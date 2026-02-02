@@ -164,7 +164,7 @@ def compute_null_params(
     return params
 
 
-def spatial_q_test(
+def spatial_q_test(  # noqa: C901
     Xn: np.ndarray | sp.spmatrix,
     kernel: Kernel,
     null_params: dict | None = None,
@@ -377,7 +377,7 @@ def spatial_q_test(
     return Q, pval
 
 
-def spatial_r_test(
+def spatial_r_test(  # noqa: C901
     Xn: np.ndarray,
     Yn: np.ndarray,
     kernel: Kernel,

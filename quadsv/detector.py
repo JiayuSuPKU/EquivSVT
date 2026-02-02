@@ -422,7 +422,7 @@ class PatternDetector:
         self.kernel_method_ = method
         self.kernel_params_ = kernel_params_
 
-    def build_kernel_from_obsp(
+    def build_kernel_from_obsp(  # noqa: C901
         self, key: str, is_distance: bool = False, method: str = "car", **kernel_params: Any
     ) -> None:
         """

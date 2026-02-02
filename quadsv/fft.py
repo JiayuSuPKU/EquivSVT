@@ -239,7 +239,7 @@ class FFTKernel:
 
         return min_d2
 
-    def _compute_eigenvalues(self):
+    def _compute_eigenvalues(self):  # noqa: C901
         """Spectral decomposition of the kernel using fft2 or rfft2.
 
         Returns eigenvalues in the selected FFT layout.

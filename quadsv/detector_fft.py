@@ -498,7 +498,7 @@ class PatternDetectorFFT:
         # Result: (N_features, n_freq_bins)
         return weighted_freq.reshape(n_feats, -1)
 
-    def compute_rstat(
+    def compute_rstat(  # noqa: C901
         self,
         bins: str,
         table_name: str,

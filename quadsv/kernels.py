@@ -162,7 +162,7 @@ class Kernel(ABC):
         self.spectrum = vals
         return vals
 
-    def xtKx(self, x: np.ndarray | sp.spmatrix) -> float | np.ndarray:
+    def xtKx(self, x: np.ndarray | sp.spmatrix) -> float | np.ndarray:  # noqa: C901
         """
         Efficiently compute the quadratic form x^T K x.
 
@@ -578,7 +578,7 @@ class SpatialKernel(Kernel):
         mode = "precomputed_inverse" if is_inverse else "precomputed"
         return cls(matrix, mode=mode, method=method, **kwargs)
 
-    def _build_kernel(self):
+    def _build_kernel(self):  # noqa: C901
         method = self.method
 
         # ==========================================
