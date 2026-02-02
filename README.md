@@ -1,6 +1,6 @@
-# quadsv: Consistent and Scalable Spatial Pattern Detection
+# quadsv: Consistent and scalable spatial pattern detection
 
-Detect spatial patterns in omics data via kernel-based hypothesis tests—Q-tests for spatial variability and R-tests for co-expression.
+Detect spatial patterns in omics data via kernel-based hypothesis tests for spatial variability (*Q-tests*) and for co-expression (*R-tests*).
 
 **Key features:**
 - **Reliable**: CAR kernel eliminates false negatives from Moran's I spectral cancellation  
@@ -141,14 +141,14 @@ pip install -e ".[dev,docs]"            # Install dev + docs dependencies
 
 **Documentation:** [ReadTheDocs](https://quadsv.readthedocs.io/)
 
-## Citation & References
+<!-- ## Citation & References
 
 If you use quadsv in your research, please cite:
 
 ```
 Su, Jiayu, et al. (2026). On the consistent and scalable detection of spatial patterns. 
 link to preprint.
-```
+``` -->
 
 ## License & Support
 

@@ -64,3 +64,8 @@ Thumbs.db
 
 # copilot 
 .github/copilot-instructions.md
+
+# Sphinx documentation build
+docs/_build/
+docs/_static/
+docs/_templates/
