@@ -429,5 +429,71 @@ class TestStandardizationPerformance(unittest.TestCase):
         self._standardize_sparse_vs_dense_runtime(self.n_sparse)
 
 
+class TestKernelUtilities(unittest.TestCase):
+    """Additional tests to cover utility helpers and error paths."""
+
+    def setUp(self):
+        np.random.seed(7)
+        x = np.linspace(0, 3, 4)
+        y = np.linspace(0, 3, 4)
+        xx, yy = np.meshgrid(x, y)
+        self.coords = np.column_stack((xx.ravel(), yy.ravel()))
+
+    def test_format_params_repr_str(self):
+        """_format_params, __repr__, and __str__ should handle arrays and sparse matrices."""
+        kernel = SpatialKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.2)
+        kernel.params["arr"] = np.ones((2, 2))
+        kernel.params["sparse"] = sp.csr_matrix(np.eye(2))
+
+        params_str = kernel._format_params()
+        self.assertIn("bandwidth=1.2", params_str)
+        self.assertIn("array(shape=(2, 2)", params_str)
+        self.assertIn("sparse(shape=(2, 2)", params_str)
+
+        repr_str = repr(kernel)
+        self.assertIn("SpatialKernel", repr_str)
+        self.assertIn("method=gaussian", repr_str)
+
+        str_out = str(kernel)
+        self.assertIn("SpatialKernel", str_out)
+        self.assertIn("Method: gaussian", str_out)
+
+    def test_from_matrix_precomputed_and_inverse(self):
+        """from_matrix should support precomputed kernels and precision matrices."""
+        K = np.array([[2.0, -1.0], [-1.0, 2.0]])
+        kernel_pre = SpatialKernel.from_matrix(K, is_inverse=False)
+        np.testing.assert_allclose(kernel_pre.realization(), K, rtol=1e-12)
+
+        # Singular precision triggers pseudo-inverse path
+        M = np.array([[1.0, 0.0], [0.0, 0.0]])
+        kernel_inv = SpatialKernel.from_matrix(M, is_inverse=True, method="car", standardize=True)
+        K_inv = kernel_inv.realization()
+        self.assertEqual(K_inv.shape, (2, 2))
+        self.assertTrue(np.allclose(K_inv, K_inv.T, rtol=1e-12))
+
+    def test_invalid_kernel_param_raises(self):
+        """Unknown kernel parameter should raise ValueError."""
+        with self.assertRaises(ValueError):
+            SpatialKernel.from_coordinates(self.coords, method="gaussian", bad_param=1)
+
+    def test_eigenvalues_cache(self):
+        """eigenvalues should reuse cached spectrum for smaller k."""
+        kernel = SpatialKernel.from_coordinates(self.coords, method="moran", k_neighbors=2)
+        vals_full = kernel.eigenvalues(k=4)
+        vals_subset = kernel.eigenvalues(k=2)
+        np.testing.assert_allclose(vals_subset, vals_full[-2:], rtol=1e-12)
+
+    def test_getstate_setstate_resets_lu(self):
+        """__getstate__ and __setstate__ should reset cached LU factorization."""
+        kernel = SpatialKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
+        kernel._lu = object()
+        state = kernel.__getstate__()
+        self.assertIsNone(state.get("_lu"))
+
+        kernel2 = SpatialKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
+        kernel2.__setstate__(state)
+        self.assertIsNone(kernel2._lu)
+
+
 if __name__ == "__main__":
     unittest.main()

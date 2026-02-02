@@ -9,8 +9,10 @@ from scipy.sparse import csc_matrix, csr_matrix
 
 from quadsv.kernels import SpatialKernel
 from quadsv.statistics import (
+    compute_null_params,
     liu_sf,
     spatial_q_test,
+    spatial_r_test,
 )
 
 
@@ -68,6 +70,15 @@ class TestStatisticalFunctions(unittest.TestCase):
         pval = liu_sf(t, lambs)
 
         # P-value should be between 0 and 1
+        self.assertIsInstance(pval, (float, np.floating))
+        self.assertGreaterEqual(pval, 0)
+        self.assertLessEqual(pval, 1)
+
+    def test_liu_sf_kurtosis_path(self):
+        """Test Liu approximation with kurtosis-based branch."""
+        lambs = np.ones(10)
+        t = 5.0
+        pval = liu_sf(t, lambs, kurtosis=True)
         self.assertIsInstance(pval, (float, np.floating))
         self.assertGreaterEqual(pval, 0)
         self.assertLessEqual(pval, 1)
@@ -169,6 +180,44 @@ class TestStatisticalFunctions(unittest.TestCase):
         # Verify we got results
         self.assertEqual(len(Q), 30)
         self.assertEqual(len(pval), 30)
+
+    def test_compute_null_params_clt(self):
+        """Test compute_null_params with CLT approximation."""
+        params = compute_null_params(self.kernel, method="clt")
+        self.assertEqual(params["method"], "clt")
+        self.assertIn("mean_Q", params)
+        self.assertIn("var_Q", params)
+
+    def test_compute_null_params_liu(self):
+        """Test compute_null_params with Liu approximation and top-k eigenvalues."""
+        params = compute_null_params(self.kernel, method="liu", k_eigen=5)
+        self.assertEqual(params["method"], "liu")
+        self.assertIn("eigenvalues", params)
+        self.assertLessEqual(len(params["eigenvalues"]), 5)
+
+    def test_spatial_q_test_kernel_matrix_requires_params(self):
+        """Kernel matrices without params should raise when null_params is None."""
+        K = self.kernel.realization()
+        with self.assertRaises(ValueError):
+            spatial_q_test(self.data, K, null_params=None)
+
+    def test_spatial_r_test_basic(self):
+        """Test spatial R-test on two vectors."""
+        x = np.random.randn(self.n)
+        y = np.random.randn(self.n)
+        R, pval = spatial_r_test(x, y, self.kernel, return_pval=True)
+        self.assertIsInstance(R, (float, np.floating))
+        self.assertIsInstance(pval, (float, np.floating))
+        self.assertGreaterEqual(pval, 0)
+        self.assertLessEqual(pval, 1)
+
+    def test_spatial_r_test_zero_variance(self):
+        """Zero-variance inputs should return neutral p-values."""
+        x = np.ones(self.n)
+        y = np.random.randn(self.n)
+        R, pval = spatial_r_test(x, y, self.kernel, return_pval=True)
+        self.assertAlmostEqual(R, 0.0, places=8)
+        self.assertAlmostEqual(pval, 1.0, places=8)
 
 
 if __name__ == "__main__":

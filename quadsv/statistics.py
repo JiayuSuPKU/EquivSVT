@@ -332,14 +332,14 @@ def spatial_q_test(  # noqa: C901
 
     # 3. Compute P-value (Vectorized)
     if null_params is None:
-        if not hasattr(kernel, "trace"):
+        if not hasattr(kernel, "square_trace"):
             raise ValueError("If params is None, kernel must be a Kernel object.")
         null_params = compute_null_params(kernel, method="welch")
         null_approx_method = "welch"
     else:
         null_approx_method = null_params.get("method", "welch")
         # Ensure params exist
-        if len(null_params) == 1 and hasattr(kernel, "trace"):
+        if len(null_params) == 1 and hasattr(kernel, "square_trace"):
             null_params.update(compute_null_params(kernel, method=null_approx_method))
 
     # P-value logic
