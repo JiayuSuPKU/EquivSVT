@@ -115,12 +115,12 @@ class PatternDetectorFFT:
     kernel_params_ : dict
         Pre-processed kernel parameters with defaults.
 
-    Methods
-    -------
-    compute_qstat(bins, table_name, col_key, row_key, features=None, n_jobs=-1, return_pval=True, chunk_size=100)
-        Compute univariate spatial Q-test statistics for features in parallel.
-    compute_rstat(bins, table_name, col_key, row_key, features_x=None, features_y=None, n_jobs=-1, return_pval=True, chunk_size=100)
-        Compute bivariate spatial R-test (cross-correlation) statistics in parallel.
+    See Also
+    --------
+    :meth:`~quadsv.detector_fft.PatternDetectorFFT.compute_qstat`
+        Compute univariate spatial statistics (Q-test).
+    :meth:`~quadsv.detector_fft.PatternDetectorFFT.compute_rstat`
+        Compute bivariate spatial statistics (R-test).
 
     Examples
     --------

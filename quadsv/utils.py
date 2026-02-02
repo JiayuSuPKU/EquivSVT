@@ -69,6 +69,7 @@ def get_visium_coords(n_rows: int = 78, n_cols: int = 64) -> tuple[np.ndarray, t
     Notes
     -----
     Visium layout uses offset hexagonal packing:
+
     - Even rows (0, 2, 4...): column indices 0, 2, 4, 6, ...
     - Odd rows (1, 3, 5...): column indices 1, 3, 5, 7, ...
 
@@ -119,12 +120,15 @@ def convert_visium_to_physical(coords: np.ndarray) -> np.ndarray:
     Notes
     -----
     Visium uses hexagonal packing with offset rows. The conversion assumes:
+
     - Horizontal neighbor spacing: Δcol = 2 → Δx = 1
     - Vertical neighbor spacing: Δrow = 1 → Δy = √3/2 (hexagonal geometry)
 
     Formulas:
-    $$x = \\text{col} / 2$$
-    $$y = \\text{row} \\cdot \\frac{\\sqrt{3}}{2}$$
+
+    .. math::
+       x = \\text{col} / 2 \\quad
+       y = \\text{row} \\cdot \\frac{\\sqrt{3}}{2}
 
     This ensures that nearest neighbors form equilateral triangles in the physical space.
 
@@ -178,8 +182,10 @@ def compute_torus_distance_matrix(
     1. Direct Euclidean distance
     2. Euclidean distance after wrapping through periodic boundaries
 
-    For each dimension, the wrapped distance is:
-    $$d_{wrapped} = \\min(|\\Delta p|, D - |\\Delta p|)$$
+    For each dimension, the wrapped distance is
+
+    .. math::
+       d_{wrapped} = \\min(|\\Delta p|, D - |\\Delta p|),
 
     where D is the domain extent in that dimension.
 

@@ -222,9 +222,10 @@ def spatial_q_test(  # noqa: C901
     The test statistic Q = x^T K x where K is the kernel matrix,
     follows approximately a chi-squared mixture distribution:
 
-    $$Q \\sim \\sum_{i=1}^{n} \\lambda_i \\chi^2_{1}$$
+    .. math::
+       Q \\sim \\sum_{i=1}^{n} \\lambda_i \\chi^2_{1}
 
-    where $\\lambda_i$ are the kernel eigenvalues.
+    where :math:`\\lambda_i` are the kernel eigenvalues.
 
     By default, we approximate the null using Welch-Satterthwaite moment matching.
     For more accurate tail probabilities, set null_params = {'method': 'liu'} or using
@@ -426,9 +427,10 @@ def spatial_r_test(  # noqa: C901
 
     The test statistic R = x^T K y is approximated as Normal under the null:
 
-    $$R \\sim N(0, \\text{Trace}(K^2))$$
+    .. math::
+       R \\sim N(0, \\text{Trace}(K^2))
 
-    P-value is computed as two-tailed: 2 × Pr(|R| > |r_obs|).
+    P-value is computed as two-tailed: ``2 × Pr(|R| > |r_obs|)``.
 
     Examples
     --------

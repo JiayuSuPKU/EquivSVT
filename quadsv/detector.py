@@ -262,8 +262,9 @@ class PatternDetector:
     (Gaussian, Matérn, Moran's I, graph Laplacian, CAR) and integrates with scanpy/AnnData.
 
     The core test statistic is:
-    - Univariate: $Q = \\mathbf{x}^T \\mathbf{K} \\mathbf{x}$ for standardized feature vector $\\mathbf{x}$ and kernel $\\mathbf{K}$.
-    - Bivariate: $R = \\mathbf{x}^T \\mathbf{K} \\mathbf{y}$ for cross-spatial correlation.
+
+    - Univariate:  :math:`Q = \\mathbf{x}^T \\mathbf{K} \\mathbf{x}` for standardized feature vector :math:`\\mathbf{x}` and kernel :math:`\\mathbf{K}`.
+    - Bivariate: :math:`R = \\mathbf{x}^T \\mathbf{K} \\mathbf{y}` for cross-spatial correlation.
 
     Parameters
     ----------
@@ -287,16 +288,16 @@ class PatternDetector:
     kernel_params_ : dict or None
         Parameters used to construct the current kernel.
 
-    Methods
-    -------
-    build_kernel_from_coordinates(coords, method='car', **kernel_params)
+    See Also
+    --------
+    :meth:`~quadsv.detector.PatternDetector.compute_qstat`
+        Compute univariate spatial statistics (Q-test).
+    :meth:`~quadsv.detector.PatternDetector.compute_rstat`
+        Compute bivariate spatial statistics (R-test).
+    :meth:`~quadsv.detector.PatternDetector.build_kernel_from_coordinates`
         Construct kernel from spatial coordinates.
-    build_kernel_from_obsp(key, is_distance=False, method='car', **kernel_params)
+    :meth:`~quadsv.detector.PatternDetector.build_kernel_from_obsp`
         Construct kernel from precomputed distance/adjacency matrix.
-    compute_qstat(source='var', features=None, n_jobs=-1, layer=None, return_pval=True)
-        Compute univariate spatial statistics.
-    compute_rstat(features_x=None, features_y=None, source='var', n_jobs=-1, layer=None, return_pval=True)
-        Compute bivariate spatial statistics.
 
     Examples
     --------
@@ -362,7 +363,7 @@ class PatternDetector:
         Builds a spatial kernel from an array of coordinates.
 
         Constructs distance-based kernel matrix from sample coordinates using
-        specified method. Updates self.kernel_ and self.kernel_params_.
+        specified method. Updates ``self.kernel_`` and ``self.kernel_params_``.
 
         Parameters
         ----------
@@ -382,6 +383,7 @@ class PatternDetector:
         Notes
         -----
         Common parameters by method:
+
         - gaussian: bandwidth (float, default 1.0)
         - matern: bandwidth (float, default 1.0), nu (float, default 1.5)
         - moran: k_neighbors (int, default 10)
@@ -456,14 +458,16 @@ class PatternDetector:
         Notes
         -----
         For distance matrices (is_distance=True):
-        - gaussian: $K = \\exp(-d^2 / (2 \\sigma^2))$ where $\\sigma$ is bandwidth.
+
+        - gaussian: :math:`K = \\exp(-d^2 / (2 \\sigma^2))` where :math:`\\sigma` is bandwidth.
         - matern: Matérn kernel with nu and bandwidth parameters.
 
         For adjacency matrices (is_distance=False):
-        - Symmetric normalization: $W_{norm} = D^{-1/2} W D^{-1/2}$.
-        - moran: Uses W_norm directly as kernel.
-        - graph_laplacian: $K = I - W_{norm}$.
-        - car: $K = (I - \\rho W_{norm})^{-1}$ (implicit kernel).
+
+        - Symmetric normalization: :math:`W_{norm} = D^{-1/2} W D^{-1/2}`.
+        - moran: Uses :math:`W_{norm}` directly as kernel.
+        - graph_laplacian: :math:`K = I - W_{norm}`.
+        - car: :math:`K = (I - \\rho W_{norm})^{-1}` (implicit kernel).
 
         Isolated nodes (degree=0) are automatically removed from the data.
 
@@ -890,7 +894,8 @@ class PatternDetector:
         Returns
         -------
         df : pd.DataFrame
-            Results sorted by |Z_score| (descending). Columns:
+            Results sorted by absolute Z_score (descending). Columns:
+
             - Feature_1: name of first feature
             - Feature_2: name of second feature
             - R: test statistic (bivariate spatial correlation, range approximately [-1, 1])

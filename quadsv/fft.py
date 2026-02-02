@@ -487,7 +487,7 @@ def spatial_q_test_fft(
     Under H₁: mean-shift present.
 
     Computationally: Q = z^T K z where z is standardized data.
-    Uses FFT via Parseval's theorem to compute $Q = \\sum_{i,j} \\lambda_{i,j} Z^2_{i,j}$
+    Uses FFT via Parseval's theorem to compute :math:`Q = \\sum_{i,j} \\lambda_{i,j} Z^2_{i,j}`
     in O(N log N) time instead of O(N³) dense methods.
 
     For Moran's I kernel (which has negative eigenvalues), uses Normal approximation
@@ -604,7 +604,7 @@ def spatial_r_test_fft(
         Test statistic (cross-variance). Scalar if input was 2D; array of shape (M,) if 3D.
     pval : float or np.ndarray, optional
         Two-tailed p-value under null hypothesis (no spatial co-variation).
-        Based on Normal approximation: $z = R / \\sqrt{\\text{Trace}(K^2)}$.
+        Based on Normal approximation: :math:`z = R / \\sqrt{\\text{Trace}(K^2)}`.
         Only returned if return_pval=True.
 
     Raises
@@ -618,12 +618,11 @@ def spatial_r_test_fft(
     Under H₁: spatial co-clustering or co-dispersion present.
 
     Computationally: R = z_x^T K z_y where z_x, z_y are standardized data.
-    Uses FFT via Parseval's theorem: $R = \\frac{1}{N} \\sum_{i,j} \\overline{Z_x}_{i,j} \\lambda_{i,j} Z_y_{i,j}$.
+    Uses FFT via Parseval's theorem: :math:`R = \\frac{1}{N} \\sum_{i,j} \\overline{Z_{x}}_{i,j} \\lambda_{i,j} Z_{y_{i,j}}`
 
     P-value calculation assumes asymptotic Normality with variance estimated from
-    kernel trace: $\\text{Var}(R) \\approx \\text{Trace}(K^2) / N^2$.
-    Returns two-tailed probability: $p = 2 P(|Z| > |z\\text{-score}|)$.
-
+    kernel trace: :math:`\\text{Var}(R) \\approx \\text{Trace}(K^2) / N^2`.
+    Returns two-tailed probability: :math:`p = 2 P(|Z| > |\\text{z-score}|)`.
     Examples
     --------
     >>> ny, nx = 32, 32

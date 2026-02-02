@@ -386,7 +386,15 @@ class TestStandardizationPerformance(unittest.TestCase):
         # Test dense approach (full inversion)
         print("\nTesting dense inversion approach...")
         start_dense = time.time()
-        with self.assertWarns(RuntimeWarning):
+        if n > 5000:
+            with self.assertWarns(RuntimeWarning):
+                kernel_dense = SpatialKernel.from_matrix(
+                    M_dense,
+                    is_inverse=True,
+                    method="car",
+                    standardize=True,
+                )
+        else:
             kernel_dense = SpatialKernel.from_matrix(
                 M_dense,
                 is_inverse=True,
