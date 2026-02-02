@@ -51,7 +51,8 @@ print(f"R-statistic: {R:.4f}, p-value: {pval:.4e}")
 ### FFT-accelerated tests (for regular grids like Visium HD)
 
 ```python
-from quadsv.fft import FFTKernel
+import numpy as np
+from quadsv.fft import FFTKernel, spatial_q_test_fft, spatial_r_test_fft
 
 # For grid data (e.g., 1000x1000 Visium HD)
 kernel_fft = FFTKernel(shape=(1000, 1000), method='car', rho=0.9)
@@ -60,13 +61,13 @@ kernel_fft = FFTKernel(shape=(1000, 1000), method='car', rho=0.9)
 gene_grid = np.random.randn(1000, 1000)
 
 # run FFT-based Q-test
-Q_fft, pval_fft = spatial_q_test(gene_grid, kernel_fft)
+Q_fft, pval_fft = spatial_q_test_fft(gene_grid, kernel_fft)
 print(f"FFT Q-test: Q={Q_fft:.4f}, p-value={pval_fft:.4e}")
 
 # run FFT-based R-test
 gene1_grid = np.random.randn(1000, 1000)
 gene2_grid = np.random.randn(1000, 1000)
-R_fft, pval_fft = spatial_r_test(gene1_grid, gene2_grid, kernel_fft)
+R_fft, pval_fft = spatial_r_test_fft(gene1_grid, gene2_grid, kernel_fft)
 print(f"FFT R-test: R={R_fft:.4f}, p-value={pval_fft:.4e}")
 ```
 

@@ -118,11 +118,9 @@ Three approximation methods are provided, balancing accuracy and speed:
      - Positive semi-definite kernels only
      - N ≤ 5000 or FFT grids
 
-**CLT**: Approximates :math:`Q_n` as normal with mean :math:`\mu = \text{tr}(\mathbf{K})` and variance :math:`\sigma^2 = 2\text{tr}(\mathbf{K}^2)`.
-
-**Welch/Satterthwaite**: Matches first two moments to a scaled chi-square distribution using Hutchinson trace estimation. Recommended default.
-
-**Liu**: Exact eigendecomposition followed by polynomial moment-matching. Most accurate but requires O(N³) computation.
+- **CLT**: Approximates :math:`Q_n` as normal with mean :math:`\mu = \text{tr}(\mathbf{K})` and variance :math:`\sigma^2 = 2\text{tr}(\mathbf{K}^2)`.
+- **Welch/Satterthwaite**: Matches first two moments to a scaled chi-square distribution using Hutchinson trace estimation. Recommended default.
+- **Liu**: Exact eigendecomposition followed by polynomial moment-matching. Most accurate but requires O(N³) computation.
 
 R-test: bivariate spatial co-expression
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -158,12 +156,12 @@ where :math:`\mathbf{U}` is the FFT basis and :math:`\Lambda` is diagonal.
 
 - Explicit eigendecomposition: O(N³)
 - FFT eigenvalues: O(N log N)
-- Q-test computation: O(N log N)
 
-**Example: 1000×1000 grid**
+**Example: single-gene, 1000×1000 grid**
 
-- Explicit kernel: ~10 hours
-- FFT kernel: ~1 minute
+- Explicit kernel (eigen): memory error
+- Explicit kernel (Welch): ~10 seconds
+- FFT kernel (eigen): ~0.1 seconds
 
 **Supported topologies:** Square (4-neighbor, default) and hexagonal (6-neighbor).
 
