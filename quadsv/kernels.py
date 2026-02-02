@@ -1,14 +1,16 @@
-import numpy as np
 import warnings
-import scipy.sparse as sp
-from scipy.spatial.distance import pdist, squareform
-from scipy.linalg import inv, solve, lu_factor, lu_solve
-from scipy.sparse.linalg import spsolve, splu
-from sklearn.neighbors import NearestNeighbors
 from abc import ABC, abstractmethod
-from scipy.special import kv, gamma
+from typing import Any
+
+import numpy as np
+import scipy.sparse as sp
+from scipy.linalg import inv, lu_factor, lu_solve
+from scipy.sparse.linalg import splu
+from scipy.spatial.distance import pdist, squareform
+from scipy.special import gamma, kv
+from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
-from typing import Optional, Union, Tuple, Any
+
 
 class Kernel(ABC):
     """
@@ -31,7 +33,7 @@ class Kernel(ABC):
         Additional kernel parameters (bandwidth, nu, rho, etc.).
     """
 
-    def __init__(self, n: int, method: str = 'gaussian', **kwargs) -> None:
+    def __init__(self, n: int, method: str = "gaussian", **kwargs) -> None:
         """
         Initialize the Kernel.
 
@@ -51,7 +53,7 @@ class Kernel(ABC):
         # Threshold for switching between dense realization and implicit solving
         self.implicit_threshold = 5000
         self.is_implicit = False
-        self._lu = None # Cache for sparse LU factorization if needed
+        self._lu = None  # Cache for sparse LU factorization if needed
 
         # _K can be the kernel matrix OR the inverse/precision matrix depending on is_implicit
         self._K = self._build_kernel()
@@ -116,7 +118,7 @@ class Kernel(ABC):
                 return inv(self._K)
         return self._K
 
-    def eigenvalues(self, k: Optional[int] = None) -> np.ndarray:
+    def eigenvalues(self, k: int | None = None) -> np.ndarray:
         """
         Compute the k largest eigenvalues of the kernel matrix.
 
@@ -140,25 +142,27 @@ class Kernel(ABC):
         if self.is_implicit:
             # Implicit case with kernel inverse: Use sparse methods
             from scipy.sparse.linalg import eigsh
+
             k = k if k is not None else max(6, self.n - 2)
-            vals, _ = eigsh(self._K, k=k, which='SM')  # Smallest magnitude of K^-1 = largest of K
+            vals, _ = eigsh(self._K, k=k, which="SM")  # Smallest magnitude of K^-1 = largest of K
             vals = np.real(1.0 / vals)
         else:
             # Handle kernel matrix directly
             if sp.issparse(self._K):
                 from scipy.sparse.linalg import eigsh
+
                 k = k if k is not None else max(6, self.n - 2)
-                vals, _ = eigsh(self._K, k=k, which='LM')
+                vals, _ = eigsh(self._K, k=k, which="LM")
                 vals = np.real(vals)
             else:
-                vals = np.linalg.eigvalsh(self._K) # ascending order
+                vals = np.linalg.eigvalsh(self._K)  # ascending order
                 if k is not None:
                     vals = np.sort(vals)[-k:]
 
         self.spectrum = vals
         return vals
 
-    def xtKx(self, x: Union[np.ndarray, sp.spmatrix]) -> Union[float, np.ndarray]:
+    def xtKx(self, x: np.ndarray | sp.spmatrix) -> float | np.ndarray:
         """
         Efficiently compute the quadratic form x^T K x.
 
@@ -184,11 +188,11 @@ class Kernel(ABC):
         """
         # Handle sparse input
         is_sparse_input = sp.issparse(x)
-        
+
         # Allow x to be a matrix (N, n_vectors) or vector (N,)
         # If vector, reshape to (N, 1) to ensure matrix math works
         if is_sparse_input:
-            if x.ndim == 1 or (hasattr(x, 'shape') and len(x.shape) == 1):
+            if x.ndim == 1 or (hasattr(x, "shape") and len(x.shape) == 1):
                 x_in = x.reshape(-1, 1)
             else:
                 x_in = x
@@ -218,24 +222,24 @@ class Kernel(ABC):
                     y = lu_solve(self._lu, x_in.toarray())
                 else:
                     y = lu_solve(self._lu, x_in)
-            
+
             # Compute x^T @ y efficiently
             if is_sparse_input:
                 # For sparse x, use multiply and sum
                 result = np.asarray(x_in.multiply(y).sum(axis=0)).flatten()
             else:
-                result_matrix = x_in.T.dot(y) # (M, M)
+                result_matrix = x_in.T.dot(y)  # (M, M)
                 result = np.diag(result_matrix) if n_cols > 1 else result_matrix.item()
         else:
             # Standard Case: K is realized as a dense or sparse matrix
             if is_sparse_input:
                 # Sparse @ Dense matrix multiplication
-                Kx = self._K.dot(x_in.toarray() if hasattr(x_in, 'toarray') else x_in)
+                Kx = self._K.dot(x_in.toarray() if hasattr(x_in, "toarray") else x_in)
                 # x^T @ Kx with sparse x
                 result = np.asarray(x_in.multiply(Kx).sum(axis=0)).flatten()
             else:
                 Kx = self._K.dot(x_in)
-                result_matrix = x_in.T.dot(Kx) # (M, M)
+                result_matrix = x_in.T.dot(Kx)  # (M, M)
                 result = np.diag(result_matrix) if n_cols > 1 else result_matrix.item()
 
         # Return appropriate shape
@@ -250,11 +254,15 @@ class Kernel(ABC):
             raise RuntimeError("Trace caching is only for implicit kernels.")
 
         # Check if cache exists
-        if hasattr(self, '_trace_rvs_cache'):
-            if self._trace_rvs_cache['n_vectors'] == n_vectors:
+        if hasattr(self, "_trace_rvs_cache"):
+            if self._trace_rvs_cache["n_vectors"] == n_vectors:
                 return self._trace_rvs_cache
             else:
-                warnings.warn("Updating trace random vectors cache with different n_vectors.", RuntimeWarning)
+                warnings.warn(
+                    "Updating trace random vectors cache with different n_vectors.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         # Hutchinson's trick random vectors
         rvs = np.random.choice([-1, 1], size=(self.n, n_vectors))
@@ -274,7 +282,7 @@ class Kernel(ABC):
             Y = lu_solve(self._lu, rvs)
 
         # Cache for future use
-        self._trace_rvs_cache = {'n_vectors': n_vectors, 'rvs': rvs, 'Y': Y}
+        self._trace_rvs_cache = {"n_vectors": n_vectors, "rvs": rvs, "Y": Y}
         return self._trace_rvs_cache
 
     def trace(self) -> float:
@@ -295,8 +303,8 @@ class Kernel(ABC):
             cache = self._get_rvs_trace_cache(n_vectors)
 
             # Hutchinson's estimator is (1/n_vectors) * sum(v_i^T * y_i)
-            rvs = cache['rvs']
-            Y = cache['Y']
+            rvs = cache["rvs"]
+            Y = cache["Y"]
             return np.sum(rvs * Y) / n_vectors
 
         elif sp.issparse(self._K):
@@ -323,7 +331,7 @@ class Kernel(ABC):
 
             # Trace(K^2) ~= (1/m) * sum( ||K v_i||^2 )
             # Since Y = K * rvs, we just need sum(Y^2)
-            Y = cache['Y']
+            Y = cache["Y"]
             return np.sum(Y**2) / n_vectors
 
         elif sp.issparse(self._K):
@@ -350,7 +358,11 @@ class Kernel(ABC):
 
             # Determine batch size (100-1000 is usually optimal for cache locality)
             batch_size = 128
-            with tqdm(total=n, desc="Computing diagonal of K", bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}') as pbar:
+            with tqdm(
+                total=n,
+                desc="Computing diagonal of K",
+                bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
+            ) as pbar:
                 for i in range(0, n, batch_size):
                     end = min(i + batch_size, n)
                     current_batch_size = end - i
@@ -384,7 +396,8 @@ class Kernel(ABC):
             # Dense case: Direct inversion (slow, should work with kernel matrix directly)
             warnings.warn(
                 "Dense precision inversion invoked. Consider using the kernel matrix directly.",
-                RuntimeWarning
+                RuntimeWarning,
+                stacklevel=2,
             )
             Minv = inv(M)
             return np.diag(Minv)
@@ -408,7 +421,7 @@ class Kernel(ABC):
         state = self.__dict__.copy()
         # Remove the cached LU factorization because SuperLU objects cannot be pickled.
         # Workers will re-compute this locally.
-        state['_lu'] = None
+        state["_lu"] = None
         return state
 
     def __setstate__(self, state):
@@ -433,9 +446,12 @@ class SpatialKernel(Kernel):
     mode : {'coords', 'precomputed', 'precomputed_inverse'}
         How the kernel was initialized.
     """
-    _available_kernels = ['gaussian', 'matern', 'moran', 'graph_laplacian', 'car']
 
-    def __init__(self, data: np.ndarray, mode: str = 'coords', method: str = 'matern', **kwargs) -> None:
+    _available_kernels = ["gaussian", "matern", "moran", "graph_laplacian", "car"]
+
+    def __init__(
+        self, data: np.ndarray, mode: str = "coords", method: str = "matern", **kwargs
+    ) -> None:
         """
         Internal constructor. Use .from_coordinates() or .from_matrix() instead.
 
@@ -452,10 +468,15 @@ class SpatialKernel(Kernel):
         """
         self.data = data
         self.mode = mode
-        assert mode in ['coords', 'precomputed', 'precomputed_inverse'], \
-            "Invalid mode. Must be 'coords', 'precomputed', or 'precomputed_inverse'."
+        assert mode in [
+            "coords",
+            "precomputed",
+            "precomputed_inverse",
+        ], "Invalid mode. Must be 'coords', 'precomputed', or 'precomputed_inverse'."
 
-        assert method in self._available_kernels + ['precomputed'], f"Unknown kernel method: {method}."
+        assert method in self._available_kernels + [
+            "precomputed"
+        ], f"Unknown kernel method: {method}."
 
         # Update kernel parameters from defaults
         defaults = self._get_default_params(method).copy()
@@ -472,7 +493,7 @@ class SpatialKernel(Kernel):
     def _get_default_params(self, method: str) -> dict[str, Any]:
         """
         Returns default parameters for specific kernel methods.
-        
+
         Parameters
         ----------
         method : str
@@ -484,21 +505,18 @@ class SpatialKernel(Kernel):
             Method defaults: bandwidth (gaussian/matern), nu (matern), neighbor_degree (moran/graph_laplacian/car), rho (car).
         """
         method_defaults = {
-            'gaussian': {'bandwidth': 2.0},
-            'matern': {'bandwidth': 2.0, 'nu': 1.5},
-            'moran': {'k_neighbors': 4},
-            'graph_laplacian': {'k_neighbors': 4},
-            'car': {'rho': 0.9, 'k_neighbors': 4, 'standardize': False},
+            "gaussian": {"bandwidth": 2.0},
+            "matern": {"bandwidth": 2.0, "nu": 1.5},
+            "moran": {"k_neighbors": 4},
+            "graph_laplacian": {"k_neighbors": 4},
+            "car": {"rho": 0.9, "k_neighbors": 4, "standardize": False},
         }
         return method_defaults.get(method, {})
 
     @classmethod
     def from_coordinates(
-        cls,
-        coords: np.ndarray,
-        method: str = 'matern',
-        **kwargs
-    ) -> 'SpatialKernel':
+        cls, coords: np.ndarray, method: str = "matern", **kwargs
+    ) -> "SpatialKernel":
         """
         Build kernel from spatial coordinates.
 
@@ -523,16 +541,16 @@ class SpatialKernel(Kernel):
         """
         assert method in cls._available_kernels, f"Unknown kernel method for coordinates: {method}."
 
-        return cls(coords, mode='coords', method=method, **kwargs)
+        return cls(coords, mode="coords", method=method, **kwargs)
 
     @classmethod
     def from_matrix(
         cls,
-        matrix: Union[np.ndarray, sp.spmatrix],
+        matrix: np.ndarray | sp.spmatrix,
         is_inverse: bool = False,
-        method: str = 'precomputed',
-        **kwargs
-    ) -> 'SpatialKernel':
+        method: str = "precomputed",
+        **kwargs,
+    ) -> "SpatialKernel":
         """
         Build kernel from a precomputed kernel matrix or its inverse.
 
@@ -557,7 +575,7 @@ class SpatialKernel(Kernel):
         >>> K = np.array([[2, -1], [-1, 2]])  # kernel matrix
         >>> kernel = SpatialKernel.from_matrix(K, is_inverse=False)
         """
-        mode = 'precomputed_inverse' if is_inverse else 'precomputed'
+        mode = "precomputed_inverse" if is_inverse else "precomputed"
         return cls(matrix, mode=mode, method=method, **kwargs)
 
     def _build_kernel(self):
@@ -568,36 +586,36 @@ class SpatialKernel(Kernel):
         # ==========================================
 
         # Case A: Coordinates provided -> Compute Dists or W from scratch
-        if self.mode == 'coords':
+        if self.mode == "coords":
             coords = self.data
-            if method in ['gaussian', 'matern']:
+            if method in ["gaussian", "matern"]:
                 # Compute dense distance matrix
-                dists = squareform(pdist(coords, metric='euclidean'))
+                dists = squareform(pdist(coords, metric="euclidean"))
                 W = None
-            elif method in ['moran', 'graph_laplacian', 'car']:
+            elif method in ["moran", "graph_laplacian", "car"]:
                 # Compute sparse adjacency graph
-                k = self.params['k_neighbors']
-                nbrs = NearestNeighbors(n_neighbors=k, algorithm='ball_tree').fit(coords)
-                W = nbrs.kneighbors_graph(coords, mode='connectivity').astype(float)
+                k = self.params["k_neighbors"]
+                nbrs = NearestNeighbors(n_neighbors=k, algorithm="ball_tree").fit(coords)
+                W = nbrs.kneighbors_graph(coords, mode="connectivity").astype(float)
                 dists = None
             else:
                 raise ValueError(f"Unknown method for coordinates: {method}")
 
         # Case B: Precomputed Kernel provided
-        elif self.mode == 'precomputed':
+        elif self.mode == "precomputed":
             return self.data
 
         # Case C: Precomputed Inverse Kernel provided
-        elif self.mode == 'precomputed_inverse':
+        elif self.mode == "precomputed_inverse":
             M = self.data
-            standardize = self.params.get('standardize', False)
+            standardize = self.params.get("standardize", False)
 
             # If small, realize dense K; else keep implicit precision
             if self.n <= self.implicit_threshold:
                 try:
                     M_dense = M.toarray() if sp.issparse(M) else M
                     K_dense = inv(M_dense)
-                except Exception:
+                except np.linalg.LinAlgError:
                     M_dense = M.toarray() if sp.issparse(M) else M
                     K_dense = np.linalg.pinv(M_dense)
 
@@ -620,24 +638,24 @@ class SpatialKernel(Kernel):
         # ==========================================
 
         # --- Distance Based ---
-        if method in ['gaussian', 'matern']:
-            bw = self.params['bandwidth']
+        if method in ["gaussian", "matern"]:
+            bw = self.params["bandwidth"]
 
-            if method == 'gaussian':
-                K = np.exp(-dists**2 / (2 * bw**2))
-            elif method == 'matern':
-                nu = self.params['nu']
+            if method == "gaussian":
+                K = np.exp(-(dists**2) / (2 * bw**2))
+            elif method == "matern":
+                nu = self.params["nu"]
                 length_scale = bw
                 # Avoid div by zero
                 dists_safe = dists.copy()
                 dists_safe[dists_safe == 0] = 1e-15
                 factor = (np.sqrt(2 * nu) * dists_safe) / length_scale
-                K = (2**(1 - nu) / gamma(nu)) * (factor**nu) * kv(nu, factor)
+                K = (2 ** (1 - nu) / gamma(nu)) * (factor**nu) * kv(nu, factor)
                 np.fill_diagonal(K, 1.0)
             return K
 
         # --- Graph Based ---
-        elif method in ['moran', 'graph_laplacian', 'car']:
+        elif method in ["moran", "graph_laplacian", "car"]:
             # Symmetrize and apply symmetric normalization: D^{-1/2} W D^{-1/2}
             if W is None:
                 raise ValueError("Graph weights (W) required for graph kernels.")
@@ -657,18 +675,18 @@ class SpatialKernel(Kernel):
             inv_D_sqrt = sp.diags(1.0 / np.sqrt(row_sums))
             W_norm = inv_D_sqrt @ W_sym @ inv_D_sqrt
 
-            if method == 'moran':
+            if method == "moran":
                 # Already symmetric and normalized
                 return W_norm
 
-            elif method == 'graph_laplacian':
-                I = sp.eye(self.n, format='csr')
+            elif method == "graph_laplacian":
+                I = sp.eye(self.n, format="csr")
                 return I - W_norm
 
-            elif method == 'car':
-                rho = self.params['rho']
-                standardize = self.params['standardize']
-                I = sp.eye(self.n, format='csc')
+            elif method == "car":
+                rho = self.params["rho"]
+                standardize = self.params["standardize"]
+                I = sp.eye(self.n, format="csc")
                 # M = (I - rho * W_norm) is the inverse of the CAR kernel
                 M = I - rho * W_norm
 
@@ -680,7 +698,7 @@ class SpatialKernel(Kernel):
                 else:
                     try:
                         K_dense = inv(M.toarray())
-                    except:
+                    except np.linalg.LinAlgError:
                         K_dense = np.linalg.pinv(M.toarray())
 
                     if standardize:
@@ -697,16 +715,16 @@ class SpatialKernel(Kernel):
 
     def __repr__(self):
         # Describe input data succinctly
-        if self.mode == 'coords':
+        if self.mode == "coords":
             coords = self.data
             data_desc = f"coords shape={getattr(coords, 'shape', '?')}"
-        elif self.mode == 'precomputed':
+        elif self.mode == "precomputed":
             M = self.data
             if sp.issparse(M):
                 data_desc = f"matrix shape={M.shape} sparse nnz={M.nnz}"
             else:
                 data_desc = f"matrix shape={getattr(M, 'shape', '?')} dense"
-        elif self.mode == 'precomputed_inverse':
+        elif self.mode == "precomputed_inverse":
             M = self.data
             if sp.issparse(M):
                 data_desc = f"precision shape={M.shape} sparse nnz={M.nnz}"
@@ -732,16 +750,16 @@ class SpatialKernel(Kernel):
 
         # Add a brief data description
         try:
-            if self.mode == 'coords':
+            if self.mode == "coords":
                 coords = self.data
                 lines.append(f"- Data: coords shape={getattr(coords, 'shape', '?')}")
             else:
                 M = self.data
                 if sp.issparse(M):
-                    kind = 'precision' if self.mode == 'precomputed_inverse' else 'matrix'
+                    kind = "precision" if self.mode == "precomputed_inverse" else "matrix"
                     lines.append(f"- Data: {kind} shape={M.shape} sparse nnz={M.nnz}")
                 else:
-                    kind = 'precision' if self.mode == 'precomputed_inverse' else 'matrix'
+                    kind = "precision" if self.mode == "precomputed_inverse" else "matrix"
                     lines.append(f"- Data: {kind} shape={getattr(M, 'shape', '?')} dense")
         except Exception:
             lines.append("- Data: ?")

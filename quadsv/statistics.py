@@ -1,20 +1,20 @@
 import numpy as np
 import scipy.sparse as sp
 from scipy.stats import chi2, ncx2, norm
-from typing import Optional, Union, Tuple
 from tqdm import tqdm
 
-from quadsv.kernels import Kernel, SpatialKernel
+from quadsv.kernels import Kernel
 
 _DELTA = 1e-10
 
+
 def liu_sf(
-    t: Union[float, np.ndarray],
+    t: float | np.ndarray,
     lambs: np.ndarray,
-    dofs: Optional[np.ndarray] = None,
-    deltas: Optional[np.ndarray] = None,
-    kurtosis: bool = False
-) -> Union[float, np.ndarray]:
+    dofs: np.ndarray | None = None,
+    deltas: np.ndarray | None = None,
+    kurtosis: bool = False,
+) -> float | np.ndarray:
     """
     Liu approximation to linear combination of noncentral chi-squared variables.
 
@@ -58,9 +58,7 @@ def liu_sf(
     # Calculate moments of weights
     lambs_pow = {i: lambs**i for i in range(1, 5)}
 
-    c = {
-        i: np.sum(lambs_pow[i] * dofs) + i * np.sum(lambs_pow[i] * deltas) for i in range(1, 5)
-    }
+    c = {i: np.sum(lambs_pow[i] * dofs) + i * np.sum(lambs_pow[i] * deltas) for i in range(1, 5)}
 
     s1 = c[3] / (np.sqrt(c[2]) ** 3 + _DELTA)
     s2 = c[4] / (c[2] ** 2 + _DELTA)
@@ -94,10 +92,8 @@ def liu_sf(
 
 
 def compute_null_params(
-    kernel: Kernel,
-    method: str = 'welch',
-    k_eigen: Optional[int] = None
-) -> dict[str, Union[float, np.ndarray]]:
+    kernel: Kernel, method: str = "welch", k_eigen: int | None = None
+) -> dict[str, float | np.ndarray]:
     """
     Pre-compute null distribution parameters for spatial tests.
 
@@ -136,48 +132,47 @@ def compute_null_params(
     >>> params = compute_null_params(kernel, method='welch')
     >>> Q, pval = spatial_q_test(data, kernel, null_params=params)
     """
-    params = {'method': method}
+    params = {"method": method}
 
-    assert method in ['clt', 'welch', 'liu'], "Method must be 'clt', 'welch', or 'liu'."
+    assert method in ["clt", "welch", "liu"], "Method must be 'clt', 'welch', or 'liu'."
 
-    if method == 'liu':
+    if method == "liu":
         # Requires eigenvalues
         # If kernel is implicit/sparse, we might only get top k
         vals = kernel.eigenvalues(k=k_eigen)
         # Filter numerical noise
-        params['eigenvalues'] = vals[np.abs(vals) > 1e-9]
+        params["eigenvalues"] = vals[np.abs(vals) > 1e-9]
     else:
         # Compute trace and trace squared
         tr_K = kernel.trace()
         tr_K2 = kernel.square_trace()
 
-        params['mean_Q'] = tr_K
-        params['var_Q'] = 2 * tr_K2
+        params["mean_Q"] = tr_K
+        params["var_Q"] = 2 * tr_K2
 
-        if method == 'welch':
+        if method == "welch":
             # Pre-calculate Welch-Satterthwaite parameters
-            if params['var_Q'] > 0:
-                params['scale_g'] = params['var_Q'] / (2 * params['mean_Q'])
-                params['df_h'] = (2 * params['mean_Q']**2) / params['var_Q']
+            if params["var_Q"] > 0:
+                params["scale_g"] = params["var_Q"] / (2 * params["mean_Q"])
+                params["df_h"] = (2 * params["mean_Q"] ** 2) / params["var_Q"]
             else:
-                params['scale_g'] = 1.0
-                params['df_h'] = 1.0
+                params["scale_g"] = 1.0
+                params["df_h"] = 1.0
 
     return params
-
 
     return params
 
 
 def spatial_q_test(
-    Xn: Union[np.ndarray, sp.spmatrix],
+    Xn: np.ndarray | sp.spmatrix,
     kernel: Kernel,
-    null_params: Optional[dict] = None,
+    null_params: dict | None = None,
     return_pval: bool = True,
     is_standardized: bool = False,
     chunk_size: int = -1,
-    show_progress: bool = False
-) -> Union[float, np.ndarray, Tuple[Union[float, np.ndarray], Union[float, np.ndarray]]]:
+    show_progress: bool = False,
+) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
     """
     Univariate spatial Q-test for detecting spatial variability.
 
@@ -248,12 +243,12 @@ def spatial_q_test(
     """
     # Handle sparse matrices
     is_sparse = sp.issparse(Xn)
-    
+
     if is_sparse:
         # Get shape from sparse matrix
         n, M = Xn.shape if Xn.ndim == 2 else (Xn.shape[0], 1)
         if Xn.ndim == 1 or M == 1:
-            Xn = Xn.reshape(-1, 1) if hasattr(Xn, 'reshape') else Xn
+            Xn = Xn.reshape(-1, 1) if hasattr(Xn, "reshape") else Xn
             M = 1
     else:
         Xn = np.asarray(Xn).astype(float)
@@ -266,23 +261,27 @@ def spatial_q_test(
     # Determine chunking
     if chunk_size == -1 or chunk_size >= M:
         chunk_size = M
-    
+
     # Process in chunks
     n_chunks = int(np.ceil(M / chunk_size))
     Q_results = []
-    
+
     iterator = range(n_chunks)
     if show_progress and n_chunks > 1:
-        iterator = tqdm(iterator, desc="Processing features", total=n_chunks,
-                        bar_format='{l_bar}{bar:30}{r_bar}{bar:-30b}')
-    
+        iterator = tqdm(
+            iterator,
+            desc="Processing features",
+            total=n_chunks,
+            bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
+        )
+
     for chunk_idx in iterator:
         start_idx = chunk_idx * chunk_size
         end_idx = min(start_idx + chunk_size, M)
-        
+
         # Extract chunk
         Xn_chunk = Xn[:, start_idx:end_idx]
-        
+
         # 1. Preprocessing (Standardization)
         if is_standardized:
             z = Xn_chunk
@@ -290,7 +289,7 @@ def spatial_q_test(
             # Convert sparse to dense for standardization (centering destroys sparsity anyway)
             if is_sparse:
                 Xn_chunk = Xn_chunk.toarray()
-            
+
             # Compute stats along axis 0 (samples)
             means = np.mean(Xn_chunk, axis=0)
             stds = np.std(Xn_chunk, axis=0, ddof=1)
@@ -298,13 +297,13 @@ def spatial_q_test(
             # Handle constant features (std=0) to avoid NaNs
             valid_mask = stds > 1e-12
             z = np.zeros_like(Xn_chunk)
-            
+
             if np.any(valid_mask):
                 z[:, valid_mask] = (Xn_chunk[:, valid_mask] - means[valid_mask]) / stds[valid_mask]
 
         # 2. Compute Statistic Q = z^T K z
         # Use optimized class method if available
-        if hasattr(kernel, 'xtKx'):
+        if hasattr(kernel, "xtKx"):
             # This now supports (N, M) inputs and returns (M,)
             Q_chunk = kernel.xtKx(z)
         else:
@@ -317,9 +316,9 @@ def spatial_q_test(
             # Efficient diagonal of z.T @ Kz without full matrix mult
             # sum(z_ij * (Kz)_ij) along axis 0
             Q_chunk = np.sum(z * Kz, axis=0)
-        
+
         Q_results.append(Q_chunk)
-    
+
     # Concatenate results
     Q = np.concatenate([np.atleast_1d(q) for q in Q_results])
 
@@ -332,39 +331,39 @@ def spatial_q_test(
 
     # 3. Compute P-value (Vectorized)
     if null_params is None:
-        if not hasattr(kernel, 'trace'):
+        if not hasattr(kernel, "trace"):
             raise ValueError("If params is None, kernel must be a Kernel object.")
-        null_params = compute_null_params(kernel, method='welch')
-        null_approx_method = 'welch'
+        null_params = compute_null_params(kernel, method="welch")
+        null_approx_method = "welch"
     else:
-        null_approx_method = null_params.get('method', 'welch')
+        null_approx_method = null_params.get("method", "welch")
         # Ensure params exist
-        if len(null_params) == 1 and hasattr(kernel, 'trace'):
+        if len(null_params) == 1 and hasattr(kernel, "trace"):
             null_params.update(compute_null_params(kernel, method=null_approx_method))
 
     # P-value logic
-    if null_approx_method == 'clt':
-        mu_Q = null_params['mean_Q']
-        var_Q = null_params['var_Q']
+    if null_approx_method == "clt":
+        mu_Q = null_params["mean_Q"]
+        var_Q = null_params["var_Q"]
         if var_Q > 0:
             z_score = (Q - mu_Q) / np.sqrt(var_Q)
             pval = chi2.sf(z_score**2, df=1)
         else:
             pval = np.ones_like(Q, dtype=float)
 
-    elif null_approx_method == 'welch':
-        g = null_params['scale_g']
-        d = null_params['df_h']
+    elif null_approx_method == "welch":
+        g = null_params["scale_g"]
+        d = null_params["df_h"]
         pval = chi2.sf(Q / g, df=d)
 
-    elif null_approx_method == 'liu':
-        lambs = null_params['eigenvalues']
+    elif null_approx_method == "liu":
+        lambs = null_params["eigenvalues"]
         # filter numerical noise
         lambs = lambs[np.abs(lambs) > _DELTA]
 
         # liu_sf likely needs a loop if not vectorized, or use np.vectorize
         # Assuming liu_sf handles array inputs or we map it:
-        if M > 1: # batched inputs
+        if M > 1:  # batched inputs
             pval = np.array([liu_sf(q_val, lambs) for q_val in Q])
         else:
             pval = liu_sf(Q, lambs)
@@ -382,10 +381,10 @@ def spatial_r_test(
     Xn: np.ndarray,
     Yn: np.ndarray,
     kernel: Kernel,
-    null_params: Optional[dict] = None,
+    null_params: dict | None = None,
     return_pval: bool = True,
-    is_standardized: bool = False
-) -> Union[float, np.ndarray, Tuple[Union[float, np.ndarray], Union[float, np.ndarray]]]:
+    is_standardized: bool = False,
+) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
     """
     Bivariate spatial R-test for correlation between two spatial variables.
 
@@ -439,9 +438,12 @@ def spatial_r_test(
     >>> y_data = np.random.randn(100)
     >>> R, pval = spatial_r_test(x_data, y_data, kernel)
     """
-    Xn = np.asarray(Xn); Yn = np.asarray(Yn)
-    if Xn.ndim == 1: Xn = Xn.reshape(-1, 1)
-    if Yn.ndim == 1: Yn = Yn.reshape(-1, 1)
+    Xn = np.asarray(Xn)
+    Yn = np.asarray(Yn)
+    if Xn.ndim == 1:
+        Xn = Xn.reshape(-1, 1)
+    if Yn.ndim == 1:
+        Yn = Yn.reshape(-1, 1)
 
     n, M = Xn.shape
     assert Xn.shape == Yn.shape, "Xn and Yn shapes must match"
@@ -471,18 +473,20 @@ def spatial_r_test(
     # 2. Compute R = Zx.T @ K @ Zy
     # We use the kernel's optimized multiplication
     # K @ Zy
-    if hasattr(kernel, 'is_implicit') and kernel.is_implicit:
+    if hasattr(kernel, "is_implicit") and kernel.is_implicit:
         # Implicit solve: M^-1 * Zy
         if sp.issparse(kernel._K):
             # Check for cached LU factorization
             if kernel._lu is None:
                 from scipy.sparse.linalg import splu
+
                 kernel._lu = splu(kernel._K.tocsc())
             K_Zy = kernel._lu.solve(Zy)
         else:
             # Check for cached LU factorization
             if kernel._lu is None:
                 from scipy.linalg import lu_factor, lu_solve
+
                 kernel._lu = lu_factor(kernel._K)
             K_Zy = lu_solve(kernel._lu, Zy)
     else:
@@ -508,7 +512,7 @@ def spatial_r_test(
         tr_K2 = kernel.square_trace()
         var_R = tr_K2
     else:
-        var_R = null_params.get('var_R', 1.0)
+        var_R = null_params.get("var_R", 1.0)
 
     sigma = np.sqrt(var_R)
 

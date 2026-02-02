@@ -1,12 +1,7 @@
-from typing import Tuple
-
 import numpy as np
 
 
-def get_rect_coords(
-    n_rows: int = 32,
-    n_cols: int = 32
-) -> Tuple[np.ndarray, Tuple[int, int]]:
+def get_rect_coords(n_rows: int = 32, n_cols: int = 32) -> tuple[np.ndarray, tuple[int, int]]:
     """
     Generate rectangular grid coordinates with unit spacing.
 
@@ -43,13 +38,11 @@ def get_rect_coords(
     """
     y = np.arange(n_rows)
     x = np.arange(n_cols)
-    yy, xx = np.meshgrid(y, x, indexing='ij')
+    yy, xx = np.meshgrid(y, x, indexing="ij")
     return np.column_stack([yy.ravel(), xx.ravel()]), (n_rows, n_cols)
 
-def get_visium_coords(
-    n_rows: int = 78,
-    n_cols: int = 64
-) -> Tuple[np.ndarray, Tuple[int, int]]:
+
+def get_visium_coords(n_rows: int = 78, n_cols: int = 64) -> tuple[np.ndarray, tuple[int, int]]:
     """
     Generate Visium-like hexagonal grid coordinates.
 
@@ -103,9 +96,8 @@ def get_visium_coords(
 
     return np.array(coords), (n_rows, n_cols)
 
-def convert_visium_to_physical(
-    coords: np.ndarray
-) -> np.ndarray:
+
+def convert_visium_to_physical(coords: np.ndarray) -> np.ndarray:
     """
     Convert integer Visium indices to physical hexagonal coordinates.
 
@@ -158,8 +150,7 @@ def convert_visium_to_physical(
 
 
 def compute_torus_distance_matrix(
-    phys_coords: np.ndarray,
-    domain_dims: Tuple[float, float]
+    phys_coords: np.ndarray, domain_dims: tuple[float, float]
 ) -> np.ndarray:
     """
     Compute pairwise Euclidean distances on a torus (with periodic boundary conditions).

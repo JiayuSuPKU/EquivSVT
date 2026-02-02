@@ -2,13 +2,16 @@
 Unit tests for quadsv.utils functions.
 Tests coordinate generation and distance calculations.
 """
-import numpy as np
+
 import unittest
+
+import numpy as np
+
 from quadsv.utils import (
-    get_rect_coords, 
-    get_visium_coords, 
+    compute_torus_distance_matrix,
     convert_visium_to_physical,
-    compute_torus_distance_matrix
+    get_rect_coords,
+    get_visium_coords,
 )
 
 
@@ -30,11 +33,11 @@ class TestGetRectCoords(unittest.TestCase):
         """Test that coordinates are within expected ranges."""
         n_rows, n_cols = 10, 20
         coords, _ = get_rect_coords(n_rows=n_rows, n_cols=n_cols)
-        
+
         # First column (rows) should be in [0, n_rows)
         assert np.all(coords[:, 0] >= 0)
         assert np.all(coords[:, 0] < n_rows)
-        
+
         # Second column (cols) should be in [0, n_cols)
         assert np.all(coords[:, 1] >= 0)
         assert np.all(coords[:, 1] < n_cols)
@@ -56,6 +59,7 @@ class TestGetRectCoords(unittest.TestCase):
 
 class TestGetVisiumCoords(unittest.TestCase):
     """Test Visium hexagonal grid coordinate generation."""
+
     def test_docstring_example(self):
         """Test example from docstring: 78x64 grid."""
         coords, dims = get_visium_coords(n_rows=78, n_cols=64)
@@ -67,30 +71,35 @@ class TestGetVisiumCoords(unittest.TestCase):
         coords, grid_dims = get_visium_coords(n_rows=3, n_cols=2)
         assert coords.shape == (6, 2)
         assert grid_dims == (3, 2)
-        
+
         # Verify hex pattern
         # Row 0 (even): starts at 0, then 2
         # Row 1 (odd): starts at 1, then 3
         # Row 2 (even): starts at 0, then 2
-        expected = np.array([
-            [0, 0], [0, 2],  # Row 0, even
-            [1, 1], [1, 3],  # Row 1, odd
-            [2, 0], [2, 2],  # Row 2, even
-        ])
+        expected = np.array(
+            [
+                [0, 0],
+                [0, 2],  # Row 0, even
+                [1, 1],
+                [1, 3],  # Row 1, odd
+                [2, 0],
+                [2, 2],  # Row 2, even
+            ]
+        )
         assert np.allclose(coords, expected)
 
     def test_row_parity_pattern(self):
         """Test that even and odd rows have correct starting columns."""
         coords, _ = get_visium_coords(n_rows=4, n_cols=3)
-        
+
         # Row 0 (even): cols should start at 0
         row_0 = coords[0:3]
         assert row_0[0, 1] == 0  # First col
-        
+
         # Row 1 (odd): cols should start at 1
         row_1 = coords[3:6]
         assert row_1[0, 1] == 1  # First col should be 1
-        
+
         # Row 2 (even): cols should start at 0
         row_2 = coords[6:9]
         assert row_2[0, 1] == 0  # First col
@@ -98,7 +107,7 @@ class TestGetVisiumCoords(unittest.TestCase):
     def test_col_spacing_is_2(self):
         """Test that columns within a row are spaced by 2."""
         coords, _ = get_visium_coords(n_rows=2, n_cols=4)
-        
+
         # Row 0: should have cols 0, 2, 4, 6
         row_0 = coords[0:4, 1]
         diffs = np.diff(row_0)
@@ -123,13 +132,9 @@ class TestConvertVisiumToPhysical(unittest.TestCase):
         """Test example from docstring with specific input coordinates."""
         coords = np.array([[0, 0], [0, 2], [1, 1]])
         phys_coords = convert_visium_to_physical(coords)
-        
+
         # Expected results from docstring
-        expected = np.array([
-            [0.0, 0.0],
-            [0.0, 1.0],
-            [0.8660254, 0.5]
-        ])
+        expected = np.array([[0.0, 0.0], [0.0, 1.0], [0.8660254, 0.5]])
         np.testing.assert_array_almost_equal(phys_coords, expected, decimal=6)
 
     def test_origin_conversion(self):
@@ -149,7 +154,7 @@ class TestConvertVisiumToPhysical(unittest.TestCase):
         """Test that row scaling is sqrt(3)/2."""
         coords = np.array([[0, 0], [1, 0], [2, 0]])
         phys = convert_visium_to_physical(coords)
-        expected_y = np.array([0, np.sqrt(3)/2, np.sqrt(3)])
+        expected_y = np.array([0, np.sqrt(3) / 2, np.sqrt(3)])
         assert np.allclose(phys[:, 0], expected_y)
 
     def test_hex_distance_properties(self):
@@ -157,41 +162,38 @@ class TestConvertVisiumToPhysical(unittest.TestCase):
         # In hexagonal grid, each cell has 6 equidistant neighbors
         # For the cell at (0, 0), neighbors should be at fixed distance
         center = np.array([[0, 0]])
-        neighbors = np.array([
-            [0, 2],   # right
-            [1, 1],   # down-right
-            [1, -1],  # down-left (if wrapped)
-            [0, -2],  # left (if wrapped)
-            [-1, -1], # up-left (if wrapped)
-            [-1, 1],  # up-right (if wrapped)
-        ])
-        
+        neighbors = np.array(
+            [
+                [0, 2],  # right
+                [1, 1],  # down-right
+                [1, -1],  # down-left (if wrapped)
+                [0, -2],  # left (if wrapped)
+                [-1, -1],  # up-left (if wrapped)
+                [-1, 1],  # up-right (if wrapped)
+            ]
+        )
+
         center_phys = convert_visium_to_physical(center)
         neighbors_phys = convert_visium_to_physical(neighbors)
-        
+
         # Compute distances
         dists = np.linalg.norm(neighbors_phys - center_phys, axis=1)
-        
+
         # All distances should be 1.0 (for valid neighbors within bounds)
         # We only test the first neighbor (right) which should be valid
         assert np.isclose(dists[0], 1.0)
 
     def test_batch_conversion(self):
         """Test conversion of multiple coordinates."""
-        coords = np.array([
-            [0, 0],
-            [1, 2],
-            [2, 4],
-            [3, 0]
-        ])
+        coords = np.array([[0, 0], [1, 2], [2, 4], [3, 0]])
         phys = convert_visium_to_physical(coords)
         assert phys.shape == (4, 2)
-        
+
         # Verify each row
         assert np.allclose(phys[0], [0.0, 0.0])
-        assert np.allclose(phys[1], [np.sqrt(3)/2, 1.0])
+        assert np.allclose(phys[1], [np.sqrt(3) / 2, 1.0])
         assert np.allclose(phys[2], [np.sqrt(3), 2.0])
-        assert np.allclose(phys[3], [3 * np.sqrt(3)/2, 0.0])
+        assert np.allclose(phys[3], [3 * np.sqrt(3) / 2, 0.0])
 
     def test_output_shape(self):
         """Test that output shape matches input."""
@@ -208,7 +210,7 @@ class TestComputeTorusDistanceMatrix(unittest.TestCase):
         coords = np.array([[0.0, 0.0], [1.0, 0.0], [9.9, 0.0]])
         domain = (10.0, 10.0)
         dists = compute_torus_distance_matrix(coords, domain)
-        
+
         # Distance from (0,0) to (9.9,0) on [0,10)×[0,10) torus should wrap
         # Wrapping distance: min(9.9, 10-9.9) = 0.1
         np.testing.assert_almost_equal(dists[0, 2], 0.1, decimal=6)
@@ -227,35 +229,26 @@ class TestComputeTorusDistanceMatrix(unittest.TestCase):
         coords = np.array([[0.0, 0.0], [3.0, 4.0]])
         domain_dims = (100.0, 100.0)  # Large domain, no wrapping
         dist_matrix = compute_torus_distance_matrix(coords, domain_dims)
-        
+
         # Euclidean distance should be 5.0
         assert np.isclose(dist_matrix[0, 1], 5.0)
         assert np.isclose(dist_matrix[1, 0], 5.0)
 
     def test_symmetry(self):
         """Test that distance matrix is symmetric."""
-        coords = np.array([
-            [1.0, 2.0],
-            [3.0, 4.0],
-            [5.0, 1.0]
-        ])
+        coords = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 1.0]])
         domain_dims = (20.0, 20.0)
         dist_matrix = compute_torus_distance_matrix(coords, domain_dims)
-        
+
         # Should be symmetric
         assert np.allclose(dist_matrix, dist_matrix.T)
 
     def test_diagonal_zeros(self):
         """Test that diagonal is all zeros (distance to self)."""
-        coords = np.array([
-            [0.5, 0.5],
-            [2.0, 3.0],
-            [5.0, 1.0],
-            [7.0, 8.0]
-        ])
+        coords = np.array([[0.5, 0.5], [2.0, 3.0], [5.0, 1.0], [7.0, 8.0]])
         domain_dims = (20.0, 20.0)
         dist_matrix = compute_torus_distance_matrix(coords, domain_dims)
-        
+
         assert np.allclose(np.diag(dist_matrix), 0.0)
 
     def test_wrapping_both_axes(self):
@@ -267,7 +260,7 @@ class TestComputeTorusDistanceMatrix(unittest.TestCase):
         coords = np.array([[0.5, 0.5], [9.0, 9.5]])
         domain_dims = (10.0, 10.0)
         dist_matrix = compute_torus_distance_matrix(coords, domain_dims)
-        
+
         expected_dist = np.sqrt(1.5**2 + 1.0**2)
         assert np.isclose(dist_matrix[0, 1], expected_dist)
 
@@ -276,40 +269,32 @@ class TestComputeTorusDistanceMatrix(unittest.TestCase):
         coords = np.array([[0.0, 0.0], [1.0, 19.5]])
         domain_dims = (20.0, 20.0)
         dist_matrix = compute_torus_distance_matrix(coords, domain_dims)
-        
+
         # Distance with wrapping: sqrt(1 + 0.5^2) = sqrt(1.25)
         expected_dist = np.sqrt(1.0**2 + 0.5**2)
         assert np.isclose(dist_matrix[0, 1], expected_dist)
 
     def test_non_negative_distances(self):
         """Test that all distances are non-negative."""
-        coords = np.array([
-            [0.0, 0.0],
-            [5.0, 5.0],
-            [9.9, 9.9],
-            [0.1, 0.1]
-        ])
+        coords = np.array([[0.0, 0.0], [5.0, 5.0], [9.9, 9.9], [0.1, 0.1]])
         domain_dims = (10.0, 10.0)
         dist_matrix = compute_torus_distance_matrix(coords, domain_dims)
-        
+
         assert np.all(dist_matrix >= 0)
 
     def test_triangle_inequality(self):
         """Test that triangle inequality holds approximately."""
-        coords = np.array([
-            [0.0, 0.0],
-            [3.0, 0.0],
-            [0.0, 4.0]
-        ])
+        coords = np.array([[0.0, 0.0], [3.0, 0.0], [0.0, 4.0]])
         domain_dims = (100.0, 100.0)  # Large to avoid wrapping
         dist_matrix = compute_torus_distance_matrix(coords, domain_dims)
-        
+
         # d(A,B) + d(B,C) >= d(A,C)
         d_ab = dist_matrix[0, 1]
         d_bc = dist_matrix[1, 2]
         d_ac = dist_matrix[0, 2]
-        
+
         assert d_ab + d_bc >= d_ac - 1e-10  # Account for floating point error
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

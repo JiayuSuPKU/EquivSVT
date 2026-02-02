@@ -1,27 +1,24 @@
 """
 quadsv: Spatial statistics library for kernel-based hypothesis testing
 
-This package implements kernel-based hypothesis tests for detecting 
-spatial variability and equivalence testing using different kernel methods 
+This package implements kernel-based hypothesis tests for detecting
+spatial variability and equivalence testing using different kernel methods
 (Moran, Gaussian RBF, Matérn, Laplacian).
 """
 
 # Automatically read version from installed package or fallback to hardcoded
 try:
-    from importlib.metadata import version, PackageNotFoundError
-    __version__ = version('quadsv')
+    from importlib.metadata import PackageNotFoundError, version
+
+    __version__ = version("quadsv")
 except (ImportError, PackageNotFoundError):
     # Fallback for development environments where package is not installed
-    __version__ = '0.1.0'
+    __version__ = "0.1.0"
 
 # Import core classes and functions
+from quadsv.fft import FFTKernel, spatial_q_test_fft, spatial_r_test_fft
 from quadsv.kernels import SpatialKernel
-from quadsv.statistics import (
-    spatial_q_test, spatial_r_test
-)
-from quadsv.fft import (
-    FFTKernel, spatial_q_test_fft, spatial_r_test_fft
-)
+from quadsv.statistics import spatial_q_test, spatial_r_test
 
 # Two application classes for pattern detection
 # from quadsv.detector import PatternDetector

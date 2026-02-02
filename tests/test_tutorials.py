@@ -4,30 +4,28 @@ Tutorial and Integration Tests - Real-World Use Cases
 This test module validates all tutorial examples from documentation and README.
 Tests are organized by use case to demonstrate typical workflows.
 """
+
+import importlib.util
 import unittest
+
 import numpy as np
-import tempfile
-import os
 
 try:
     import anndata as ad
+
     HAS_ANNDATA = True
 except ImportError:
     HAS_ANNDATA = False
 
-try:
-    import spatialdata as sd
-    HAS_SPATIALDATA = True
-except ImportError:
-    HAS_SPATIALDATA = False
+HAS_SPATIALDATA = importlib.util.find_spec("spatialdata") is not None
 
 from quadsv.kernels import SpatialKernel
-from quadsv.statistics import spatial_q_test, spatial_r_test, compute_null_params
+from quadsv.statistics import compute_null_params, spatial_q_test, spatial_r_test
 
 
 class TestTutorialBasicQTest(unittest.TestCase):
     """Tutorial: Basic Q-test for spatial variability detection.
-    
+
     Use case: Test whether a single gene exhibits significant spatial clustering.
     """
 
@@ -42,19 +40,14 @@ class TestTutorialBasicQTest(unittest.TestCase):
 
     def test_q_test_basic_workflow(self):
         """Test: Q-test basic workflow from README.
-        
+
         Step-by-step:
         1. Build CAR kernel from coordinates
         2. Compute Q-statistic and p-value
         3. Verify output format
         """
         # Build CAR kernel (recommended)
-        kernel = SpatialKernel.from_coordinates(
-            self.coords,
-            method='car',
-            k_neighbors=15,
-            rho=0.9
-        )
+        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         # Compute Q-test
         Q, pval = spatial_q_test(self.gene_expr, kernel)
@@ -70,21 +63,17 @@ class TestTutorialBasicQTest(unittest.TestCase):
 
     def test_q_test_different_null_approximations(self):
         """Test: Q-test with different null approximation methods."""
-        kernel = SpatialKernel.from_coordinates(
-            self.coords, method='car', k_neighbors=15, rho=0.9
-        )
+        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         # Test with different null approximations
-        methods = ['welch', 'liu']
-        
+        methods = ["welch", "liu"]
+
         for method in methods:
             null_params = compute_null_params(kernel, method=method)
             Q, pval = spatial_q_test(
-                self.gene_expr, kernel,
-                null_params=null_params,
-                return_pval=True
+                self.gene_expr, kernel, null_params=null_params, return_pval=True
             )
-            
+
             self.assertIsInstance(Q, (float, np.floating))
             self.assertIsInstance(pval, (float, np.floating))
             self.assertGreaterEqual(pval, 0)
@@ -92,18 +81,14 @@ class TestTutorialBasicQTest(unittest.TestCase):
 
     def test_q_test_multiple_genes(self):
         """Test: Q-test on multiple genes (matrix input)."""
-        kernel = SpatialKernel.from_coordinates(
-            self.coords, method='car', k_neighbors=15, rho=0.9
-        )
+        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         # Stack multiple genes
         n_genes = 5
         genes_matrix = np.random.randn(self.n_spots, n_genes)
 
         # Compute Q-statistics for each gene
-        Q_values, pvals = spatial_q_test(
-            genes_matrix, kernel, return_pval=True
-        )
+        Q_values, pvals = spatial_q_test(genes_matrix, kernel, return_pval=True)
 
         # Verify output
         self.assertEqual(Q_values.shape, (n_genes,))
@@ -127,12 +112,10 @@ class TestTutorialRTest(unittest.TestCase):
 
     def test_r_test_basic_workflow(self):
         """Test: R-test basic workflow from README.
-        
+
         Use case: Detect spatial co-expression between two genes.
         """
-        kernel = SpatialKernel.from_coordinates(
-            self.coords, method='car', k_neighbors=15, rho=0.9
-        )
+        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         # Compute R-test
         R, pval = spatial_r_test(self.gene1, self.gene2, kernel)
@@ -145,9 +128,7 @@ class TestTutorialRTest(unittest.TestCase):
 
     def test_r_test_symmetry(self):
         """Test: R-test symmetry (order of genes shouldn't matter much)."""
-        kernel = SpatialKernel.from_coordinates(
-            self.coords, method='car', k_neighbors=15, rho=0.9
-        )
+        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         R1, pval1 = spatial_r_test(self.gene1, self.gene2, kernel)
         R2, pval2 = spatial_r_test(self.gene2, self.gene1, kernel)
@@ -161,7 +142,7 @@ class TestTutorialRTest(unittest.TestCase):
 @unittest.skipIf(not HAS_ANNDATA, "AnnData not installed")
 class TestTutorialAnnDataWorkflow(unittest.TestCase):
     """Tutorial: Genome-wide analysis using AnnData.
-    
+
     Use case: Detect spatially variable genes (SVGs) in a tissue sample.
     """
 
@@ -173,18 +154,18 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
 
         # Create synthetic count data
         X = np.random.poisson(lam=5, size=(n_obs, n_vars)).astype(np.float32)
-        
+
         # Create AnnData object
         self.adata = ad.AnnData(X)
-        self.adata.var_names = [f'Gene_{i}' for i in range(n_vars)]
-        self.adata.obs_names = [f'Cell_{i}' for i in range(n_obs)]
-        
+        self.adata.var_names = [f"Gene_{i}" for i in range(n_vars)]
+        self.adata.obs_names = [f"Cell_{i}" for i in range(n_obs)]
+
         # Add synthetic spatial coordinates
-        self.adata.obsm['spatial'] = np.random.randn(n_obs, 2)
+        self.adata.obsm["spatial"] = np.random.randn(n_obs, 2)
 
     def test_anndata_integration(self):
         """Test: Basic AnnData integration and kernel building.
-        
+
         Workflow:
         1. Load AnnData object
         2. Build kernel from obsm['spatial']
@@ -194,17 +175,14 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
 
         # Initialize detector
         detector = PatternDetector(self.adata, min_cells_frac=0.05)
-        
+
         # Verify detector initialized
         self.assertIsNotNone(detector.adata)
         self.assertEqual(detector.adata.n_obs, 500)
 
         # Build kernel from coordinates
         detector.build_kernel_from_coordinates(
-            self.adata.obsm['spatial'],
-            method='car',
-            k_neighbors=10,
-            rho=0.9
+            self.adata.obsm["spatial"], method="car", k_neighbors=10, rho=0.9
         )
 
         # Verify kernel was built
@@ -217,26 +195,23 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
 
         detector = PatternDetector(self.adata, min_cells_frac=0.05)
         detector.build_kernel_from_coordinates(
-            self.adata.obsm['spatial'],
-            method='car',
-            k_neighbors=10,
-            rho=0.9
+            self.adata.obsm["spatial"], method="car", k_neighbors=10, rho=0.9
         )
 
         # Compute Q-statistics for subset of genes
-        features = ['Gene_0', 'Gene_1', 'Gene_2']
+        features = ["Gene_0", "Gene_1", "Gene_2"]
         results = detector.compute_qstat(
-            source='var',
+            source="var",
             features=features,
-            n_jobs=1,  # Single job for testing
-            return_pval=True
+            n_jobs=1,
+            return_pval=True,  # Single job for testing
         )
 
         # Verify results structure
         self.assertIsNotNone(results)
         self.assertTrue(len(results) > 0)
-        self.assertIn('Q', results.columns)
-        self.assertIn('P_value', results.columns)
+        self.assertIn("Q", results.columns)
+        self.assertIn("P_value", results.columns)
 
     def test_anndata_rstat_computation(self):
         """Test: Compute pairwise R-statistics."""
@@ -244,33 +219,26 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
 
         detector = PatternDetector(self.adata, min_cells_frac=0.05)
         detector.build_kernel_from_coordinates(
-            self.adata.obsm['spatial'],
-            method='car',
-            k_neighbors=10,
-            rho=0.9
+            self.adata.obsm["spatial"], method="car", k_neighbors=10, rho=0.9
         )
 
         # Test on small subset for speed
-        features_x = ['Gene_0', 'Gene_1', 'Gene_2']
-        
+        features_x = ["Gene_0", "Gene_1", "Gene_2"]
+
         results = detector.compute_rstat(
-            source='var',
-            features_x=features_x,
-            features_y=features_x,
-            n_jobs=1,
-            return_pval=True
+            source="var", features_x=features_x, features_y=features_x, n_jobs=1, return_pval=True
         )
 
         # Verify results structure
         self.assertIsNotNone(results)
         self.assertTrue(len(results) > 0)
-        self.assertIn('R', results.columns)
-        self.assertIn('P_value', results.columns)
+        self.assertIn("R", results.columns)
+        self.assertIn("P_value", results.columns)
 
 
 class TestTutorialFFTKernel(unittest.TestCase):
     """Tutorial: FFT-accelerated kernels for regular grids.
-    
+
     Use case: Analyze large Visium HD datasets efficiently.
     """
 
@@ -285,12 +253,7 @@ class TestTutorialFFTKernel(unittest.TestCase):
         from quadsv.fft import FFTKernel
 
         # Create FFT kernel
-        kernel_fft = FFTKernel(
-            shape=self.grid_shape,
-            method='car',
-            rho=0.9,
-            topology='square'
-        )
+        kernel_fft = FFTKernel(shape=self.grid_shape, method="car", rho=0.9, topology="square")
 
         # Verify properties
         self.assertEqual(kernel_fft.ny, self.grid_shape[0])
@@ -305,7 +268,7 @@ class TestTutorialFFTKernel(unittest.TestCase):
 
     def test_fft_kernel_vs_spatial_kernel(self):
         """Test: FFT kernel gives reasonable results vs. spatial kernel.
-        
+
         For a small regular grid, compare FFT and spatial kernels.
         """
         from quadsv.fft import FFTKernel
@@ -318,18 +281,13 @@ class TestTutorialFFTKernel(unittest.TestCase):
 
         kernel_spatial = SpatialKernel.from_coordinates(
             grid_coords,
-            method='car',
-            k_neighbors=4,  # 4-neighbor grid
-            rho=0.9
+            method="car",
+            k_neighbors=4,
+            rho=0.9,  # 4-neighbor grid
         )
 
         # Create FFT kernel for same grid
-        kernel_fft = FFTKernel(
-            shape=(50, 50),
-            method='car',
-            rho=0.9,
-            topology='square'
-        )
+        kernel_fft = FFTKernel(shape=(50, 50), method="car", rho=0.9, topology="square")
 
         # Generate test data
         np.random.seed(42)
@@ -345,5 +303,6 @@ class TestTutorialFFTKernel(unittest.TestCase):
         self.assertGreater(ratio, 0.5)  # FFT within 2x of spatial
         self.assertLess(ratio, 2.0)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()
