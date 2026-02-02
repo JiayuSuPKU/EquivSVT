@@ -1,0 +1,165 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quadsv"
+version = "0.1.0"
+description = "Consistent and scalable spatial pattern detection via quadratic forms."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BSD-3-Clause"}
+authors = [
+    {name = "Jiayu Su"}
+]
+maintainers = [
+    {name = "Jiayu Su"}
+]
+keywords = [
+    "spatial statistics",
+    "pattern detection",
+    "SVG detection",
+    "kernel methods",
+    "hypothesis testing",
+    "spatial transcriptomics",
+    "single-cell",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD-3-Clause License",
+    "Natural Language :: English",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "scikit-learn>=1.0.0",
+    "pandas>=1.3.0",
+    "scanpy>=1.9.0",
+    "joblib>=1.0.0",
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+    "jupyter>=1.0.0",
+    "matplotlib>=3.5.0",
+    "black>=22.0.0",
+    "ruff>=0.1.0",
+]
+docs = [
+    "sphinx>=4.5.0",
+    "pydata-sphinx-theme>=0.13.0",
+    "sphinx-autodoc-typehints>=1.12.0",
+    "sphinxcontrib-napoleon>=0.7",
+    "myst-parser>=0.18.0",
+    "sphinx-autobuild>=2021.3.14",
+]
+spatial = [
+    "anndata>=0.8.0",
+    "spatialdata>=0.1.0",
+]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+    "pytest-xdist>=3.0.0",
+]
+
+[project.urls]
+Documentation = "https://quadsv.readthedocs.io/"
+Repository = "https://github.com/JiayuSuPKU/EquivSVT"
+"Bug Tracker" = "https://github.com/JiayuSuPKU/EquivSVT/issues"
+"Source Code" = "https://github.com/JiayuSuPKU/EquivSVT"
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+  | docs
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "C",      # flake8-comprehensions
+    "B",      # flake8-bugbear
+    "UP",     # pyupgrade
+]
+ignore = [
+    "E501",   # line too long (handled by black)
+    "B008",   # do not perform function calls in argument defaults
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401", "E402"]
+"tests/**" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "--strict-markers -v -p no:npe2 -p no:napari"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
+
+[tool.coverage.run]
+source = ["quadsv"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+    "*/setup.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "if typing.TYPE_CHECKING:",
+]
+precision = 2
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quadsv*"]
+exclude = ["tests*", "data*", "figures*"]
