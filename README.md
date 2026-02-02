@@ -12,7 +12,9 @@ Detect spatial patterns in omics data via kernel-based hypothesis tests for spat
 
 ```bash
 pip install quadsv  # From PyPI
-# OR
+# OR (latest dev version)
+pip install git+https://github.com/JiayuSuPKU/EquivSVT.git#egg=quadsv
+# OR (for development)
 git clone https://github.com/JiayuSuPKU/EquivSVT.git && cd EquivSVT && pip install -e .
 ```
 
@@ -139,7 +141,7 @@ pytest tests/test_tutorials.py -v       # Run tutorial examples
 pip install -e ".[dev,docs]"            # Install dev + docs dependencies
 ```
 
-**Documentation:** [ReadTheDocs](https://quadsv.readthedocs.io/)
+**Documentation:** [ReadTheDocs](https://equivsvt.readthedocs.io/)
 
 <!-- ## Citation & References
 
@@ -154,4 +156,4 @@ link to preprint.
 
 - **License:** BSD-3-Clause – see [LICENSE](LICENSE)  
 - **Issues:** [GitHub Issues](https://github.com/JiayuSuPKU/EquivSVT/issues)  
-- **Docs:** [ReadTheDocs](https://quadsv.readthedocs.io/)
+- **Docs:** [ReadTheDocs](https://equivsvt.readthedocs.io/)

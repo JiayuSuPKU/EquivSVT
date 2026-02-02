@@ -61,6 +61,8 @@ dev = [
     "matplotlib>=3.5.0",
     "black>=22.0.0",
     "ruff>=0.1.0",
+    "build>=1.0.0",
+    "twine>=4.0.0",
 ]
 docs = [
     "sphinx>=4.5.0",
@@ -81,7 +83,7 @@ test = [
 ]
 
 [project.urls]
-Documentation = "https://quadsv.readthedocs.io/"
+Documentation = "https://equivsvt.readthedocs.io/"
 Repository = "https://github.com/JiayuSuPKU/EquivSVT"
 "Bug Tracker" = "https://github.com/JiayuSuPKU/EquivSVT/issues"
 "Source Code" = "https://github.com/JiayuSuPKU/EquivSVT"

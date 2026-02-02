@@ -20,7 +20,12 @@ Or install with optional dependencies:
 Development installation
 ------------------------
 
-Clone and install in editable mode:
+Latest development version from GitHub:
+.. code-block:: bash
+
+   pip install git+https://github.com/JiayuSuPKU/EquivSVT.git#egg=quadsv
+
+Alternatively, clone and install in editable mode:
 
 .. code-block:: bash
 
