@@ -48,3 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tutorial test cases demonstrating all major workflows
 - Complete documentation with quickstart and theory sections
 - Support for Python 3.10, 3.11, 3.12
+
+## [0.1.1]
+
+### Fixed
+- Fix type hinting issues in `quadsv.kernels` module

@@ -3,16 +3,33 @@
 
 import os
 import sys
+from pathlib import Path
 
 # Add quadsv source directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# Read version from pyproject.toml
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import tomli as tomllib  # Fallback for Python 3.10
+
+project_root = Path(__file__).parent.parent
+pyproject_path = project_root / 'pyproject.toml'
+
+if pyproject_path.exists():
+    with open(pyproject_path, 'rb') as f:
+        pyproject_data = tomllib.load(f)
+    version_str = pyproject_data['project']['version']
+else:
+    version_str = '0.1.0'  # Fallback version
 
 # Project information
 project = 'quadsv'
 copyright = '2026, Jiayu Su'
 author = 'Jiayu Su'
-version = '0.1.0'
-release = '0.1.0'
+version = version_str
+release = version_str
 
 # General configuration
 extensions = [

@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quadsv"
-version = "0.1.0"
+version = "0.1.1"
 description = "Consistent and scalable spatial pattern detection via quadratic forms."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "BSD-3-Clause"}
+license = "BSD-3-Clause"
 authors = [
     {name = "Jiayu Su"}
 ]
@@ -68,6 +68,7 @@ docs = [
     "pydata-sphinx-theme>=0.13.0",
     "sphinx-autodoc-typehints>=1.12.0",
     "sphinxcontrib-napoleon>=0.7",
+    "tomli>=1.0.0;python_version<'3.11'",
     "myst-parser>=0.18.0",
     "sphinx-autobuild>=2021.3.14",
 ]

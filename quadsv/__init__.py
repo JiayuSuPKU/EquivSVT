@@ -6,7 +6,13 @@ spatial variability and equivalence testing using different kernel methods
 (Moran, Gaussian RBF, Matérn, Laplacian).
 """
 
-__version__ = "0.1.0"
+# Automatically read version from installed package or fallback to hardcoded
+try:
+    from importlib.metadata import version, PackageNotFoundError
+    __version__ = version('quadsv')
+except (ImportError, PackageNotFoundError):
+    # Fallback for development environments where package is not installed
+    __version__ = '0.1.0'
 
 # Import core classes and functions
 from quadsv.kernels import SpatialKernel
