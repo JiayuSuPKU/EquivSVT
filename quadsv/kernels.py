@@ -8,7 +8,7 @@ from sklearn.neighbors import NearestNeighbors
 from abc import ABC, abstractmethod
 from scipy.special import kv, gamma
 from tqdm import tqdm
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, Any
 
 class Kernel(ABC):
     """
