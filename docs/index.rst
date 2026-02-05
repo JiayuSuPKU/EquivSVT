@@ -3,7 +3,7 @@ Consistent and scalable detection of spatial patterns
 
 Welcome to ``quadsv``, a Python library for detecting patterns in spatial omics data and beyond.
 
-In our accompanied paper, we unify spatial pattern detection methods through a single quadratic-form Q-statistic framework. 
+In our `accompanied paper <https://arxiv.org/pdf/2602.02825>`_, we unify spatial pattern detection methods through a single quadratic-form Q-statistic framework. 
 Major spatial variable gene (SVG) detection methods (Moran's I, parametric models, dependence tests) are mathematically 
 equivalent instances of the Q-test, differing primarily in kernel choice. 
 We reveal that several widely used methods, including Moran's I, are inconsistent, and propose scalable corrections. 
@@ -35,6 +35,12 @@ Quick links
    kernels
    faq
    api/index
+
+References
+----------
+
+Su, Jiayu, et al. "On the consistent and scalable detection of spatial patterns." arXiv (2026): 2602.02825.
+
 
 Indices and tables
 ------------------

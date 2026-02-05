@@ -12,7 +12,7 @@ The spatial Q-test framework unifies pattern detection under the quadratic form,
 
 The kernel matrix :math:`\mathbf{K}` encodes spatial structure. **Test consistency requires positive definiteness**; indefinite kernels suffer spectral cancellation and produce false negatives.
 
-**See theory:** :doc:`theory` for Theorems 1–2, CAR kernel solution, null distributions, and FFT acceleration.
+**See theory:** :doc:`theory` for Theorems 1-2, CAR kernel solution, null distributions, and FFT acceleration.
 
 
 Kernel spectrum and power

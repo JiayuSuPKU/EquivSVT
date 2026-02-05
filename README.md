@@ -144,17 +144,13 @@ pip install -e ".[dev,docs]"            # Install dev + docs dependencies
 
 **Documentation:** [ReadTheDocs](https://equivsvt.readthedocs.io/)
 
-<!-- ## Citation & References
+## References
 
-If you use quadsv in your research, please cite:
+Su, Jiayu, et al. "On the consistent and scalable detection of spatial patterns." arXiv (2026): 2602.02825. [link to preprint](https://arxiv.org/abs/2602.02825)
 
-```
-Su, Jiayu, et al. (2026). On the consistent and scalable detection of spatial patterns. 
-link to preprint.
-``` -->
 
 ## License & Support
 
-- **License:** BSD-3-Clause – see [LICENSE](LICENSE)  
+- **License:** BSD-3-Clause - see [LICENSE](LICENSE)  
 - **Issues:** [GitHub Issues](https://github.com/JiayuSuPKU/EquivSVT/issues)  
 - **Docs:** [ReadTheDocs](https://equivsvt.readthedocs.io/)
