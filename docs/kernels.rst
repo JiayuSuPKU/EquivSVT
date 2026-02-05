@@ -106,7 +106,7 @@ Use median pairwise distance as starting point:
 
 **k-Neighbors** (graph kernels)
 
-- k = 5–10: Sparse, local
+- k = 5-10: Sparse, local
 - k = 30+: Dense, global
 
 .. code-block:: python

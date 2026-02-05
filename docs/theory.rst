@@ -1,7 +1,7 @@
 Theoretical Results
 ====================================
 
-In our accompanied paper, we demonstrate that virtually all major spatial variable gene (SVG) detection methods, 
+In our `accompanied paper <https://arxiv.org/pdf/2602.02825>`_, we demonstrate that virtually all major spatial variable gene (SVG) detection methods, 
 including graph-based ones like Moran's I, parametric models, and non-parametric dependence tests, reduce to
 a single quadratic-form statistic (**Q-statistic**),
 
