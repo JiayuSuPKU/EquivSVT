@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import warnings
 from typing import Any
 
 import numpy as np
@@ -69,11 +72,14 @@ class FFTKernel:
         >>> kernel = FFTKernel((64, 64), topology='hex', method='matern')
         """
         self.ny, self.nx = shape
+        if self.ny < 2 or self.nx < 2:
+            raise ValueError(f"Grid dimensions must be >= 2, got ({self.ny}, {self.nx})")
         self.dy, self.dx = spacing
         self.n_grid = self.ny * self.nx
 
         # FFT solver selection
-        assert fft_solver in ["fft2", "rfft2"], "fft_solver must be 'fft2' or 'rfft2'."
+        if fft_solver not in ("fft2", "rfft2"):
+            raise ValueError(f"fft_solver must be 'fft2' or 'rfft2', got '{fft_solver}'")
         self.fft_solver = fft_solver
         if fft_solver == "fft2":
             self.n_rfft = self.ny * self.nx  # Full spectrum
@@ -81,10 +87,10 @@ class FFTKernel:
             self.n_rfft = self.ny * (self.nx // 2 + 1)  # rfft2 spectrum size
 
         # Sanity Checks
-        assert topology in ["square", "hex"], "topology must be 'square' or 'hex'."
-        assert (
-            method in self._available_kernels
-        ), f"method must be one of {self._available_kernels}."
+        if topology not in ("square", "hex"):
+            raise ValueError(f"topology must be 'square' or 'hex', got '{topology}'")
+        if method not in self._available_kernels:
+            raise ValueError(f"method must be one of {self._available_kernels}, got '{method}'")
 
         self.topology = topology
         self.method = method
@@ -259,10 +265,11 @@ class FFTKernel:
             bw = self.params["bandwidth"]
             nu = self.params["nu"]
             d = np.sqrt(self.min_dist_sq)
-            d[d == 0] = 1e-15
+            mask_zero = d == 0
+            d[mask_zero] = 1.0  # dummy value, overwritten below
             factor = (np.sqrt(2 * nu) * d) / bw
             K_img = (2 ** (1 - nu) / gamma(nu)) * (factor**nu) * kv(nu, factor)
-            K_img[0, 0] = 1.0
+            K_img[mask_zero] = 1.0  # correct limit: K(x, x) = 1
             if self.fft_solver == "fft2":
                 spectrum_2d = scipy.fft.fft2(K_img, workers=self.workers)
             else:
@@ -306,6 +313,11 @@ class FFTKernel:
                 rho = self.params["rho"]
                 # Cap rho to prevent singularity if rho is too close to 1
                 if rho >= 1.0:
+                    warnings.warn(
+                        f"rho={rho} >= 1.0 causes singularity in CAR kernel; clamping to 0.99",
+                        UserWarning,
+                        stacklevel=2,
+                    )
                     rho = 0.99
                 return 1.0 / (1.0 - rho * lam_W)
 
@@ -334,7 +346,10 @@ class FFTKernel:
 
         ny, nx, M = x.shape
 
-        assert ny == self.ny and nx == self.nx
+        if ny != self.ny or nx != self.nx:
+            raise ValueError(
+                f"Data shape ({ny}, {nx}) does not match kernel ({self.ny}, {self.nx})"
+            )
 
         # Transform using selected FFT solver
         if self.fft_solver == "fft2":
@@ -441,7 +456,6 @@ class FFTKernel:
         float
             Trace of K² (sum of squared eigenvalues).
         """
-        """Returns the trace of the squared kernel matrix."""
         return np.sum(self.eigenvalues(return_full=True) ** 2)
 
 
@@ -505,9 +519,10 @@ def spatial_q_test_fft(
         Xn = Xn[..., np.newaxis]
 
     ny, nx, M = Xn.shape
-    assert (
-        ny == kernel.ny and nx == kernel.nx
-    ), f"Data shape ({ny}, {nx}) does not match kernel ({kernel.ny}, {kernel.nx})"
+    if ny != kernel.ny or nx != kernel.nx:
+        raise ValueError(
+            f"Data shape ({ny}, {nx}) does not match kernel ({kernel.ny}, {kernel.nx})"
+        )
 
     # 1. Standardization (Z-score across spatial dimensions)
     if is_standardized:
@@ -555,9 +570,10 @@ def spatial_q_test_fft(
 
     # For otehr kernels, use Liu's method
     evals = kernel.eigenvalues(return_full=True)
-    assert (
-        evals.min() >= -0.1
-    ), "Kernel has significant negative eigenvalues; Liu's method may be invalid."
+    if evals.min() < -0.1:
+        raise ValueError(
+            "Kernel has significant negative eigenvalues; Liu's method may be invalid."
+        )
 
     # Filter numerical noise
     sig_evals = evals[evals > 1e-9]
@@ -568,6 +584,38 @@ def spatial_q_test_fft(
         pval = np.array([liu_sf(q, sig_evals) for q in Q])
 
     return Q, pval
+
+
+def _standardize_grid(X: np.ndarray) -> np.ndarray:
+    """Z-score standardize a grid tensor along spatial dims (0, 1)."""
+    m = np.mean(X, axis=(0, 1), keepdims=True)
+    s = np.std(X, axis=(0, 1), keepdims=True, ddof=1)
+    Z = np.zeros_like(X)
+    np.divide(X - m, s, out=Z, where=(s > 1e-12))
+    return Z
+
+
+def _spectral_cross_product(
+    Zx: np.ndarray, Zy: np.ndarray, kernel: FFTKernel, ny: int, nx: int
+) -> np.ndarray:
+    """Compute sum of conj(Zx_hat) * lambda * Zy_hat in frequency domain."""
+    if kernel.fft_solver == "fft2":
+        Zx_hat = scipy.fft.fft2(Zx, axes=(0, 1), workers=kernel.workers)
+        Zy_hat = scipy.fft.fft2(Zy, axes=(0, 1), workers=kernel.workers)
+        lam = kernel.eigenvalues().reshape(ny, nx, 1)
+        spectral_prod = np.real(np.conj(Zx_hat) * lam * Zy_hat)
+        return np.sum(spectral_prod, axis=(0, 1))
+
+    # rfft2 case with symmetry correction
+    Zx_hat = scipy.fft.rfft2(Zx, axes=(0, 1), workers=kernel.workers)
+    Zy_hat = scipy.fft.rfft2(Zy, axes=(0, 1), workers=kernel.workers)
+    lam = kernel.eigenvalues().reshape(ny, nx // 2 + 1, 1)
+    spectral_prod = np.real(np.conj(Zx_hat) * lam * Zy_hat)
+    R_sum = 2.0 * np.sum(spectral_prod, axis=(0, 1))
+    R_sum -= np.sum(spectral_prod[:, 0, :], axis=0)
+    if nx % 2 == 0:
+        R_sum -= np.sum(spectral_prod[:, -1, :], axis=0)
+    return R_sum
 
 
 def spatial_r_test_fft(
@@ -640,53 +688,22 @@ def spatial_r_test_fft(
         Yn = Yn[..., np.newaxis]
 
     ny, nx, M = Xn.shape
-    assert Xn.shape == Yn.shape, "Xn and Yn shapes must match"
-    assert ny == kernel.ny and nx == kernel.nx
+    if Xn.shape != Yn.shape:
+        raise ValueError(f"Xn and Yn shapes must match, got {Xn.shape} and {Yn.shape}")
+    if ny != kernel.ny or nx != kernel.nx:
+        raise ValueError(
+            f"Data shape ({ny}, {nx}) does not match kernel ({kernel.ny}, {kernel.nx})"
+        )
 
     # 1. Standardization
     if is_standardized:
         Zx, Zy = Xn, Yn
     else:
-        # X
-        mx = np.mean(Xn, axis=(0, 1), keepdims=True)
-        sx = np.std(Xn, axis=(0, 1), keepdims=True, ddof=1)
-        Zx = np.zeros_like(Xn)
-        np.divide(Xn - mx, sx, out=Zx, where=(sx > 1e-12))
+        Zx = _standardize_grid(Xn)
+        Zy = _standardize_grid(Yn)
 
-        # Y
-        my = np.mean(Yn, axis=(0, 1), keepdims=True)
-        sy = np.std(Yn, axis=(0, 1), keepdims=True, ddof=1)
-        Zy = np.zeros_like(Yn)
-        np.divide(Yn - my, sy, out=Zy, where=(sy > 1e-12))
-
-    # 2. Compute R = Zx^T K Zy via FFT
-    # R = (1/N) * sum( conj(Zx_hat) * Spectrum * Zy_hat )
-    if kernel.fft_solver == "fft2":
-        Zx_hat = scipy.fft.fft2(Zx, axes=(0, 1), workers=kernel.workers)
-        Zy_hat = scipy.fft.fft2(Zy, axes=(0, 1), workers=kernel.workers)
-        lam = kernel.eigenvalues().reshape(ny, nx, 1)
-
-        # Compute spectral product and sum
-        spectral_prod = np.real(np.conj(Zx_hat) * lam * Zy_hat)
-        R_sum = np.sum(spectral_prod, axis=(0, 1))
-    else:
-        # rfft2 case with symmetry correction
-        Zx_hat = scipy.fft.rfft2(Zx, axes=(0, 1), workers=kernel.workers)
-        Zy_hat = scipy.fft.rfft2(Zy, axes=(0, 1), workers=kernel.workers)
-        lam = kernel.eigenvalues().reshape(ny, nx // 2 + 1, 1)
-
-        spectral_prod = np.real(np.conj(Zx_hat) * lam * Zy_hat)
-
-        # --- Symmetry Correction for rfft2 ---
-        # Sum over frequency axes (0, 1)
-        R_sum = 2.0 * np.sum(spectral_prod, axis=(0, 1))
-
-        # Subtract DC component (freq index 0) once
-        R_sum -= np.sum(spectral_prod[:, 0, :], axis=0)
-
-        # If width is even, subtract Nyquist component (last freq index) once
-        if nx % 2 == 0:
-            R_sum -= np.sum(spectral_prod[:, -1, :], axis=0)
+    # 2. Compute R = Zx^T K Zy via FFT (Parseval's theorem)
+    R_sum = _spectral_cross_product(Zx, Zy, kernel, ny, nx)
 
     # Apply Parseval's 1/N normalization
     n_pixels = ny * nx

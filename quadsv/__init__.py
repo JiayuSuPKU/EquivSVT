@@ -16,13 +16,11 @@ except (ImportError, PackageNotFoundError):
     __version__ = "0.1.0"
 
 # Import core classes and functions
+# Application classes for pattern detection
+from quadsv.detector import PatternDetector
 from quadsv.fft import FFTKernel, spatial_q_test_fft, spatial_r_test_fft
 from quadsv.kernels import SpatialKernel
 from quadsv.statistics import spatial_q_test, spatial_r_test
-
-# Two application classes for pattern detection
-# from quadsv.detector import PatternDetector
-# from quadsv.detector_fft import PatternDetectorFFT
 
 # Define public API
 __all__ = [
@@ -35,6 +33,13 @@ __all__ = [
     "spatial_q_test_fft",
     "spatial_r_test_fft",
     # Detector classes
-    # "PatternDetector",
-    # "PatternDetectorFFT",
+    "PatternDetector",
 ]
+
+# PatternDetectorFFT requires optional spatialdata dependency
+try:
+    from quadsv.detector_fft import PatternDetectorFFT
+
+    __all__.append("PatternDetectorFFT")
+except ImportError:
+    pass

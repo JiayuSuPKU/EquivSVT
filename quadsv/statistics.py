@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import scipy.sparse as sp
 from scipy.stats import chi2, ncx2, norm
@@ -65,17 +67,27 @@ def liu_sf(
 
     s12 = s1**2
     if s12 > s2:
-        a = 1 / (s1 - np.sqrt(s12 - s2))
-        delta_x = s1 * a**3 - a**2
-        dof_x = a**2 - 2 * delta_x
+        denom = s1 - np.sqrt(s12 - s2)
+        if abs(denom) < _DELTA:
+            # Catastrophic cancellation; fall back to kurtosis path
+            delta_x = 0
+            a = 1 / (np.sqrt(s2) + _DELTA)
+            dof_x = 1 / (s2 + _DELTA)
+        else:
+            a = 1 / denom
+            delta_x = s1 * a**3 - a**2
+            dof_x = a**2 - 2 * delta_x
     else:
         delta_x = 0
         if kurtosis:
-            a = 1 / np.sqrt(s2)
-            dof_x = 1 / s2
+            a = 1 / (np.sqrt(s2) + _DELTA)
+            dof_x = 1 / (s2 + _DELTA)
         else:
             a = 1 / (s1 + _DELTA)
             dof_x = 1 / (s12 + _DELTA)
+    # Ensure valid chi-squared parameters
+    dof_x = max(dof_x, _DELTA)
+    delta_x = max(delta_x, 0.0)
 
     mu_q = c[1]
     sigma_q = np.sqrt(2 * c[2])
@@ -158,8 +170,6 @@ def compute_null_params(
             else:
                 params["scale_g"] = 1.0
                 params["df_h"] = 1.0
-
-    return params
 
     return params
 

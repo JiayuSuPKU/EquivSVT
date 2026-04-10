@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Any
 
 import numpy as np
@@ -660,14 +662,14 @@ class PatternDetector:
                 names = dummies.columns.tolist()
                 X_dense = dummies.values.astype(np.float32)
                 means = X_dense.mean(axis=0)
-                stds = X_dense.std(axis=0)
+                stds = X_dense.std(axis=0, ddof=1)
                 X_csc = sp.csc_matrix(X_dense)
             else:
                 # All numeric - no encoding needed
                 names = adata_tmp.columns.tolist()
                 X_dense = adata_tmp.values.astype(np.float32)
                 means = X_dense.mean(axis=0)
-                stds = X_dense.std(axis=0)
+                stds = X_dense.std(axis=0, ddof=1)
                 X_csc = sp.csc_matrix(X_dense)
 
         elif source == "var":
@@ -686,7 +688,8 @@ class PatternDetector:
 
             names = adata_tmp.var_names.tolist()
 
-            # compute means and stds
+            # compute means and stds (ddof=1 for sample std, consistent with statistics.py)
+            n_obs = X.shape[0]
             if sp.issparse(X):
                 means = np.array(X.mean(axis=0)).flatten()
                 X2 = X.copy()
@@ -694,11 +697,14 @@ class PatternDetector:
                 means2 = np.array(X2.mean(axis=0)).flatten()
                 var = means2 - (means**2)
                 var[var < 0] = 0
+                # Bessel correction: population var -> sample var
+                if n_obs > 1:
+                    var = var * n_obs / (n_obs - 1)
                 stds = np.sqrt(var)
                 X_csc = X.tocsc()
             else:
                 means = np.mean(X, axis=0)
-                stds = np.std(X, axis=0)
+                stds = np.std(X, axis=0, ddof=1)
                 X_csc = sp.csc_matrix(X)
         else:
             raise ValueError("Source must be either 'obs' or 'var'.")

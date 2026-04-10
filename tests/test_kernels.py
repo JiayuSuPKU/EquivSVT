@@ -476,7 +476,8 @@ class TestKernelUtilities(unittest.TestCase):
         kernel = SpatialKernel.from_coordinates(self.coords, method="moran", k_neighbors=2)
         vals_full = kernel.eigenvalues(k=4)
         vals_subset = kernel.eigenvalues(k=2)
-        np.testing.assert_allclose(vals_subset, vals_full[-2:], rtol=1e-12)
+        # Spectrum is sorted descending, so top-2 are the first 2 elements
+        np.testing.assert_allclose(vals_subset, vals_full[:2], rtol=1e-12)
 
     def test_getstate_setstate_resets_lu(self):
         """__getstate__ and __setstate__ should reset cached LU factorization."""

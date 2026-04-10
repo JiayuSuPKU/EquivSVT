@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import warnings
 
 # Suppress known deprecation warnings from SpatialData dependencies BEFORE importing anything else
@@ -161,9 +163,10 @@ class PatternDetectorFFT:
         self.sdata = sdata
         self.min_count = min_count
 
-        assert (
-            kernel_method in self._available_kernels
-        ), f"kernel_method must be one of {self._available_kernels}."
+        if kernel_method not in self._available_kernels:
+            raise ValueError(
+                f"kernel_method must be one of {self._available_kernels}, got '{kernel_method}'"
+            )
         self.kernel_method_ = kernel_method
 
         # Merge user params with defaults
@@ -483,10 +486,10 @@ class PatternDetectorFFT:
         # 3. FFT and Spectral Weighting
         # Use selected FFT solver
         if self.kernel_.fft_solver == "fft2":
-            freq_data = scipy.fft.fft2(data, axes=(1, 2), workers=-1)
+            freq_data = scipy.fft.fft2(data, axes=(1, 2), workers=self.kernel_.workers)
             rfft_spectrum = self.kernel_.eigenvalues().reshape(ny, nx)
         else:
-            freq_data = scipy.fft.rfft2(data, axes=(1, 2), workers=-1)
+            freq_data = scipy.fft.rfft2(data, axes=(1, 2), workers=self.kernel_.workers)
             rfft_spectrum = self.kernel_.eigenvalues().reshape(ny, nx // 2 + 1)
 
         weights = np.sqrt(np.abs(rfft_spectrum))

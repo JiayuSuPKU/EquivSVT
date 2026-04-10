@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import threading
 import warnings
 from abc import ABC, abstractmethod
 from typing import Any
@@ -54,6 +57,7 @@ class Kernel(ABC):
         self.implicit_threshold = 5000
         self.is_implicit = False
         self._lu = None  # Cache for sparse LU factorization if needed
+        self._lu_lock = threading.Lock()  # Thread safety for lazy LU init
 
         # _K can be the kernel matrix OR the inverse/precision matrix depending on is_implicit
         self._K = self._build_kernel()
@@ -133,11 +137,13 @@ class Kernel(ABC):
             Eigenvalues sorted in descending order, shape (k,) or (n,).
         """
         if self.spectrum is not None:
-            # check if we have enough cached
+            # check if we have enough cached (spectrum is always descending)
             if k is None and len(self.spectrum) == self.n:
                 return self.spectrum
             elif k is not None and len(self.spectrum) >= k:
-                return self.spectrum[-k:]
+                return self.spectrum[:k]
+
+        k_orig = k  # preserve original before internal modification
 
         if self.is_implicit:
             # Implicit case with kernel inverse: Use sparse methods
@@ -156,11 +162,9 @@ class Kernel(ABC):
                 vals = np.real(vals)
             else:
                 vals = np.linalg.eigvalsh(self._K)  # ascending order
-                if k is not None:
-                    vals = np.sort(vals)[-k:]
 
-        self.spectrum = vals
-        return vals
+        self.spectrum = np.sort(vals)[::-1]  # always store descending
+        return self.spectrum if k_orig is None else self.spectrum[:k_orig]
 
     def xtKx(self, x: np.ndarray | sp.spmatrix) -> float | np.ndarray:  # noqa: C901
         """
@@ -206,18 +210,20 @@ class Kernel(ABC):
             # We want x^T M^-1 x
             # Solve My = x
             if sp.issparse(self._K):
-                # Cache LU factorization for efficiency
-                if self._lu is None:
-                    self._lu = splu(self._K.tocsc())
+                # Cache LU factorization for efficiency (thread-safe)
+                with self._lu_lock:
+                    if self._lu is None:
+                        self._lu = splu(self._K.tocsc())
                 if is_sparse_input:
                     # Convert to dense for solver (most efficient for sparse solvers)
                     y = self._lu.solve(x_in.toarray())
                 else:
                     y = self._lu.solve(x_in)
             else:
-                # Cache LU factorization for efficiency
-                if self._lu is None:
-                    self._lu = lu_factor(self._K)
+                # Cache LU factorization for efficiency (thread-safe)
+                with self._lu_lock:
+                    if self._lu is None:
+                        self._lu = lu_factor(self._K)
                 if is_sparse_input:
                     y = lu_solve(self._lu, x_in.toarray())
                 else:
@@ -416,12 +422,14 @@ class Kernel(ABC):
 
     def __getstate__(self):
         """
-        Custom pickling behavior: exclude unpicklable SuperLU objects.
+        Custom pickling behavior: exclude unpicklable SuperLU objects and locks.
         """
         state = self.__dict__.copy()
         # Remove the cached LU factorization because SuperLU objects cannot be pickled.
         # Workers will re-compute this locally.
         state["_lu"] = None
+        # Locks cannot be pickled; will be recreated in __setstate__
+        state.pop("_lu_lock", None)
         return state
 
     def __setstate__(self, state):
@@ -431,6 +439,7 @@ class Kernel(ABC):
         self.__dict__.update(state)
         # Ensure _lu is explicitly None upon restoration
         self._lu = None
+        self._lu_lock = threading.Lock()
 
 
 class SpatialKernel(Kernel):
@@ -468,15 +477,13 @@ class SpatialKernel(Kernel):
         """
         self.data = data
         self.mode = mode
-        assert mode in [
-            "coords",
-            "precomputed",
-            "precomputed_inverse",
-        ], "Invalid mode. Must be 'coords', 'precomputed', or 'precomputed_inverse'."
+        if mode not in ("coords", "precomputed", "precomputed_inverse"):
+            raise ValueError(
+                f"Invalid mode '{mode}'. Must be 'coords', 'precomputed', or 'precomputed_inverse'."
+            )
 
-        assert method in self._available_kernels + [
-            "precomputed"
-        ], f"Unknown kernel method: {method}."
+        if method not in self._available_kernels + ["precomputed"]:
+            raise ValueError(f"Unknown kernel method: {method}.")
 
         # Update kernel parameters from defaults
         defaults = self._get_default_params(method).copy()
@@ -488,7 +495,32 @@ class SpatialKernel(Kernel):
                     raise ValueError(f"Unknown parameter '{key}' for method '{method}'")
 
         n = data.shape[0]
+        if mode == "coords":
+            self._validate_coords_params(n, method, defaults)
+
         super().__init__(n, method=method, **defaults)
+
+    @staticmethod
+    def _validate_coords_params(n: int, method: str, params: dict) -> None:
+        """Validate parameters for coordinate-based kernel construction."""
+        if n < 2:
+            raise ValueError(f"Need at least 2 samples, got {n}")
+        if method in ("gaussian", "matern"):
+            bw = params.get("bandwidth", None)
+            if bw is not None and bw <= 0:
+                raise ValueError(f"bandwidth must be positive, got {bw}")
+        if method == "matern":
+            nu = params.get("nu", None)
+            if nu is not None and nu <= 0:
+                raise ValueError(f"nu must be positive, got {nu}")
+        if method in ("moran", "graph_laplacian", "car"):
+            k = params.get("k_neighbors", None)
+            if k is not None and (k < 1 or k >= n):
+                raise ValueError(f"k_neighbors must be in [1, {n - 1}], got {k}")
+        if method == "car":
+            rho = params.get("rho", None)
+            if rho is not None and rho < 0:
+                raise ValueError(f"rho must be non-negative, got {rho}")
 
     def _get_default_params(self, method: str) -> dict[str, Any]:
         """
@@ -516,7 +548,7 @@ class SpatialKernel(Kernel):
     @classmethod
     def from_coordinates(
         cls, coords: np.ndarray, method: str = "matern", **kwargs
-    ) -> "SpatialKernel":
+    ) -> SpatialKernel:
         """
         Build kernel from spatial coordinates.
 
@@ -550,7 +582,7 @@ class SpatialKernel(Kernel):
         is_inverse: bool = False,
         method: str = "precomputed",
         **kwargs,
-    ) -> "SpatialKernel":
+    ) -> SpatialKernel:
         """
         Build kernel from a precomputed kernel matrix or its inverse.
 
@@ -595,8 +627,24 @@ class SpatialKernel(Kernel):
             elif method in ["moran", "graph_laplacian", "car"]:
                 # Compute sparse adjacency graph
                 k = self.params["k_neighbors"]
-                nbrs = NearestNeighbors(n_neighbors=k, algorithm="ball_tree").fit(coords)
+                nbrs = NearestNeighbors(
+                    n_neighbors=k + 1, algorithm="auto", metric="euclidean"
+                ).fit(coords)
                 W = nbrs.kneighbors_graph(coords, mode="connectivity").astype(float)
+
+                # Mutual neighbors: keep only edges where both spots list each other
+                W_mut = W + W.T
+                W_mut.data = (W_mut.data > 1).astype(float)
+                W_mut.setdiag(0)
+
+                # Handle isolated nodes: add self-loop to avoid division-by-zero
+                row_sums = np.asarray(W_mut.sum(axis=1)).ravel()
+                isolated = row_sums == 0
+                if isolated.any():
+                    W_mut.setdiag(isolated.astype(float))
+                W_mut.eliminate_zeros()
+
+                W = W_mut
                 dists = None
             else:
                 raise ValueError(f"Unknown method for coordinates: {method}")
@@ -616,6 +664,11 @@ class SpatialKernel(Kernel):
                     M_dense = M.toarray() if sp.issparse(M) else M
                     K_dense = inv(M_dense)
                 except np.linalg.LinAlgError:
+                    warnings.warn(
+                        "Precision matrix is singular; using pseudo-inverse.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                     M_dense = M.toarray() if sp.issparse(M) else M
                     K_dense = np.linalg.pinv(M_dense)
 
@@ -646,12 +699,13 @@ class SpatialKernel(Kernel):
             elif method == "matern":
                 nu = self.params["nu"]
                 length_scale = bw
-                # Avoid div by zero
+                # Mask zero distances; evaluate Bessel K only at non-zero distances
+                mask_zero = dists == 0
                 dists_safe = dists.copy()
-                dists_safe[dists_safe == 0] = 1e-15
+                dists_safe[mask_zero] = 1.0  # dummy value, overwritten below
                 factor = (np.sqrt(2 * nu) * dists_safe) / length_scale
                 K = (2 ** (1 - nu) / gamma(nu)) * (factor**nu) * kv(nu, factor)
-                np.fill_diagonal(K, 1.0)
+                K[mask_zero] = 1.0  # correct limit: K(x, x) = 1
             return K
 
         # --- Graph Based ---
@@ -685,6 +739,14 @@ class SpatialKernel(Kernel):
 
             elif method == "car":
                 rho = self.params["rho"]
+                if rho >= 1.0:
+                    warnings.warn(
+                        f"rho={rho} >= 1.0 causes singularity in CAR kernel; clamping to 0.99",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    rho = 0.99
+                    self.params["rho"] = rho
                 standardize = self.params["standardize"]
                 I = sp.eye(self.n, format="csc")
                 # M = (I - rho * W_norm) is the inverse of the CAR kernel
@@ -699,6 +761,12 @@ class SpatialKernel(Kernel):
                     try:
                         K_dense = inv(M.toarray())
                     except np.linalg.LinAlgError:
+                        warnings.warn(
+                            "CAR precision matrix is singular; using pseudo-inverse. "
+                            "Consider reducing rho or changing k_neighbors.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
                         K_dense = np.linalg.pinv(M.toarray())
 
                     if standardize:
