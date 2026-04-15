@@ -44,6 +44,7 @@ env/
 htmlcov/
 .tox/
 .nox/
+.hypothesis/
 
 # Data
 data/
@@ -69,3 +70,7 @@ Thumbs.db
 docs/_build/
 docs/_static/
 docs/_templates/
+
+# claude code
+CLAUDE.md
+.claude/

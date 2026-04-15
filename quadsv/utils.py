@@ -1,4 +1,45 @@
 import numpy as np
+import pandas as pd
+
+__all__ = [
+    "get_rect_coords",
+    "get_visium_coords",
+    "convert_visium_to_physical",
+    "compute_torus_distance_matrix",
+]
+
+
+def _apply_bh_correction(df: pd.DataFrame) -> None:
+    """Apply Benjamini-Hochberg FDR correction to a DataFrame's ``P_value`` column in place.
+
+    Writes the adjusted p-values into a new column ``P_adj``. Entries with non-finite
+    p-values (NaN / inf) are left as NaN in the output. Shared helper used by both
+    :class:`quadsv.detector.PatternDetector` and :class:`quadsv.detector_fft.PatternDetectorFFT`.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must contain a ``P_value`` column. Modified in place to add ``P_adj``.
+    """
+    pvals = df["P_value"].to_numpy()
+    valid_mask = np.isfinite(pvals)
+    m = valid_mask.sum()
+    if m == 0:
+        return
+
+    p_sorted_idx = np.argsort(pvals[valid_mask])
+    p_sorted = pvals[valid_mask][p_sorted_idx]
+    ranks = np.arange(1, m + 1)
+
+    bh_vals = p_sorted * m / ranks
+    bh_adj = np.minimum.accumulate(bh_vals[::-1])[::-1]
+    bh_adj = np.clip(bh_adj, 0, 1)
+
+    p_adj = np.full_like(pvals, np.nan)
+    p_adj_indices = np.where(valid_mask)[0][p_sorted_idx]
+    p_adj[p_adj_indices] = bh_adj
+
+    df["P_adj"] = p_adj
 
 
 def get_rect_coords(n_rows: int = 32, n_cols: int = 32) -> tuple[np.ndarray, tuple[int, int]]:

@@ -14,26 +14,39 @@ from scipy.special import gamma, kv
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
+__all__ = ["Kernel", "SpatialKernel"]
+
 
 class Kernel(ABC):
     """
     Abstract base class for spatial kernels.
 
-    Handles dense, sparse, and implicit (operator-based) kernels.
-    Implements a dual-mode system that switches between explicit (dense) and
-    implicit (sparse) computation based on problem size.
+    Handles dense, sparse, and implicit (operator-based) kernels. Switches between
+    an explicit representation (the kernel matrix ``K`` is stored and used directly)
+    and an implicit representation (the precision matrix ``M = K^{-1}`` is stored and
+    linear systems are solved on demand) based on problem size.
 
     Attributes
     ----------
     n : int
         Number of observations (samples).
     method : str
-        The kernel method ('gaussian', 'matern', 'moran', 'graph_laplacian', 'car').
-    is_implicit : bool
-        If True, uses sparse solver for implicit kernels (N > 5000).
-        If False, uses dense matrix operations.
+        Kernel method (``'gaussian'``, ``'matern'``, ``'moran'``, ``'graph_laplacian'``,
+        ``'car'``).
     params : dict
-        Additional kernel parameters (bandwidth, nu, rho, etc.).
+        Resolved kernel parameters after defaults have been merged with user overrides
+        (e.g., ``bandwidth``, ``nu``, ``rho``, ``k_neighbors``).
+    is_implicit : bool
+        If ``True``, the kernel is represented implicitly via its precision matrix and
+        linear solves are used for :meth:`xtKx` and trace estimation. If ``False``,
+        the realized kernel matrix is stored and used directly.
+
+    Notes
+    -----
+    The internal buffer ``_K`` stores the kernel matrix when ``is_implicit=False`` and
+    the precision matrix ``K^{-1}`` when ``is_implicit=True``. Public methods
+    (:meth:`xtKx`, :meth:`trace`, :meth:`square_trace`, :meth:`eigenvalues`) transparently
+    handle both cases; callers should not access ``_K`` directly.
     """
 
     def __init__(self, n: int, method: str = "gaussian", **kwargs) -> None:
@@ -47,21 +60,26 @@ class Kernel(ABC):
         method : str, default 'gaussian'
             Kernel method to use.
         **kwargs : dict
-            Additional kernel-specific parameters.
+            Additional kernel-specific parameters stored in ``self.params``.
         """
-        self.n = n
-        self.method = method
-        self.params = kwargs
+        self.n: int = n
+        """Number of observations (samples)."""
+        self.method: str = method
+        """Kernel method name."""
+        self.params: dict = kwargs
+        """Resolved kernel parameters after defaults are merged with user overrides."""
 
-        # Threshold for switching between dense realization and implicit solving
-        self.implicit_threshold = 5000
-        self.is_implicit = False
+        # Threshold (in samples) for switching to the implicit representation.
+        self._implicit_threshold = 5000
+        self.is_implicit: bool = False
+        """Whether the kernel is stored in precision form (``True``) or as the realized kernel matrix (``False``)."""
         self._lu = None  # Cache for sparse LU factorization if needed
         self._lu_lock = threading.Lock()  # Thread safety for lazy LU init
 
-        # _K can be the kernel matrix OR the inverse/precision matrix depending on is_implicit
+        # _K stores the kernel matrix when is_implicit=False and the precision
+        # matrix K^{-1} when is_implicit=True (see class Notes).
         self._K = self._build_kernel()
-        self.spectrum = None  # Lazy-evaluated eigenvalues cache
+        self._spectrum = None  # Lazy-evaluated eigenvalues cache (access via eigenvalues())
 
     @abstractmethod
     def _build_kernel(self):
@@ -88,7 +106,7 @@ class Kernel(ABC):
     def __repr__(self):
         return (
             f"<Kernel method={self.method} n={self.n} implicit={self.is_implicit} "
-            f"threshold={self.implicit_threshold} params={{ {self._format_params()} }}>"
+            f"threshold={self._implicit_threshold} params={{ {self._format_params()} }}>"
         )
 
     def __str__(self):
@@ -96,7 +114,7 @@ class Kernel(ABC):
             "Kernel\n"
             f"- Method: {self.method}\n"
             f"- Samples: {self.n}\n"
-            f"- Implicit: {self.is_implicit} (threshold={self.implicit_threshold})\n"
+            f"- Implicit: {self.is_implicit} (threshold={self._implicit_threshold})\n"
             f"- Params: {self._format_params()}"
         )
 
@@ -109,10 +127,10 @@ class Kernel(ABC):
         np.ndarray
             Dense (N, N) kernel matrix.
 
-        Warnings
-        --------
-        If is_implicit is True, this forces expensive dense inversion of the
-        precision matrix. Use xtKx() and trace() for implicit kernels instead.
+        Notes
+        -----
+        If ``is_implicit`` is True, this forces expensive dense inversion of the
+        precision matrix. Prefer :meth:`xtKx` and :meth:`trace` for implicit kernels.
         """
         if self.is_implicit:
             # _K is M = K^-1. We need to invert it.
@@ -126,6 +144,9 @@ class Kernel(ABC):
         """
         Compute the k largest eigenvalues of the kernel matrix.
 
+        Results are cached internally; subsequent calls reuse the cached spectrum
+        when it contains enough values to satisfy the request.
+
         Parameters
         ----------
         k : int, optional
@@ -136,12 +157,12 @@ class Kernel(ABC):
         np.ndarray
             Eigenvalues sorted in descending order, shape (k,) or (n,).
         """
-        if self.spectrum is not None:
+        if self._spectrum is not None:
             # check if we have enough cached (spectrum is always descending)
-            if k is None and len(self.spectrum) == self.n:
-                return self.spectrum
-            elif k is not None and len(self.spectrum) >= k:
-                return self.spectrum[:k]
+            if k is None and len(self._spectrum) == self.n:
+                return self._spectrum
+            elif k is not None and len(self._spectrum) >= k:
+                return self._spectrum[:k]
 
         k_orig = k  # preserve original before internal modification
 
@@ -163,16 +184,16 @@ class Kernel(ABC):
             else:
                 vals = np.linalg.eigvalsh(self._K)  # ascending order
 
-        self.spectrum = np.sort(vals)[::-1]  # always store descending
-        return self.spectrum if k_orig is None else self.spectrum[:k_orig]
+        self._spectrum = np.sort(vals)[::-1]  # always store descending
+        return self._spectrum if k_orig is None else self._spectrum[:k_orig]
 
     def xtKx(self, x: np.ndarray | sp.spmatrix) -> float | np.ndarray:  # noqa: C901
         """
         Efficiently compute the quadratic form x^T K x.
 
-        Handles both single vectors and batches. Uses implicit solvers for
-        large N (implicit_threshold) to avoid dense matrix operations.
-        Supports sparse input matrices without densification.
+        Handles both single vectors and batches. Uses implicit solvers when the
+        kernel is stored in precision form (``is_implicit=True``) to avoid dense
+        matrix operations. Supports sparse input matrices without densification.
 
         Parameters
         ----------
@@ -295,13 +316,19 @@ class Kernel(ABC):
         """
         Compute the trace of the kernel matrix Tr(K).
 
-        For implicit kernels, uses Hutchinson's trick with random vectors
+        For implicit kernels, uses Hutchinson's trick with random ±1 vectors
         for efficient O(N) estimation instead of O(N³) eigendecomposition.
 
         Returns
         -------
         float
             Trace of the kernel matrix.
+
+        Notes
+        -----
+        For implicit kernels the result is a stochastic estimate using a fixed
+        ``n_vectors=15`` Hutchinson probes; repeated calls reuse the cached probes
+        so the returned value is deterministic within a given instance.
         """
         if self.is_implicit:
             # Trace estimation using Hutchinson's trick
@@ -329,6 +356,11 @@ class Kernel(ABC):
         -------
         float
             Trace of K squared.
+
+        Notes
+        -----
+        For implicit kernels the result is a stochastic estimate using a fixed
+        ``n_vectors=15`` Hutchinson probes (shared with :meth:`trace`).
         """
         if self.is_implicit:
             # Trace(K^2) estimation
@@ -444,16 +476,19 @@ class Kernel(ABC):
 
 class SpatialKernel(Kernel):
     """
-    Concrete implementation of Spatial Kernel.
+    Concrete spatial kernel built from coordinates or a precomputed matrix.
 
-    Can be built from raw coordinates OR from precomputed matrices.
+    Inherits all public attributes and methods from :class:`Kernel`
+    (``n``, ``method``, ``params``, ``is_implicit``, :meth:`realization`,
+    :meth:`eigenvalues`, :meth:`xtKx`, :meth:`trace`, :meth:`square_trace`).
 
-    Attributes
-    ----------
-    data : np.ndarray
-        Raw data (coordinates or matrix) used to construct the kernel.
-    mode : {'coords', 'precomputed', 'precomputed_inverse'}
-        How the kernel was initialized.
+    See Also
+    --------
+    SpatialKernel.from_coordinates
+        Recommended entry point when working from raw sample coordinates.
+    SpatialKernel.from_matrix
+        Recommended entry point when a kernel or precision matrix is already
+        available.
     """
 
     _available_kernels = ["gaussian", "matern", "moran", "graph_laplacian", "car"]
@@ -462,21 +497,35 @@ class SpatialKernel(Kernel):
         self, data: np.ndarray, mode: str = "coords", method: str = "matern", **kwargs
     ) -> None:
         """
-        Internal constructor. Use .from_coordinates() or .from_matrix() instead.
+        Construct a spatial kernel from already-prepared input data.
+
+        This constructor is public but low-level; most users should prefer the
+        factory methods :meth:`from_coordinates` or :meth:`from_matrix`, which
+        dispatch to this constructor with the appropriate ``mode``.
 
         Parameters
         ----------
-        data : np.ndarray
-            Input data (coordinates or kernel matrix).
+        data : np.ndarray or scipy.sparse matrix
+            Input data whose interpretation is controlled by ``mode``:
+            an ``(N, D)`` coordinate array when ``mode='coords'``, an ``(N, N)``
+            kernel matrix when ``mode='precomputed'``, or an ``(N, N)`` precision
+            matrix when ``mode='precomputed_inverse'``.
         mode : {'coords', 'precomputed', 'precomputed_inverse'}, default 'coords'
-            Interpretation of the data.
+            How ``data`` should be interpreted.
         method : str, default 'matern'
-            Kernel method to use.
+            Kernel method. Must be one of ``'gaussian'``, ``'matern'``, ``'moran'``,
+            ``'graph_laplacian'``, ``'car'``, or ``'precomputed'``.
         **kwargs : dict
-            Additional kernel parameters.
+            Kernel-specific parameters (e.g., ``bandwidth``, ``nu``, ``rho``,
+            ``k_neighbors``). Unknown keys raise :class:`ValueError`.
+
+        Raises
+        ------
+        ValueError
+            If ``mode`` or ``method`` is unknown, or any parameter fails validation.
         """
-        self.data = data
-        self.mode = mode
+        self._data = data
+        self._mode = mode
         if mode not in ("coords", "precomputed", "precomputed_inverse"):
             raise ValueError(
                 f"Invalid mode '{mode}'. Must be 'coords', 'precomputed', or 'precomputed_inverse'."
@@ -534,7 +583,7 @@ class SpatialKernel(Kernel):
         Returns
         -------
         dict[str, Any]
-            Method defaults: bandwidth (gaussian/matern), nu (matern), neighbor_degree (moran/graph_laplacian/car), rho (car).
+            Method defaults: bandwidth (gaussian/matern), nu (matern), k_neighbors (moran/graph_laplacian/car), rho (car).
         """
         method_defaults = {
             "gaussian": {"bandwidth": 2.0},
@@ -566,12 +615,18 @@ class SpatialKernel(Kernel):
         SpatialKernel
             Initialized kernel object.
 
+        Raises
+        ------
+        ValueError
+            If ``method`` is not one of :attr:`_available_kernels`.
+
         Examples
         --------
         >>> coords = np.random.randn(100, 2)
         >>> kernel = SpatialKernel.from_coordinates(coords, method='gaussian', bandwidth=1.0)
         """
-        assert method in cls._available_kernels, f"Unknown kernel method for coordinates: {method}."
+        if method not in cls._available_kernels:
+            raise ValueError(f"Unknown kernel method for coordinates: {method}.")
 
         return cls(coords, mode="coords", method=method, **kwargs)
 
@@ -618,8 +673,8 @@ class SpatialKernel(Kernel):
         # ==========================================
 
         # Case A: Coordinates provided -> Compute Dists or W from scratch
-        if self.mode == "coords":
-            coords = self.data
+        if self._mode == "coords":
+            coords = self._data
             if method in ["gaussian", "matern"]:
                 # Compute dense distance matrix
                 dists = squareform(pdist(coords, metric="euclidean"))
@@ -650,16 +705,16 @@ class SpatialKernel(Kernel):
                 raise ValueError(f"Unknown method for coordinates: {method}")
 
         # Case B: Precomputed Kernel provided
-        elif self.mode == "precomputed":
-            return self.data
+        elif self._mode == "precomputed":
+            return self._data
 
         # Case C: Precomputed Inverse Kernel provided
-        elif self.mode == "precomputed_inverse":
-            M = self.data
+        elif self._mode == "precomputed_inverse":
+            M = self._data
             standardize = self.params.get("standardize", False)
 
             # If small, realize dense K; else keep implicit precision
-            if self.n <= self.implicit_threshold:
+            if self.n <= self._implicit_threshold:
                 try:
                     M_dense = M.toarray() if sp.issparse(M) else M
                     K_dense = inv(M_dense)
@@ -752,7 +807,7 @@ class SpatialKernel(Kernel):
                 # M = (I - rho * W_norm) is the inverse of the CAR kernel
                 M = I - rho * W_norm
 
-                if self.n > self.implicit_threshold:
+                if self.n > self._implicit_threshold:
                     self.is_implicit = True
                     if standardize:
                         M = self._standardize_precision(M)
@@ -783,17 +838,17 @@ class SpatialKernel(Kernel):
 
     def __repr__(self):
         # Describe input data succinctly
-        if self.mode == "coords":
-            coords = self.data
+        if self._mode == "coords":
+            coords = self._data
             data_desc = f"coords shape={getattr(coords, 'shape', '?')}"
-        elif self.mode == "precomputed":
-            M = self.data
+        elif self._mode == "precomputed":
+            M = self._data
             if sp.issparse(M):
                 data_desc = f"matrix shape={M.shape} sparse nnz={M.nnz}"
             else:
                 data_desc = f"matrix shape={getattr(M, 'shape', '?')} dense"
-        elif self.mode == "precomputed_inverse":
-            M = self.data
+        elif self._mode == "precomputed_inverse":
+            M = self._data
             if sp.issparse(M):
                 data_desc = f"precision shape={M.shape} sparse nnz={M.nnz}"
             else:
@@ -802,7 +857,7 @@ class SpatialKernel(Kernel):
             data_desc = "data=?"
 
         return (
-            f"<SpatialKernel method={self.method} mode={self.mode} n={self.n} "
+            f"<SpatialKernel method={self.method} mode={self._mode} n={self.n} "
             f"implicit={self.is_implicit} data={data_desc} params={{ {self._format_params()} }}>"
         )
 
@@ -811,23 +866,23 @@ class SpatialKernel(Kernel):
         lines = [
             "SpatialKernel",
             f"- Method: {self.method}",
-            f"- Mode: {self.mode}",
+            f"- Mode: {self._mode}",
             f"- Samples: {self.n}",
-            f"- Implicit: {self.is_implicit} (threshold={self.implicit_threshold})",
+            f"- Implicit: {self.is_implicit} (threshold={self._implicit_threshold})",
         ]
 
         # Add a brief data description
         try:
-            if self.mode == "coords":
-                coords = self.data
+            if self._mode == "coords":
+                coords = self._data
                 lines.append(f"- Data: coords shape={getattr(coords, 'shape', '?')}")
             else:
-                M = self.data
+                M = self._data
                 if sp.issparse(M):
-                    kind = "precision" if self.mode == "precomputed_inverse" else "matrix"
+                    kind = "precision" if self._mode == "precomputed_inverse" else "matrix"
                     lines.append(f"- Data: {kind} shape={M.shape} sparse nnz={M.nnz}")
                 else:
-                    kind = "precision" if self.mode == "precomputed_inverse" else "matrix"
+                    kind = "precision" if self._mode == "precomputed_inverse" else "matrix"
                     lines.append(f"- Data: {kind} shape={getattr(M, 'shape', '?')} dense")
         except Exception:
             lines.append("- Data: ?")

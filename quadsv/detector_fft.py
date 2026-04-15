@@ -13,6 +13,7 @@ except ImportError as e:
         "spatialdata is required for PatternDetectorFFT. Please install it via 'pip install spatialdata'."
     ) from e
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,11 @@ from scipy.stats import norm
 from tqdm import tqdm
 
 from quadsv.fft import FFTKernel, spatial_q_test_fft
+from quadsv.utils import _apply_bh_correction
+
+__all__ = ["PatternDetectorFFT"]
+
+logger = logging.getLogger(__name__)
 
 
 def _qstat_worker_fft(
@@ -110,12 +116,17 @@ class PatternDetectorFFT:
     ----------
     sdata : sd.SpatialData
         Reference to the input spatial data object.
+    min_count : int or None
+        Feature count threshold applied when filtering features for testing.
     kernel_ : FFTKernel or None
-        Lazily constructed FFT kernel; initialized on first compute_qstat/compute_rstat call.
+        Lazily constructed FFT kernel. ``None`` until the first
+        :meth:`compute_qstat` or :meth:`compute_rstat` call, which rasterizes the
+        input grid and builds the kernel at the resulting shape. Rebuilt
+        automatically if a subsequent call uses a different grid shape.
     kernel_method_ : str
         The selected kernel method.
     kernel_params_ : dict
-        Pre-processed kernel parameters with defaults.
+        Kernel parameters after defaults are merged with user overrides.
 
     See Also
     --------
@@ -147,7 +158,7 @@ class PatternDetectorFFT:
         ----------
         sdata : sd.SpatialData
             The spatial data object containing the tables.
-        min_count : int or None, optional
+        min_count : int, optional
             Minimum count threshold for features to be included.
         kernel_method : str, default 'car'
             The kernel method to use. Must be one of: 'gaussian', 'matern', 'moran', 'graph_laplacian', 'car'.
@@ -157,17 +168,21 @@ class PatternDetectorFFT:
 
         Raises
         ------
-        AssertionError
-            If kernel_method is not in _available_kernels.
+        ValueError
+            If ``kernel_method`` is not one of :attr:`_available_kernels`, or if
+            ``kernel_params`` contains an unknown key for the chosen method.
         """
-        self.sdata = sdata
-        self.min_count = min_count
+        self.sdata: sd.SpatialData = sdata
+        """Reference to the input :class:`spatialdata.SpatialData` object."""
+        self.min_count: int | None = min_count
+        """Minimum total count for a feature to be included in testing, or ``None`` for no filtering."""
 
         if kernel_method not in self._available_kernels:
             raise ValueError(
                 f"kernel_method must be one of {self._available_kernels}, got '{kernel_method}'"
             )
-        self.kernel_method_ = kernel_method
+        self.kernel_method_: str = kernel_method
+        """Name of the kernel method used to build :attr:`kernel_`."""
 
         # Merge user params with defaults
         defaults = self._get_default_params(self.kernel_method_).copy()
@@ -177,10 +192,12 @@ class PatternDetectorFFT:
                     defaults[key] = value
                 else:
                     raise ValueError(f"Unknown parameter '{key}' for method '{kernel_method}'")
-        self.kernel_params_ = defaults
+        self.kernel_params_: dict = defaults
+        """Kernel parameters after defaults are merged with user overrides."""
 
         # FFTKernel will be initialized once grid shape is known
-        self.kernel_ = None
+        self.kernel_: FFTKernel | None = None
+        """Lazily constructed :class:`~quadsv.fft.FFTKernel`, built on first compute call."""
 
     def _get_default_params(self, method: str) -> dict[str, Any]:
         """
@@ -269,7 +286,7 @@ class PatternDetectorFFT:
         # Construct the output key
         img_key = f"rasterized_{table_name}"
 
-        print(f"Rasterizing {table_name} into {img_key}...")
+        logger.info("Rasterizing %s into %s...", table_name, img_key)
         rasterized = sd.rasterize_bins(
             self.sdata,
             bins=bins,
@@ -307,28 +324,6 @@ class PatternDetectorFFT:
                 raise ValueError(f"No features passed min_count={self.min_count}")
 
         return valid
-
-    def _apply_bh_correction(self, df):
-        """Applies Benjamini-Hochberg correction to P_value column in place."""
-        pvals = df["P_value"].to_numpy()
-        valid_mask = np.isfinite(pvals)
-        m = valid_mask.sum()
-        if m == 0:
-            return
-
-        p_sorted_idx = np.argsort(pvals[valid_mask])
-        p_sorted = pvals[valid_mask][p_sorted_idx]
-        ranks = np.arange(1, m + 1)
-
-        bh_vals = p_sorted * m / ranks
-        bh_adj = np.minimum.accumulate(bh_vals[::-1])[::-1]
-        bh_adj = np.clip(bh_adj, 0, 1)
-
-        p_adj = np.full_like(pvals, np.nan)
-        p_adj_indices = np.where(valid_mask)[0][p_sorted_idx]
-        p_adj[p_adj_indices] = bh_adj
-
-        df["P_adj"] = p_adj
 
     def compute_qstat(
         self,
@@ -417,7 +412,12 @@ class PatternDetectorFFT:
 
         # Only rebuild kernel if shape changed or not initialized
         if self.kernel_ is None or (self.kernel_.ny, self.kernel_.nx) != (ny, nx):
-            print(f"Building FFTKernel ({self.kernel_method_}) for grid shape ({ny}, {nx})...")
+            logger.info(
+                "Building FFTKernel (%s) for grid shape (%d, %d)...",
+                self.kernel_method_,
+                ny,
+                nx,
+            )
             # Pass workers to kernel for FFT parallelization
             if workers is not None:  # Override if provided
                 self.kernel_params_["workers"] = workers
@@ -436,8 +436,11 @@ class PatternDetectorFFT:
             features[i : i + chunk_size] for i in range(0, len(features), chunk_size)
         ]
 
-        print(
-            f"Processing {len(features)} features in {len(feature_batches)} batches using {n_jobs} cores..."
+        logger.info(
+            "Processing %d features in %d batches using %d cores...",
+            len(features),
+            len(feature_batches),
+            n_jobs,
         )
 
         # 6. Parallel execution
@@ -460,7 +463,7 @@ class PatternDetectorFFT:
 
         # 6. Multiple testing correction (Benjamini-Hochberg) in place
         if return_pval:
-            self._apply_bh_correction(df)
+            _apply_bh_correction(df)
 
         return df.sort_values(by="Q", ascending=False)
 
@@ -607,7 +610,12 @@ class PatternDetectorFFT:
             self.kernel_params_["workers"] = workers
 
         if self.kernel_ is None or (self.kernel_.ny, self.kernel_.nx) != (ny, nx):
-            print(f"Building FFTKernel ({self.kernel_method_}) for grid shape ({ny}, {nx})...")
+            logger.info(
+                "Building FFTKernel (%s) for grid shape (%d, %d)...",
+                self.kernel_method_,
+                ny,
+                nx,
+            )
             self.kernel_ = FFTKernel((ny, nx), method=self.kernel_method_, **self.kernel_params_)
 
         # 4. Prepare Batches
@@ -617,10 +625,12 @@ class PatternDetectorFFT:
         else:
             chunks_y = chunks_x
 
-        print(
-            f"Computing R-stats: {len(features_x)} x {len(features_y) if features_y is not None else len(features_x)} matrix."
+        logger.info(
+            "Computing R-stats: %d x %d matrix.",
+            len(features_x),
+            len(features_y) if features_y is not None else len(features_x),
         )
-        print(f"Processing in {len(chunks_x)} chunks of size ~{chunk_size}...")
+        logger.info("Processing in %d chunks of size ~%d...", len(chunks_x), chunk_size)
 
         sigma = np.sqrt(self.kernel_.square_trace())
         results_list = []
@@ -705,6 +715,6 @@ class PatternDetectorFFT:
         final_df = pd.concat(results_list, ignore_index=True)
 
         if return_pval and not final_df.empty:
-            self._apply_bh_correction(final_df)
+            _apply_bh_correction(final_df)
 
         return final_df.sort_values(by="R", key=abs, ascending=False)

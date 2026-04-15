@@ -7,6 +7,8 @@ from tqdm import tqdm
 
 from quadsv.kernels import Kernel
 
+__all__ = ["liu_sf", "compute_null_params", "spatial_q_test", "spatial_r_test"]
+
 _DELTA = 1e-10
 
 
@@ -127,7 +129,7 @@ def compute_null_params(
 
     Returns
     -------
-    dict[str, Union[float, np.ndarray]]
+    dict[str, float or np.ndarray]
         Parameters keyed by null_approx method:
         - 'method': The method used
         - For 'liu': 'eigenvalues' (np.ndarray of kernel eigenvalues)
@@ -237,9 +239,11 @@ def spatial_q_test(  # noqa: C901
 
     where :math:`\\lambda_i` are the kernel eigenvalues.
 
-    By default, we approximate the null using Welch-Satterthwaite moment matching.
-    For more accurate tail probabilities, set null_params = {'method': 'liu'} or using
-    null_params = compute_null_params(method = 'liu').
+    By default, the null is approximated with Welch-Satterthwaite moment matching.
+    To use a different approximation, either pass
+    ``null_params={'method': 'liu'}`` (this function will then call
+    :func:`compute_null_params` internally with that method) or pass the fully
+    pre-computed dict from ``compute_null_params(kernel, method='liu')``.
 
     Examples
     --------

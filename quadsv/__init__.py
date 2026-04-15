@@ -6,6 +6,13 @@ spatial variability and equivalence testing using different kernel methods
 (Moran, Gaussian RBF, Matérn, Laplacian).
 """
 
+import logging
+
+# Library-style logging: attach a NullHandler so no records are emitted unless the
+# consumer configures a handler. User code can do
+# ``logging.getLogger('quadsv').setLevel(logging.INFO)`` to see progress messages.
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
 # Automatically read version from installed package or fallback to hardcoded
 try:
     from importlib.metadata import PackageNotFoundError, version

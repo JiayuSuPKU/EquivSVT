@@ -11,26 +11,41 @@ from scipy.stats import chi2, norm
 
 from quadsv.statistics import liu_sf
 
+__all__ = ["FFTKernel", "spatial_q_test_fft", "spatial_r_test_fft"]
+
 
 class FFTKernel:
     """
     FFT-accelerated spatial kernel for dense grid data.
 
-    Operates on evenly-spaced grid data (Raster data) with spectral decomposition
-    via FFT with periodic (Torus) boundary conditions.
+    Operates on evenly-spaced grid data (raster data) with spectral decomposition
+    via FFT under periodic (torus) boundary conditions.
 
     Attributes
     ----------
     ny, nx : int
-        Grid dimensions.
+        Grid dimensions (number of rows and columns).
+    n_grid : int
+        Total number of grid points (``ny * nx``).
     topology : {'square', 'hex'}
-        Grid topology.
+        Grid topology. ``'hex'`` mirrors 10x Visium hexagonal layouts.
     method : str
-        Kernel method.
+        Kernel method (``'gaussian'``, ``'matern'``, ``'moran'``, ``'graph_laplacian'``,
+        ``'car'``).
     params : dict
-        Kernel parameters (bandwidth, nu, neighbor_degree, rho).
+        Resolved kernel parameters (e.g. ``bandwidth``, ``nu``, ``neighbor_degree``,
+        ``rho``) after defaults are merged with user overrides.
+    fft_solver : {'fft2', 'rfft2'}
+        FFT routine in use. ``'rfft2'`` stores roughly half the spectrum.
+    n_rfft : int
+        Length of the flattened spectrum: ``ny * nx`` for ``fft2`` and
+        ``ny * (nx // 2 + 1)`` for ``rfft2``.
+    workers : int or None
+        Number of parallel workers forwarded to :mod:`scipy.fft`.
     spectrum : np.ndarray
-        Precomputed eigenvalues of the kernel matrix. Shape (n_rfft,) where n_rfft = ny * (nx//2 + 1).
+        Flattened (row-major) eigenvalues of the kernel matrix, shape ``(n_rfft,)``.
+        Eagerly computed in ``__init__``. See :meth:`eigenvalues` for a sorted /
+        full-FFT-layout accessor.
     """
 
     _available_kernels = ["gaussian", "matern", "moran", "graph_laplacian", "car"]
@@ -71,20 +86,26 @@ class FFTKernel:
         >>> kernel = FFTKernel((64, 64), method='gaussian', bandwidth=2.0)
         >>> kernel = FFTKernel((64, 64), topology='hex', method='matern')
         """
-        self.ny, self.nx = shape
-        if self.ny < 2 or self.nx < 2:
-            raise ValueError(f"Grid dimensions must be >= 2, got ({self.ny}, {self.nx})")
-        self.dy, self.dx = spacing
-        self.n_grid = self.ny * self.nx
+        ny, nx = shape
+        if ny < 2 or nx < 2:
+            raise ValueError(f"Grid dimensions must be >= 2, got ({ny}, {nx})")
+        self.ny: int = ny
+        """Number of grid rows."""
+        self.nx: int = nx
+        """Number of grid columns."""
+        self._dy, self._dx = spacing
+        self.n_grid: int = self.ny * self.nx
+        """Total number of grid points (``ny * nx``)."""
 
         # FFT solver selection
         if fft_solver not in ("fft2", "rfft2"):
             raise ValueError(f"fft_solver must be 'fft2' or 'rfft2', got '{fft_solver}'")
-        self.fft_solver = fft_solver
-        if fft_solver == "fft2":
-            self.n_rfft = self.ny * self.nx  # Full spectrum
-        else:
-            self.n_rfft = self.ny * (self.nx // 2 + 1)  # rfft2 spectrum size
+        self.fft_solver: str = fft_solver
+        """FFT routine in use (``'fft2'`` or ``'rfft2'``)."""
+        self.n_rfft: int = (
+            self.ny * self.nx if fft_solver == "fft2" else self.ny * (self.nx // 2 + 1)
+        )
+        """Length of the flattened spectrum buffer (``ny*nx`` for ``fft2``, ``ny*(nx//2+1)`` for ``rfft2``)."""
 
         # Sanity Checks
         if topology not in ("square", "hex"):
@@ -92,8 +113,10 @@ class FFTKernel:
         if method not in self._available_kernels:
             raise ValueError(f"method must be one of {self._available_kernels}, got '{method}'")
 
-        self.topology = topology
-        self.method = method
+        self.topology: str = topology
+        """Grid topology (``'square'`` or ``'hex'``)."""
+        self.method: str = method
+        """Kernel method name."""
 
         # Update kernel parameters from defaults
         params = self._get_default_params(method).copy()
@@ -104,18 +127,21 @@ class FFTKernel:
                 else:
                     raise ValueError(f"Unknown parameter '{key}' for method '{method}'")
 
-        self.params = params
-        self.workers = workers
+        self.params: dict = params
+        """Resolved kernel parameters after defaults are merged with user overrides."""
+        self.workers: int | None = workers
+        """Number of parallel workers forwarded to :mod:`scipy.fft`, or ``None`` for the library default."""
 
         # 1. Precompute Distances
         # For Periodic: Distances wrap around (min(d, L-d)).
         if self.topology == "hex":
-            self.min_dist_sq = self._precompute_hex_torus()
+            self._min_dist_sq = self._precompute_hex_torus()
         else:
-            self.min_dist_sq = self._precompute_square_dists()
+            self._min_dist_sq = self._precompute_square_dists()
 
         # 2. Precompute Kernel spectrum
-        self.spectrum = self._compute_eigenvalues()
+        self.spectrum: np.ndarray = self._compute_eigenvalues()
+        """Flattened (row-major) eigenvalues of the kernel matrix, shape ``(n_rfft,)``."""
 
     def _format_params(self) -> str:
         """Format kernel params safely without dumping large arrays/matrices."""
@@ -167,7 +193,7 @@ class FFTKernel:
             f"- Method: {self.method}",
             f"- Grid shape: ({self.ny}, {self.nx})",
             f"- Topology: {self.topology}",
-            f"- Spacing: ({self.dy}, {self.dx})",
+            f"- Spacing: ({self._dy}, {self._dx})",
             f"- FFT Solver: {self.fft_solver}",
         ]
 
@@ -206,12 +232,12 @@ class FFTKernel:
 
     def _precompute_square_dists(self):
         """Computes wrap-around torus distances from (0,0) to (y,x)."""
-        y = np.arange(self.ny) * self.dy
-        x = np.arange(self.nx) * self.dx
+        y = np.arange(self.ny) * self._dy
+        x = np.arange(self.nx) * self._dx
 
         # Wrap-around distance for periodic boundaries
-        y = np.minimum(y, (self.ny * self.dy) - y)
-        x = np.minimum(x, (self.nx * self.dx) - x)
+        y = np.minimum(y, (self.ny * self._dy) - y)
+        x = np.minimum(x, (self.nx * self._dx) - x)
 
         yy, xx = np.meshgrid(y, x, indexing="ij")
         return yy**2 + xx**2
@@ -254,7 +280,7 @@ class FFTKernel:
         # --- Continuous Kernels ---
         if self.method == "gaussian":
             bw = self.params["bandwidth"]
-            K_img = np.exp(-0.5 * (self.min_dist_sq / bw**2))
+            K_img = np.exp(-0.5 * (self._min_dist_sq / bw**2))
             if self.fft_solver == "fft2":
                 spectrum_2d = scipy.fft.fft2(K_img, workers=self.workers)
             else:
@@ -264,7 +290,7 @@ class FFTKernel:
         elif self.method == "matern":
             bw = self.params["bandwidth"]
             nu = self.params["nu"]
-            d = np.sqrt(self.min_dist_sq)
+            d = np.sqrt(self._min_dist_sq)
             mask_zero = d == 0
             d[mask_zero] = 1.0  # dummy value, overwritten below
             factor = (np.sqrt(2 * nu) * d) / bw
@@ -280,7 +306,7 @@ class FFTKernel:
         elif self.method in ["moran", "graph_laplacian", "car"]:
             degree_order = self.params["neighbor_degree"]
 
-            unique_dists = np.unique(self.min_dist_sq)
+            unique_dists = np.unique(self._min_dist_sq)
 
             if degree_order < len(unique_dists):
                 cutoff_sq = unique_dists[degree_order]
@@ -288,7 +314,7 @@ class FFTKernel:
                 cutoff_sq = unique_dists[-1]
 
             # Construct Adjacency Image
-            W_img = (self.min_dist_sq <= cutoff_sq).astype(float)
+            W_img = (self._min_dist_sq <= cutoff_sq).astype(float)
             W_img[0, 0] = 0.0
 
             # Row-Normalization Factor
@@ -393,7 +419,7 @@ class FFTKernel:
         ----------
         k : int, optional
             Number of largest eigenvalues to return. If None, returns all.
-        return_full : bool, default False.
+        return_full : bool, default False
             Only for fft_solver='rfft2'.
             If True, returns eigenvalues in full FFT layout (ny, nx) flattened.
 
@@ -568,7 +594,7 @@ def spatial_q_test_fft(
 
         return Q, pval
 
-    # For otehr kernels, use Liu's method
+    # For other kernels, use Liu's method
     evals = kernel.eigenvalues(return_full=True)
     if evals.min() < -0.1:
         raise ValueError(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -11,6 +12,11 @@ from tqdm import tqdm
 
 from quadsv.kernels import Kernel, SpatialKernel
 from quadsv.statistics import compute_null_params, spatial_q_test
+from quadsv.utils import _apply_bh_correction
+
+__all__ = ["PatternDetector"]
+
+logger = logging.getLogger(__name__)
 
 
 # helper function for parallel Q-stat computation
@@ -55,7 +61,7 @@ def _qstat_worker(
 
     Returns
     -------
-    List[dict[str, Union[str, float]]]
+    list[dict[str, str or float]]
         Each dict contains: {'Feature': str, 'Q': float, 'P_value': float, 'Z_score': float}
     """
     results = []
@@ -172,7 +178,7 @@ def _rstat_worker_chunked(
 
     Returns
     -------
-    List[dict[str, Union[str, float]]]
+    list[dict[str, str or float]]
         Results for all (x, y) pairs in this chunk.
     """
     results = []
@@ -314,7 +320,7 @@ class PatternDetector:
 
     def __init__(self, adata: Any, min_cells: int = 1, min_cells_frac: float | None = None) -> None:
         """
-        Initializes the PatternDetector with an AnnData object.
+        Initialize the PatternDetector with an AnnData object.
 
         Parameters
         ----------
@@ -322,18 +328,27 @@ class PatternDetector:
             Annotated data matrix.
         min_cells : int, default 1
             Minimum number of cells with non-zero expression for feature inclusion.
+            Clamped to ``[1, n_cells]``: values larger than the number of samples in
+            ``adata`` are silently capped at ``n_cells``.
         min_cells_frac : float, optional
-            If provided, overrides min_cells to be max(1, int(min_cells_frac * n_cells)).
+            If provided, overrides ``min_cells`` with
+            ``max(1, int(min_cells_frac * n_cells))``.
         """
         self.adata = adata
-        self.n = adata.shape[0]
+        """Reference to the input :class:`anndata.AnnData` object."""
+        self.n: int = adata.shape[0]
+        """Number of samples (cells/observations)."""
         if min_cells_frac is not None:
-            self.min_cells = max(1, int(min_cells_frac * self.n))
+            self.min_cells: int = max(1, int(min_cells_frac * self.n))
         else:
-            self.min_cells = min(min_cells, self.n)  # Minimum cells for feature inclusion
-        self.kernel_ = None  # Stores the active Kernel object
-        self.kernel_method_ = None  # Stores the method used to build the kernel
-        self.kernel_params_ = None  # Stores parameters used to build the kernel
+            self.min_cells = min(min_cells, self.n)
+        """Minimum number of non-zero observations a feature must have to be tested."""
+        self.kernel_: Kernel | None = None
+        """Active :class:`~quadsv.kernels.Kernel` object, set by ``build_kernel_*`` methods."""
+        self.kernel_method_: str | None = None
+        """Name of the kernel method used to build :attr:`kernel_`, or ``None`` until built."""
+        self.kernel_params_: dict | None = None
+        """Parameters used to build :attr:`kernel_`, or ``None`` until built."""
 
     def _get_default_params(self, method: str) -> dict[str, Any]:
         """
@@ -347,7 +362,7 @@ class PatternDetector:
         Returns
         -------
         dict[str, Any]
-            Method defaults: bandwidth (gaussian/matern), nu (matern), neighbor_degree (moran/graph_laplacian/car), rho (car).
+            Method defaults: bandwidth (gaussian/matern), nu (matern), k_neighbors (moran/graph_laplacian/car), rho (car).
         """
         method_defaults = {
             "gaussian": {"bandwidth": 2.0},
@@ -408,7 +423,7 @@ class PatternDetector:
                 f"Coordinate shape {coords.shape} does not match adata shape ({self.n},)."
             )
 
-        print(f"Building {method} kernel from coordinates (n_samples={self.n})...")
+        logger.info("Building %s kernel from coordinates (n_samples=%d)...", method, self.n)
 
         if not kernel_params:
             # Use default parameters if none provided
@@ -489,14 +504,18 @@ class PatternDetector:
 
         # If the user says 'precomputed', they imply the matrix IS the kernel K
         if method == "precomputed":
-            print(f"Using obsp['{key}'] directly as kernel matrix (n_samples={self.n})...")
+            logger.info("Using obsp['%s'] directly as kernel matrix (n_samples=%d)...", key, self.n)
             self.kernel_ = SpatialKernel.from_matrix(matrix, is_inverse=False)
             self.kernel_params_ = kernel_params
             self.kernel_method_ = method
             return
 
-        print(
-            f"Building {method} kernel from obsp['{key}'] (is_distance={is_distance}, n_samples={self.n})..."
+        logger.info(
+            "Building %s kernel from obsp['%s'] (is_distance=%s, n_samples=%d)...",
+            method,
+            key,
+            is_distance,
+            self.n,
         )
 
         # Set kernel configuration parameters
@@ -553,8 +572,9 @@ class PatternDetector:
             keep_mask = row_sums_raw > 0
             if not np.all(keep_mask):
                 removed = int((~keep_mask).sum())
-                print(
-                    f"Removing {removed} isolated samples with zero degree from adjacency matrix..."
+                logger.info(
+                    "Removing %d isolated samples with zero degree from adjacency matrix...",
+                    removed,
                 )
                 W = W[keep_mask][:, keep_mask]
                 self.adata = self.adata[keep_mask].copy()
@@ -655,7 +675,9 @@ class PatternDetector:
 
             # check if .obs[keys] are char/categorical
             if any(adata_tmp.dtypes == "object") or any(adata_tmp.dtypes == "category"):
-                print("Categorical features detected in .obs[keys]; performing one-hot encoding...")
+                logger.info(
+                    "Categorical features detected in .obs[keys]; performing one-hot encoding..."
+                )
                 # one-hot encode categorical variables while keeping others unchanged
                 dummies = pd.get_dummies(adata_tmp)
 
@@ -718,28 +740,6 @@ class PatternDetector:
 
         return X_csc, names, means, stds
 
-    def _apply_bh_correction(self, df):
-        """Applies Benjamini-Hochberg correction to P_value column in place."""
-        pvals = df["P_value"].to_numpy()
-        valid_mask = np.isfinite(pvals)
-        m = valid_mask.sum()
-        if m == 0:
-            return
-
-        p_sorted_idx = np.argsort(pvals[valid_mask])
-        p_sorted = pvals[valid_mask][p_sorted_idx]
-        ranks = np.arange(1, m + 1)
-
-        bh_vals = p_sorted * m / ranks
-        bh_adj = np.minimum.accumulate(bh_vals[::-1])[::-1]
-        bh_adj = np.clip(bh_adj, 0, 1)
-
-        p_adj = np.full_like(pvals, np.nan)
-        p_adj_indices = np.where(valid_mask)[0][p_sorted_idx]
-        p_adj[p_adj_indices] = bh_adj
-
-        df["P_adj"] = p_adj
-
     def compute_qstat(
         self,
         source: str = "var",
@@ -795,6 +795,12 @@ class PatternDetector:
 
         Zero-variance features are assigned Q=0, P_value=1.0.
 
+        The null-distribution approximation is auto-selected from
+        ``self.kernel_method_`` (``'clt'`` for Moran's I, ``'welch'`` for all other
+        kernels) and cannot be overridden through this method. For full control
+        over the null method (including ``'liu'``), call
+        :func:`quadsv.statistics.spatial_q_test` directly.
+
         Examples
         --------
         >>> detector.build_kernel_from_coordinates(adata.obsm['spatial'])
@@ -810,7 +816,7 @@ class PatternDetector:
 
         # 2. Compute Null Distribution
         null_method = "clt" if self.kernel_method_ in ["moran"] else "welch"
-        print(f"Computing null distribution approximation (method={null_method})...")
+        logger.info("Computing null distribution approximation (method=%s)...", null_method)
         null_params = compute_null_params(self.kernel_, method=null_method)
 
         # 3. Prepare Data
@@ -828,7 +834,7 @@ class PatternDetector:
         indices = np.arange(n_feats)
         chunks = np.array_split(indices, max(n_jobs * 4, 1))
 
-        print(f"Testing {n_feats} features using {n_jobs} cores...")
+        logger.info("Testing %d features using %d cores...", n_feats, n_jobs)
 
         results_list = Parallel(n_jobs=n_jobs)(
             delayed(_qstat_worker)(
@@ -857,7 +863,7 @@ class PatternDetector:
 
         # 6. Multiple testing correction (Benjamini-Hochberg)
         if return_pval:
-            self._apply_bh_correction(df)
+            _apply_bh_correction(df)
 
         return df.sort_values(by="Q", ascending=False)
 
@@ -923,7 +929,10 @@ class PatternDetector:
         all requested feature pairs in the symmetric mode (features_y = None). Thus, for features_x = [A, B, C],
         the output will contain (A, A), (A, B), (A, C), (B, A), (B, B), (B, C), (C, A), (C, B), (C, C).
 
-        P-value calculation uses Normal approximation based on Trace(K²).
+        P-value calculation uses a normal approximation based on Tr(K²) and is not
+        configurable through this method. For finer control over the null model,
+        call :func:`quadsv.statistics.spatial_r_test` directly.
+
         Zero-variance features are handled gracefully (assigned R=0, P=1).
 
         Examples
@@ -945,7 +954,7 @@ class PatternDetector:
         # We need Trace(KK^T) which is Trace(K^2) for symmetric K
         # compute_null_params already computes var_Q = 2*Tr(K^2).
         # var_R = Tr(K^2) = var_Q / 2.
-        print("Computing null distribution for R statistic...")
+        logger.info("Computing null distribution for R statistic...")
         q_null = compute_null_params(self.kernel_, method="clt")
         null_params = {
             "mean_R": 0.0,
@@ -1000,8 +1009,12 @@ class PatternDetector:
 
             n_jobs = os.cpu_count() or 1
 
-        print(
-            f"Testing {len(valid_x_indices)} x {len(valid_y_indices)} pairs using {n_jobs} cores with chunk_size={chunk_size}..."
+        logger.info(
+            "Testing %d x %d pairs using %d cores with chunk_size=%d...",
+            len(valid_x_indices),
+            len(valid_y_indices),
+            n_jobs,
+            chunk_size,
         )
 
         results_list = Parallel(n_jobs=n_jobs, prefer="threads")(
@@ -1029,6 +1042,6 @@ class PatternDetector:
 
         # 7. Multiple testing correction (Benjamini-Hochberg)
         if return_pval:
-            self._apply_bh_correction(df)
+            _apply_bh_correction(df)
 
         return df.sort_values(by="Z_score", key=abs, ascending=False)
