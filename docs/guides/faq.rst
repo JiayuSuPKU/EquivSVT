@@ -27,7 +27,7 @@ The **CAR kernel** :math:`\mathbf{K} = (\mathbf{I} - \rho \mathbf{\tilde{W}})^{-
        coords, method='car', k_neighbors=4, rho=0.9
    )
 
-See :doc:`theory` for mathematical details (Theorem 2).
+See :doc:`/guides/theory` for mathematical details (Theorem 2).
 
 
 **Q: What's the difference between Q-test and R-test?**
@@ -80,6 +80,6 @@ Yes, but currently only for matrix-based kernels. Pass 3D coordinates to :meth:`
 Further help
 ~~~~~~~~~~~~
 
-- **Documentation**: See :doc:`quickstart` and :doc:`theory`
-- **API Reference**: Browse :doc:`api/index`
+- **Documentation**: See :doc:`/guides/quickstart` and :doc:`/guides/theory`
+- **API Reference**: Browse :doc:`/autoapi/quadsv/index`
 - **GitHub Issues**: Open a ticket at `https://github.com/JiayuSuPKU/EquivSVT/issues <https://github.com/JiayuSuPKU/EquivSVT/issues>`_

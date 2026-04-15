@@ -181,6 +181,6 @@ CAR            ✓ Guaranteed             Low-frequency, smoothed patterns
 See also
 --------
 
-- :doc:`quickstart` — Practical usage examples
-- :doc:`kernels` — Kernel selection and design
-- :doc:`api/statistics` — Statistical API reference
+- :doc:`/guides/quickstart` — Practical usage examples
+- :doc:`/guides/kernels` — Kernel selection and design
+- :doc:`/autoapi/quadsv/statistics/index` — Statistical API reference

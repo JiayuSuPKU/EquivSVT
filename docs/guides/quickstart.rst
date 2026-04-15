@@ -180,6 +180,6 @@ calls ``sdata.rasterize_bins()`` to create dense inputs on a fixed-resolution gr
 Next Steps
 ----------
 
-- **Theory**: Read :doc:`theory` for mathematical background
-- **Kernel design**: See :doc:`kernels` for practical tips on kernel design
-- **API Reference**: Browse :doc:`api/index`
+- **Theory**: Read :doc:`/guides/theory` for mathematical background
+- **Kernel design**: See :doc:`/guides/kernels` for practical tips on kernel design
+- **API Reference**: Browse :doc:`/autoapi/quadsv/index`

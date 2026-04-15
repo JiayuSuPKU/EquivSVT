@@ -1,50 +1,92 @@
-Consistent and scalable detection of spatial patterns
-==============================================================
-
-Welcome to ``quadsv``, a Python library for detecting patterns in spatial omics data and beyond.
-
-In our `accompanied paper <https://arxiv.org/pdf/2602.02825>`_, we unify spatial pattern detection methods through a single quadratic-form Q-statistic framework. 
-Major spatial variable gene (SVG) detection methods (Moran's I, parametric models, dependence tests) are mathematically 
-equivalent instances of the Q-test, differing primarily in kernel choice. 
-We reveal that several widely used methods, including Moran's I, are inconsistent, and propose scalable corrections. 
-
-This package implements the resulting test, enabling robust pattern detection across millions of spatial locations and single-cell lineage-tracing datasets.
-
-**Key features**:
-
-- **Unified framework**: Major SVG detection methods reduce to the quadratic-form Q-test
-- **Theoretically consistent**: CAR kernel ensures robust detection of mean shifts (Theorems 1 and 2)
-- **Scalable**: Sparse and implicit kernel operations for general graphs, FFT acceleration for grids
-
-Quick links
------------
-
-- **New to quadsv?** Start with :doc:`quickstart`
-- **Understanding theory?** Read :doc:`theory`
-- **Choosing kernels?** See :doc:`kernels`
-- **API Reference?** Browse :doc:`api/index`
+Welcome
+=======
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
    :hidden:
+   :caption: Getting Started
 
-   installation
-   quickstart
-   theory
-   kernels
-   faq
-   api/index
+   self
+   guides/installation
+   guides/quickstart
+   guides/theory
+   guides/kernels
+   guides/faq
 
-References
-----------
+.. toctree::
+   :maxdepth: 2
+   :hidden:
+   :caption: API Reference
 
-Su, Jiayu, et al. "On the consistent and scalable detection of spatial patterns." arXiv (2026): 2602.02825.
+   autoapi/quadsv/index
+
+.. toctree::
+   :maxdepth: 1
+   :hidden:
+   :caption: Development
+
+   changelog
+
+`quadsv <https://github.com/JiayuSuPKU/EquivSVT>`_ is a Python library for
+consistent and scalable spatial pattern detection in omics data.
+It implements kernel-based hypothesis tests (Q-tests and R-tests) that unify
+major spatial variability detection methods under a single quadratic-form framework.
+
+In the associated paper (`Su et al. 2026 <https://arxiv.org/pdf/2602.02825>`_),
+we show that major spatial variable gene (SVG) detection methods --- Moran's I,
+parametric models, and dependence tests --- are mathematically equivalent instances
+of the Q-test, differing primarily in kernel choice.
+We reveal that several widely used methods, including Moran's I, are *inconsistent*,
+and propose scalable corrections via the CAR kernel.
 
 
-Indices and tables
-------------------
+Key features
+------------
 
-* :ref:`genindex`
-* :ref:`modindex`
-* :ref:`search`
+- **Reliable**: CAR kernel eliminates false negatives from Moran's I spectral cancellation
+- **Scalable**: Implicit sparse solvers and FFT acceleration handle millions of spots
+- **Universal**: Works with Visium, Visium HD, MERFISH, lineage trees, any spatial/graph data
+- **Integrated**: Native AnnData and SpatialData support
+
+
+Quick example
+-------------
+
+.. code-block:: python
+
+   import numpy as np
+   from quadsv import SpatialKernel, spatial_q_test
+
+   # Spatial coordinates and gene expression
+   coords = np.random.randn(500, 2)
+   gene = np.random.randn(500)
+
+   # Build CAR kernel (recommended)
+   kernel = SpatialKernel.from_coordinates(
+       coords, method='car', k_neighbors=15, rho=0.9
+   )
+
+   # Test for spatial variability
+   Q, pval = spatial_q_test(gene, kernel)
+   print(f"Q = {Q:.4f}, p-value = {pval:.4e}")
+
+
+Getting started
+---------------
+
+- **Installation**: See :doc:`guides/installation`
+- **Quick start**: See :doc:`guides/quickstart` for a 5-minute tutorial
+- **Theory**: Read :doc:`guides/theory` for mathematical background
+- **Kernel design**: See :doc:`guides/kernels` for practical kernel selection tips
+
+
+Reference
+---------
+
+Su, Jiayu, et al. "On the consistent and scalable detection of spatial patterns." arXiv (2026): 2602.02825. `link to paper <https://arxiv.org/pdf/2602.02825>`_
+
+
+Reporting issues
+----------------
+
+If you encounter any issues, please report them on the `GitHub Issues page <https://github.com/JiayuSuPKU/EquivSVT/issues>`_.

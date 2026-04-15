@@ -12,7 +12,7 @@ The spatial Q-test framework unifies pattern detection under the quadratic form,
 
 The kernel matrix :math:`\mathbf{K}` encodes spatial structure. **Test consistency requires positive definiteness**; indefinite kernels suffer spectral cancellation and produce false negatives.
 
-**See theory:** :doc:`theory` for Theorems 1-2, CAR kernel solution, null distributions, and FFT acceleration.
+**See theory:** :doc:`/guides/theory` for Theorems 1-2, CAR kernel solution, null distributions, and FFT acceleration.
 
 
 Kernel spectrum and power
@@ -251,6 +251,6 @@ Verify kernel properties by inspecting eigenvalues:
 See also
 --------
 
-- :doc:`quickstart` for practical examples
-- :doc:`theory` for mathematical background
-- :doc:`api/kernels` and :doc:`api/fft` for detailed kernel API documentation
+- :doc:`/guides/quickstart` for practical examples
+- :doc:`/guides/theory` for mathematical background
+- :doc:`/autoapi/quadsv/kernels/index` and :doc:`/autoapi/quadsv/fft/index` for detailed kernel API documentation
