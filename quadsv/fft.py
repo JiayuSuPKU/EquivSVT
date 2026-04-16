@@ -11,7 +11,72 @@ from scipy.stats import chi2, norm
 
 from quadsv.statistics import liu_sf
 
-__all__ = ["FFTKernel", "spatial_q_test_fft", "spatial_r_test_fft"]
+__all__ = ["FFTKernel", "power_spectrum_2d", "spatial_q_test_fft", "spatial_r_test_fft"]
+
+
+def power_spectrum_2d(
+    x: np.ndarray,
+    fft_solver: str = "fft2",
+    workers: int | None = None,
+) -> np.ndarray:
+    """
+    Compute the 2D power spectrum :math:`|\\hat{x}(k)|^2` of one or more grid signals.
+
+    The result is *translation-invariant*: shifting the input image leaves the power
+    spectrum unchanged. This makes the spectrum a natural alignment-free representation
+    of a spatial pattern. Use :func:`quadsv.spectral_compare.radial_bin_spectrum` to
+    further reduce the 2D spectrum to a 1D radial-binned vector that is also
+    rotation-invariant.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Grid signal of shape ``(ny, nx)`` for a single feature, or ``(ny, nx, M)``
+        for ``M`` stacked features sharing the grid.
+    fft_solver : {'fft2', 'rfft2'}, default 'fft2'
+        FFT routine. ``'rfft2'`` returns the half-spectrum of shape
+        ``(ny, nx // 2 + 1)`` and roughly halves memory.
+    workers : int, optional
+        Number of parallel workers forwarded to :mod:`scipy.fft`. ``None`` uses the
+        SciPy default.
+
+    Returns
+    -------
+    np.ndarray
+        Power spectrum. Shape ``(ny, n_kx)`` if input was 2D, or ``(ny, n_kx, M)``
+        if input was 3D, where ``n_kx = nx`` for ``fft2`` and ``nx // 2 + 1`` for
+        ``rfft2``. Layout matches the corresponding :mod:`scipy.fft` routine
+        (zero-frequency bin at ``[0, 0]``, no fftshift applied).
+
+    Raises
+    ------
+    ValueError
+        If ``fft_solver`` is not one of ``'fft2'`` or ``'rfft2'``.
+
+    Examples
+    --------
+    >>> img = np.random.randn(32, 32)
+    >>> P = power_spectrum_2d(img, fft_solver='rfft2')
+    >>> P.shape
+    (32, 17)
+    """
+    if fft_solver not in ("fft2", "rfft2"):
+        raise ValueError(f"fft_solver must be 'fft2' or 'rfft2', got '{fft_solver}'")
+
+    squeeze = x.ndim == 2
+    if squeeze:
+        x = x[..., np.newaxis]
+
+    if fft_solver == "fft2":
+        x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=workers)
+    else:
+        x_hat = scipy.fft.rfft2(x, axes=(0, 1), workers=workers)
+
+    power = np.abs(x_hat) ** 2
+
+    if squeeze:
+        power = power[..., 0]
+    return power
 
 
 class FFTKernel:
@@ -395,10 +460,10 @@ class FFTKernel:
                 f"Data shape ({ny}, {nx}) does not match kernel ({self.ny}, {self.nx})"
             )
 
-        # Transform using selected FFT solver
+        # Transform using selected FFT solver via the shared power-spectrum helper.
+        x_power = power_spectrum_2d(x, fft_solver=self.fft_solver, workers=self.workers)
+
         if self.fft_solver == "fft2":
-            x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=self.workers)
-            x_power = np.abs(x_hat) ** 2
             # Reshape spectrum for full fft2: (ny, nx, 1)
             lam = self.spectrum.reshape(self.ny, self.nx, 1)
 
@@ -406,22 +471,21 @@ class FFTKernel:
             weighted_power = np.sum(x_power * lam, axis=(0, 1))
 
         else:
-            x_hat = scipy.fft.rfft2(x, axes=(0, 1), workers=self.workers)
             # Reshape spectrum for rfft2: (ny, nx//2+1, 1)
             lam = self.spectrum.reshape(self.ny, self.nx // 2 + 1, 1)
 
             # Weighted Sum (Parseval's Theorem) with correction for rfft2
-            power_spectrum = np.abs(x_hat) ** 2 * lam
-            weighted_power = 2.0 * np.sum(power_spectrum, axis=(0, 1))
+            weighted = x_power * lam
+            weighted_power = 2.0 * np.sum(weighted, axis=(0, 1))
 
             # Correction: Subtract the first column (fx=0) once
             # because we added it twice in the line above, but it only exists once.
-            weighted_power -= np.sum(power_spectrum[:, 0, :], axis=0)
+            weighted_power -= np.sum(weighted[:, 0, :], axis=0)
 
             # Correction: If width is even, the last column is Nyquist (fx=N/2).
             # It is also unique (real-valued in full spectrum), so subtract it once.
             if nx % 2 == 0:
-                weighted_power -= np.sum(power_spectrum[:, -1, :], axis=0)
+                weighted_power -= np.sum(weighted[:, -1, :], axis=0)
 
         # FFT is unnormalized: Parseval requires 1/N normalization
         Q = weighted_power / (ny * nx)
