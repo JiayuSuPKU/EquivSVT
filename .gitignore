@@ -46,8 +46,9 @@ htmlcov/
 .nox/
 .hypothesis/
 
-# Data
-data/
+# Data + analysis outputs (project-root-anchored so nested packages aren't ignored)
+/data/
+/results/
 *.h5ad
 *.csv
 figures/
