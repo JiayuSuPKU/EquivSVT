@@ -49,6 +49,52 @@ class TestFFTKernelBasics(unittest.TestCase):
         assert kernel.nx == 8
         assert len(kernel.spectrum) == 64
 
+    def test_hex_kernel_nonsquare_anisotropic_signal(self):
+        """Regression: hex topology must give correct xtKx on non-square grids.
+
+        Visium slides are 78 rows x 64 (or 128) cols, never square. The earlier
+        implementation swapped axes inside ``_precompute_hex_torus`` and only worked
+        when ``ny == nx``. This test checks agreement with the dense Matern kernel
+        on a non-square grid with a directional signal, where the axis-swap bug is
+        observable.
+        """
+        import numpy as np
+        from scipy.spatial.distance import pdist, squareform
+        from scipy.special import gamma, kv
+
+        ny, nx = 6, 10
+        bw, nu = 2.0, 1.5
+
+        # Physical Visium hex coords for each spot (r, c).
+        coords = np.array(
+            [[r * np.sqrt(3) / 2, (2 * c + (r % 2)) / 2.0] for r in range(ny) for c in range(nx)]
+        )
+        d = squareform(pdist(coords))
+        factor = (np.sqrt(2 * nu) * d) / bw
+        with np.errstate(divide="ignore", invalid="ignore"):
+            K = (2 ** (1 - nu) / gamma(nu)) * (factor**nu) * kv(nu, factor)
+        K[d == 0] = 1.0
+
+        kernel = FFTKernel(
+            (ny, nx), topology="hex", method="matern", bandwidth=bw, nu=nu, fft_solver="fft2"
+        )
+        rng = np.random.default_rng(0)
+        # Two distinctly anisotropic signals:
+        sig_x = np.broadcast_to(np.sin(2 * np.pi * np.arange(nx) / nx), (ny, nx)).astype(float)
+        sig_y = np.broadcast_to(np.sin(2 * np.pi * np.arange(ny) / ny)[:, None], (ny, nx)).astype(
+            float
+        )
+        sig_rand = rng.standard_normal((ny, nx))
+
+        for sig in (sig_x, sig_y, sig_rand):
+            Q_dense = sig.ravel() @ K @ sig.ravel()
+            Q_fft = kernel.xtKx(sig)
+            # Allow up to 10% deviation due to torus periodic-BC wrap-around.
+            assert abs(Q_fft - Q_dense) / abs(Q_dense) < 0.10, (
+                f"Hex FFTKernel disagrees with dense Matern: dense={Q_dense:.4f}, "
+                f"fft={Q_fft:.4f}"
+            )
+
     def test_fft_matern_eigenvalues(self):
         """Test eigenvalues method."""
         shape = (5, 5)

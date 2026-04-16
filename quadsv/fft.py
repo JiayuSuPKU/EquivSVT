@@ -243,32 +243,50 @@ class FFTKernel:
         return yy**2 + xx**2
 
     def _precompute_hex_torus(self):
-        """Calculates torus distances on a hexagonal grid (Visium Standard)."""
-        # (Hex implementation remains the same, strictly periodic)
-        i = np.arange(self.nx)
-        j = np.arange(self.ny)
-        ii, jj = np.meshgrid(i, j, indexing="ij")
+        """Squared torus distances on a hexagonal grid (Visium convention).
 
-        y_phys = ii * (np.sqrt(3) / 2.0)
-        x_phys = jj + 0.5 * (ii % 2)
+        Spot ``(r, c)`` lies at physical ``(y, x) = (r * sqrt(3)/2, c + 0.5 * (r%2))``
+        in units of the center-to-center horizontal step — i.e., odd rows are shifted
+        half a step in +x, matching the 10x Visium ``array_row`` / ``array_col``
+        layout.
 
-        coords_grid = np.stack([x_phys, y_phys], axis=-1)
+        Returns an ``(ny, nx)`` array consistent with the ``(ny, nx)`` signal shape
+        expected by :meth:`xtKx`. (The previous implementation returned ``(nx, ny)``
+        and scrambled the spectrum for non-square grids, silently breaking anisotropic
+        signals on any real Visium slide — Visium is never square. Tests covered only
+        square hex grids so the bug was invisible. Fixed.)
 
-        width_phys = self.ny
-        height_phys = self.nx * (np.sqrt(3) / 2.0)
+        Periodicity in the y direction is well-defined only when ``ny`` is even (so
+        the row-parity shift is preserved under wrap-around); callers feeding odd
+        ``ny`` will get a near-periodic but slightly off torus and a warning is
+        emitted.
+        """
+        if self.ny % 2 != 0:
+            warnings.warn(
+                f"Hex topology expects an even number of rows (ny); got ny={self.ny}. "
+                "Periodic boundary conditions are approximate for odd ny.",
+                UserWarning,
+                stacklevel=2,
+            )
+        r = np.arange(self.ny)  # row index, first (ny) axis
+        c = np.arange(self.nx)  # col index, second (nx) axis
+        rr, cc = np.meshgrid(r, c, indexing="ij")  # both shape (ny, nx)
 
-        P_x = np.array([width_phys, 0])
-        P_y = np.array([0, height_phys])
+        y_phys = rr * (np.sqrt(3) / 2.0)
+        x_phys = cc + 0.5 * (rr % 2)
+        coords_grid = np.stack([y_phys, x_phys], axis=-1)  # (ny, nx, 2)
 
-        min_d2 = np.full((self.nx, self.ny), np.inf)
+        # Torus periods: width in x is nx, height in y is ny * sqrt(3)/2.
+        P_y = np.array([self.ny * (np.sqrt(3) / 2.0), 0.0])
+        P_x = np.array([0.0, float(self.nx)])
 
-        for k in [-1, 0, 1]:
-            for m in [-1, 0, 1]:
-                shift = k * P_x + m * P_y
-                shifted_coords = coords_grid + shift.reshape(1, 1, 2)
-                d2 = np.sum(shifted_coords**2, axis=-1)
+        min_d2 = np.full((self.ny, self.nx), np.inf)
+        for k in (-1, 0, 1):
+            for m in (-1, 0, 1):
+                shift = k * P_y + m * P_x
+                shifted = coords_grid + shift.reshape(1, 1, 2)
+                d2 = np.sum(shifted**2, axis=-1)
                 min_d2 = np.minimum(min_d2, d2)
-
         return min_d2
 
     def _compute_eigenvalues(self):  # noqa: C901
