@@ -11,6 +11,7 @@ Welcome
    guides/quickstart
    guides/theory
    guides/kernels
+   guides/spectral_compare
    guides/faq
 
 .. toctree::

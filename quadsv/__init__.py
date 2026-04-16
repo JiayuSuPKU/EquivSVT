@@ -33,6 +33,13 @@ from quadsv.io_visium import (
     visium_to_grid,
 )
 from quadsv.kernels import SpatialKernel
+from quadsv.spectral_compare import (
+    SpectralComparator,
+    benchmark_statistics,
+    compare_two_groups,
+    compare_two_groups_scalar,
+    shape_normalize,
+)
 from quadsv.statistics import spatial_q_test, spatial_r_test
 
 # Define public API
@@ -48,6 +55,12 @@ __all__ = [
     "power_spectrum_2d",
     # Detector classes
     "PatternDetector",
+    # Cross-sample spectral comparison
+    "SpectralComparator",
+    "compare_two_groups",
+    "compare_two_groups_scalar",
+    "benchmark_statistics",
+    "shape_normalize",
     # Visium I/O
     "load_visium_sample",
     "visium_to_grid",
