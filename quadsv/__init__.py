@@ -25,7 +25,13 @@ except (ImportError, PackageNotFoundError):
 # Import core classes and functions
 # Application classes for pattern detection
 from quadsv.detector import PatternDetector
-from quadsv.fft import FFTKernel, spatial_q_test_fft, spatial_r_test_fft
+from quadsv.fft import FFTKernel, power_spectrum_2d, spatial_q_test_fft, spatial_r_test_fft
+from quadsv.io_visium import (
+    VISIUM_V1_SPOT_SPACING_UM,
+    load_visium_sample,
+    visium_hex_spacing_um,
+    visium_to_grid,
+)
 from quadsv.kernels import SpatialKernel
 from quadsv.statistics import spatial_q_test, spatial_r_test
 
@@ -39,8 +45,14 @@ __all__ = [
     "spatial_r_test",
     "spatial_q_test_fft",
     "spatial_r_test_fft",
+    "power_spectrum_2d",
     # Detector classes
     "PatternDetector",
+    # Visium I/O
+    "load_visium_sample",
+    "visium_to_grid",
+    "visium_hex_spacing_um",
+    "VISIUM_V1_SPOT_SPACING_UM",
 ]
 
 # PatternDetectorFFT requires optional spatialdata dependency
