@@ -1734,6 +1734,13 @@ class SpectralComparator:
             None if freq_edges is None else np.asarray(freq_edges, dtype=float)
         )
         self.mode: str = mode
+        # NUFFT output is always full-2D (fft2 layout, DC at [0,0]); only the
+        # SpatialData / FFT path honours the user-chosen solver ('fft2' or
+        # 'rfft2'). This internal field is what downstream helpers
+        # (radial_bin_spectrum, align_spectra_by_rotation, covariate
+        # rasterization) see — keeps the public `fft_solver` attribute as a
+        # pure user knob.
+        self._spectrum_fft_solver: str = "fft2" if mode == "nufft" else fft_solver
         self.samples: list[Any] = samples_list
         self._layer = layer
         self._table_key = table_key
@@ -2235,7 +2242,7 @@ class SpectralComparator:
             aligned, angles = align_spectra_by_rotation(
                 self._raw_2d_spectra,
                 grid_shapes=self._grid_shapes,
-                fft_solver=self.fft_solver,
+                fft_solver=self._spectrum_fft_solver,
                 landmark_indices=landmark_indices,
                 progress=progress,
             )
@@ -2274,7 +2281,7 @@ class SpectralComparator:
                     spec_i,
                     grid_shape=shape,
                     n_bins=self.n_radial_bins,
-                    fft_solver=self.fft_solver,
+                    fft_solver=self._spectrum_fft_solver,
                     spacing=spacing_i,
                     edges=self.freq_edges,
                 )
@@ -2349,7 +2356,9 @@ class SpectralComparator:
         for i, cov in enumerate(covariates):
             if cov.ndim != 3:
                 raise ValueError(f"covariate sample {i} must be 3D, got {cov.shape}.")
-            cov_2d = compute_sample_spectrum(cov, fft_solver=self.fft_solver, workers=self.workers)
+            cov_2d = compute_sample_spectrum(
+                cov, fft_solver=self._spectrum_fft_solver, workers=self.workers
+            )
             shape = self._grid_shapes[i]
             spacing = self.spacings[i] if self.spacings is not None else None
             if self.feature_mode == "radial":
@@ -2357,7 +2366,7 @@ class SpectralComparator:
                     cov_2d,
                     grid_shape=shape,
                     n_bins=self.n_radial_bins,
-                    fft_solver=self.fft_solver,
+                    fft_solver=self._spectrum_fft_solver,
                     spacing=spacing,
                     edges=self.freq_edges,
                 )
