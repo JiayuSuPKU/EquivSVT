@@ -12,8 +12,9 @@ The top-level namespace exposes exactly four conceptual layers, nothing else:
    :class:`anndata.AnnData` (irregular grids, matrix/NUFFT backends),
    :class:`PatternDetectorFFT` consumes :class:`spatialdata.SpatialData`
    (regular grids, FFT backend).
-4. **SpectralComparator** — cross-sample pattern comparison on a list of
-   AnnData (NUFFT backend) or SpatialData (FFT backend).
+4. **Pattern comparators** — cross-sample pattern comparison:
+   :class:`PatternComparatorNUFFT` on a list of AnnData (NUFFT backend);
+   :class:`PatternComparatorFFT` on a list of SpatialData (FFT backend).
 
 Utilities, constants, and internal primitives (Liu's SF, Visium I/O,
 radial binning, etc.) remain accessible under their submodules
@@ -34,6 +35,8 @@ except (ImportError, PackageNotFoundError):
 
 # Layer 1: Kernels
 # Layer 3: PatternDetector
+# Layer 4: Pattern comparators (cross-sample)
+from quadsv.comparators import PatternComparatorFFT, PatternComparatorNUFFT
 from quadsv.detector import PatternDetector
 from quadsv.detector_fft import PatternDetectorFFT
 
@@ -41,9 +44,6 @@ from quadsv.detector_fft import PatternDetectorFFT
 from quadsv.fft import FFTKernel, spatial_q_test_fft, spatial_r_test_fft
 from quadsv.kernels import SpatialKernel
 from quadsv.nufft import NUFFTKernel, spatial_q_test_nufft, spatial_r_test_nufft
-
-# Layer 4: SpectralComparator (cross-sample)
-from quadsv.spectral_compare import SpectralComparator
 from quadsv.statistics import spatial_q_test, spatial_r_test
 
 __all__ = [
@@ -62,5 +62,6 @@ __all__ = [
     "PatternDetector",
     "PatternDetectorFFT",
     # Cross-sample
-    "SpectralComparator",
+    "PatternComparatorNUFFT",
+    "PatternComparatorFFT",
 ]

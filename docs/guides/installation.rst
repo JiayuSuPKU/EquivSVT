@@ -48,10 +48,10 @@ Requirements
   * ``numpy``, ``scipy``, ``scikit-learn``, ``pandas``
   * ``scanpy`` (which transitively pulls ``anndata``)
   * ``spatialdata`` — used by :class:`~quadsv.PatternDetectorFFT` and the
-    :class:`~quadsv.SpectralComparator` FFT backend
+    :class:`~quadsv.PatternComparatorNUFFT` FFT backend
   * ``finufft`` — used by :class:`~quadsv.NUFFTKernel`, the ``*_nufft`` tests,
     :class:`~quadsv.PatternDetector` with ``backend='nufft'``, and the
-    :class:`~quadsv.SpectralComparator` NUFFT backend
+    :class:`~quadsv.PatternComparatorNUFFT` NUFFT backend
   * ``joblib``, ``tqdm``
 
 Verify installation

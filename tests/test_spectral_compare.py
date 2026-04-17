@@ -7,9 +7,9 @@ import numpy as np
 import pytest
 from scipy.stats import kstest
 
+from quadsv.comparators import PatternComparatorNUFFT
 from quadsv.fft import power_spectrum_2d
 from quadsv.spectral_compare import (
-    SpectralComparator,
     align_spectra_by_rotation,
     apply_rotations_to_spectra,
     benchmark_statistics,
@@ -25,7 +25,7 @@ from quadsv.spectral_compare import (
 )
 
 # ---------------------------------------------------------------------------
-# Test helpers for the AnnData-based SpectralComparator API (Phase D)
+# Test helpers for the AnnData-based PatternComparatorNUFFT API (Phase D)
 # ---------------------------------------------------------------------------
 
 
@@ -607,11 +607,11 @@ class TestBenchmark:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: SpectralComparator
+# End-to-end: PatternComparatorNUFFT
 # ---------------------------------------------------------------------------
 
 
-class TestSpectralComparatorEndToEnd:
+class TestPatternComparatorNUFFTEndToEnd:
     def test_pipeline_radial_runs_and_finds_implanted_gene(self):
         rng = np.random.default_rng(3)
         n_per = 4
@@ -631,7 +631,7 @@ class TestSpectralComparatorEndToEnd:
         groups = np.array([0] * n_per + [1] * n_per)
 
         cmp = (
-            SpectralComparator(_samples_to_adata_list(samples, gene_names), groups, gene_names)
+            PatternComparatorNUFFT(_samples_to_adata_list(samples, gene_names), groups, gene_names)
             .fit()
             .normalize_background()
         )
@@ -646,7 +646,9 @@ class TestSpectralComparatorEndToEnd:
         samples = [rng.standard_normal((4, ny, nx)) for _ in range(2 * n_per)]
         covariates = [rng.standard_normal((1, ny, nx)) for _ in range(2 * n_per)]
         groups = np.array([0] * n_per + [1] * n_per)
-        cmp = SpectralComparator(_samples_to_adata_list(samples, gene_names), groups, gene_names)
+        cmp = PatternComparatorNUFFT(
+            _samples_to_adata_list(samples, gene_names), groups, gene_names
+        )
         cmp.fit().residualize(covariates)
         df = cmp.test(statistic="log_l2", n_perm=50, random_state=0)
         assert df.shape[0] == 4
@@ -655,12 +657,12 @@ class TestSpectralComparatorEndToEnd:
         gene_names = ["a", "b"]
         adatas = _samples_to_adata_list([np.zeros((2, 4, 4))] * 3, gene_names)
         with pytest.raises(ValueError, match="exactly two distinct"):
-            SpectralComparator(adatas, np.array([0, 1, 2]), gene_names)
+            PatternComparatorNUFFT(adatas, np.array([0, 1, 2]), gene_names)
 
     def test_must_fit_before_test(self):
         gene_names = ["a", "b"]
         adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
-        cmp = SpectralComparator(adatas, np.array([0, 1]), gene_names)
+        cmp = PatternComparatorNUFFT(adatas, np.array([0, 1]), gene_names)
         with pytest.raises(RuntimeError, match=r"\.fit\(\)"):
             cmp.test()
 
@@ -746,7 +748,7 @@ class TestDeAndPatternOrthogonality:
 
         groups = np.array([0] * n_per + [1] * n_per)
         gene_names = [f"g{i}" for i in range(n_genes)]
-        cmp = SpectralComparator(
+        cmp = PatternComparatorNUFFT(
             _samples_to_adata_list(samples, gene_names),
             groups,
             gene_names=gene_names,
@@ -782,13 +784,13 @@ class TestDeAndPatternOrthogonality:
         assert np.all(spec_none[:, 0, 0] > 0.0)
 
 
-class TestSpectralComparatorDcAccess:
+class TestPatternComparatorNUFFTDcAccess:
     def test_fit_populates_dc(self):
         rng = np.random.default_rng(0)
         samples = [rng.standard_normal((3, 8, 10)) + s for s in range(4)]
         groups = np.array([0, 0, 1, 1])
         gene_names = ["a", "b", "c"]
-        cmp = SpectralComparator(
+        cmp = PatternComparatorNUFFT(
             _samples_to_adata_list(samples, gene_names), groups, gene_names
         ).fit()
         assert cmp.dc_ is not None
@@ -800,7 +802,7 @@ class TestSpectralComparatorDcAccess:
     def test_test_expression_requires_fit(self):
         gene_names = ["a", "b"]
         adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
-        cmp = SpectralComparator(adatas, np.array([0, 1]), gene_names)
+        cmp = PatternComparatorNUFFT(adatas, np.array([0, 1]), gene_names)
         with pytest.raises(RuntimeError, match="fit"):
             cmp.test_expression()
 
@@ -839,7 +841,7 @@ class TestShapeNormalize:
         groups = np.array([0, 0, 1, 1])
         gene_names = ["g0", "g1", "g2", "g3"]
         cmp = (
-            SpectralComparator(
+            PatternComparatorNUFFT(
                 _samples_to_adata_list(samples, gene_names), groups, gene_names, n_radial_bins=8
             )
             .fit()
@@ -857,7 +859,7 @@ class TestShapeNormalize:
     def test_shape_normalize_requires_fit(self):
         gene_names = ["a", "b"]
         adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
-        cmp = SpectralComparator(adatas, np.array([0, 1]), gene_names)
+        cmp = PatternComparatorNUFFT(adatas, np.array([0, 1]), gene_names)
         with pytest.raises(RuntimeError, match="fit"):
             cmp.shape_normalize()
 
@@ -910,15 +912,15 @@ class TestPhysicalFrequencyBinning:
             )
 
 
-class TestSpectralComparatorWithSpacings:
+class TestPatternComparatorNUFFTWithSpacings:
     def test_physical_spacings_produce_comparable_bins(self):
-        """SpectralComparator with per-sample auto-grids handles heterogeneous shapes."""
+        """PatternComparatorNUFFT with per-sample auto-grids handles heterogeneous shapes."""
         rng = np.random.default_rng(0)
         shapes = [(32, 40), (30, 42), (34, 38), (33, 41)]
         samples = [rng.standard_normal((3, ny, nx)) for (ny, nx) in shapes]
         groups = np.array([0, 0, 1, 1])
         gene_names = ["g0", "g1", "g2"]
-        cmp = SpectralComparator(
+        cmp = PatternComparatorNUFFT(
             _samples_to_adata_list(samples, gene_names),
             groups,
             gene_names=gene_names,
@@ -1007,7 +1009,7 @@ class TestIncompleteData:
         for i in (0, 1):
             samples[i].X[:, 0] = 0.0
         groups = np.array([0, 0, 1, 1])
-        cmp = SpectralComparator(
+        cmp = PatternComparatorNUFFT(
             samples,
             groups,
             gene_names,

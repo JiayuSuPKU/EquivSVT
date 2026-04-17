@@ -17,7 +17,7 @@ at the same uniform ``(ny, nx)`` k-space grid that :func:`power_spectrum_2d`
 would produce for a rasterized input of the same physical extent, then returns
 :math:`|\\hat c|^2` with the standard scipy FFT layout (DC at ``[0, 0]``).
 Anything downstream — :func:`quadsv.spectral_compare.radial_bin_spectrum`,
-:class:`quadsv.SpectralComparator` with physical ``spacings`` — works
+:class:`quadsv.PatternComparatorNUFFT` — works
 identically.
 
 Per-sample unit handling

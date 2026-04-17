@@ -21,15 +21,15 @@ DC/AC decomposition: expression vs pattern
 ------------------------------------------
 
 By default the pipeline **mean-centres each gene's spatial signal before the
-FFT** (``center='mean'`` on :class:`~quadsv.SpectralComparator`). This cleanly
+FFT** (``center='mean'`` on :class:`~quadsv.PatternComparatorNUFFT`). This cleanly
 splits the information into two orthogonal pieces:
 
 - **DC scalar** per ``(gene, sample)`` — the grid mean, i.e. total normalized
   expression on the slide. Tested across groups via
-  :meth:`~quadsv.SpectralComparator.test_expression` (Welch *t* with a
+  :meth:`~quadsv.PatternComparatorNUFFT.test_expression` (Welch *t* with a
   permutation null, BH-FDR); this is a classical differential-expression test.
 - **AC spectrum** — the pattern shape, with DC exactly zero. Tested across
-  groups via :meth:`~quadsv.SpectralComparator.test_pattern` (the log-L2 and
+  groups via :meth:`~quadsv.PatternComparatorNUFFT.test_pattern` (the log-L2 and
   other statistics described below).
 
 Because DC and AC live in orthogonal subspaces, the two tests carry
@@ -46,7 +46,7 @@ tests).
 Pipeline
 --------
 
-The :class:`~quadsv.SpectralComparator` class chains five steps:
+The :class:`~quadsv.PatternComparatorNUFFT` class chains five steps:
 
 1. Per-sample 2D power spectra (:func:`~quadsv.power_spectrum_2d`).
 2. Reduction to a low-dimensional feature vector — radial 1D bins by default,
@@ -73,7 +73,7 @@ Use :func:`~quadsv.benchmark_statistics` to evaluate all four on the same data.
 Input types
 -----------
 
-:class:`~quadsv.SpectralComparator` accepts two — and only two — kinds of
+:class:`~quadsv.PatternComparatorNUFFT` accepts two — and only two — kinds of
 per-sample container:
 
 - a list of :class:`anndata.AnnData` → **NUFFT backend** (irregular spots,
@@ -97,7 +97,7 @@ group 1 only.
 
    import anndata as ad
    import numpy as np
-   from quadsv import SpectralComparator
+   from quadsv import PatternComparatorNUFFT
 
    rng = np.random.default_rng(3)
    ny = nx = 32
@@ -124,7 +124,7 @@ group 1 only.
    groups = np.array([0, 0, 0, 0, 1, 1, 1, 1])
 
    cmp = (
-       SpectralComparator(samples, groups, gene_names)
+       PatternComparatorNUFFT(samples, groups, gene_names)
        .fit()
        .normalize_background()
    )
@@ -136,20 +136,26 @@ The implanted gene ``g0`` ranks first in the resulting table.
 FFT walkthrough (SpatialData)
 -----------------------------
 
-Swap the per-sample containers for :class:`spatialdata.SpatialData` and the
-same API picks the FFT path — no other code changes:
+For rasterized-grid samples, use :class:`~quadsv.PatternComparatorFFT` with a
+sequence of :class:`spatialdata.SpatialData` objects. Rasterization is done
+per sample via :func:`spatialdata.rasterize_bins` — same recipe as
+:class:`~quadsv.PatternDetectorFFT`, so you'll recognize the kwargs:
 
 .. code-block:: python
 
    import spatialdata as sd
-   from quadsv import SpectralComparator
+   from quadsv import PatternComparatorFFT
 
    samples_sd = [sd.read_zarr(p) for p in paths_by_group]
-   cmp = SpectralComparator(
+   cmp = PatternComparatorFFT(
        samples_sd,
        groups,
-       gene_names=None,           # inferred from the first sample's table
-       table_key="squidpy",        # or None if only one table
+       bins="bin_shapes",            # SpatialElement name shared by every sdata
+       table_name="counts",          # table inside each sdata
+       col_key="array_col",          # obs column with bin-column indices
+       row_key="array_row",          # obs column with bin-row indices
+       value_key=None,               # None → rasterizes expression off .X
+       fft_chunk_size=256,           # genes per batched scipy.fft call
    ).fit().normalize_background()
    cmp.test(statistic="log_l2", n_perm=300)
 
@@ -172,7 +178,7 @@ curve survives. Chain it after background normalization:
 .. code-block:: python
 
    cmp = (
-       SpectralComparator(samples, groups, gene_names)
+       PatternComparatorNUFFT(samples, groups, gene_names)
        .fit()
        .normalize_background()   # cancels per-sample gain across genes
        .shape_normalize()        # cancels per-(sample, gene) magnitude across freq
@@ -180,7 +186,7 @@ curve survives. Chain it after background normalization:
    # cmp.spectra_ now has unit geometric mean along the K axis; use it for
    # downstream KMeans / hierarchical clustering of gene-level contrast vectors.
 
-The per-gene DE test via :meth:`SpectralComparator.test_expression` is
+The per-gene DE test via :meth:`PatternComparatorNUFFT.test_expression` is
 unaffected — it reads from ``cmp.dc_`` directly.
 
 Cross-sample unit conversion (NUFFT path)
@@ -194,7 +200,7 @@ cycles per that unit on all samples:
 
 .. code-block:: python
 
-   cmp = SpectralComparator(
+   cmp = PatternComparatorNUFFT(
        samples,                 # list[AnnData]
        groups,
        gene_names=gene_names,
@@ -219,7 +225,7 @@ Visium hex grids
 For 10x Visium slides, :func:`quadsv.io_visium.load_visium_sample` (from the
 submodule) reads a Space Ranger output directory into an
 :class:`anndata.AnnData`. You can feed that :class:`~anndata.AnnData`
-directly to :class:`~quadsv.SpectralComparator` — the NUFFT backend handles
+directly to :class:`~quadsv.PatternComparatorNUFFT` — the NUFFT backend handles
 the irregular hex layout without any manual rasterization step. If you do
 want the explicit hex-to-grid rasterization for other purposes,
 :func:`quadsv.io_visium.visium_to_grid` returns the ``(n_genes, 78, 128)``
@@ -233,7 +239,7 @@ Choosing covariate maps for residualization
 -------------------------------------------
 
 Pass a list of per-sample covariate arrays (each of shape
-``(n_covariates, ny_s, nx_s)``) to :meth:`~quadsv.SpectralComparator.residualize`.
+``(n_covariates, ny_s, nx_s)``) to :meth:`~quadsv.PatternComparatorNUFFT.residualize`.
 Useful candidates:
 
 - **Cell-type proportion maps** from your favorite deconvolution tool (Cell2location,
@@ -266,7 +272,7 @@ exposes a translation-invariance property that graph Fourier does not.
 API reference
 -------------
 
-:class:`quadsv.SpectralComparator` is the main public entry point.
+:class:`quadsv.PatternComparatorNUFFT` is the main public entry point.
 Lower-level primitives live in the :mod:`quadsv.spectral_compare` and
 :mod:`quadsv.nufft` submodules:
 

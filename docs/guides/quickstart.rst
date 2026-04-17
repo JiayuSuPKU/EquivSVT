@@ -14,7 +14,7 @@ The library exposes **four conceptual layers** and nothing else:
 3. **PatternDetector** — :class:`~quadsv.PatternDetector` for
    :class:`anndata.AnnData` with a ``backend={'matrix', 'nufft'}`` switch;
    :class:`~quadsv.PatternDetectorFFT` for :class:`spatialdata.SpatialData`.
-4. **SpectralComparator** — cross-sample pattern comparison across a list of
+4. **Pattern comparators** — cross-sample pattern comparison across a list of
    AnnData (→ NUFFT) or SpatialData (→ FFT) objects.
 
 
