@@ -69,7 +69,14 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_AVAILABLE_STATISTICS = ("log_l2", "hotelling_lw", "mmd_rbf", "max_welch")
+_AVAILABLE_STATISTICS = ("log_l2", "hotelling_lw", "mmd_rbf", "cauchy_welch")
+
+# Absolute clipping threshold for ``center='zscore'`` (both the FFT per-sample
+# helper :func:`compute_sample_spectrum` and the NUFFT :class:`SpectralComparator`
+# loop use this). Guards against sparse genes producing arbitrarily large
+# standardized values that dominate the pattern test. ±6σ covers > 99.99% of
+# the Normal distribution so this is a gentle cap, not a heavy truncation.
+_ZSCORE_CLIP = 6.0
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +217,7 @@ def compute_sample_spectrum(
     workers: int | None = None,
     center: str | None = "mean",
     return_dc: bool = False,
+    zscore_clip: float | None = 6.0,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Compute the 2D power spectrum of every gene in a single sample.
@@ -238,11 +246,28 @@ def compute_sample_spectrum(
           gene grid means.
         - ``'zscore'``: subtract the mean and divide by the standard deviation.
           Also removes overall magnitude, so the spectrum becomes scale-invariant
-          (pure pattern shape).
+          (pure pattern shape). Sparse genes are **heavily down-weighted**
+          by the guard described below.
         - ``None``: no centering; spectrum includes DC.
     return_dc : bool, default False
         If True, also return a ``(n_genes,)`` array of per-gene grid means (DC
         scalars of the *uncentered* signal).
+    zscore_clip : float or None, default 6.0
+        Only active when ``center='zscore'``. Two-part guard against
+        sparse / near-constant genes producing extreme-outlier z-scores
+        that dominate the pattern test:
+
+        1. The per-gene std is floored at the median non-zero std across
+           genes (robust, data-driven floor); genes with all-zero or
+           numerically-zero std are effectively zeroed out. This prevents
+           sparse genes with a single non-zero pixel from blowing up to
+           arbitrarily large z-scores.
+        2. After standardization, values are clipped to
+           ``[-zscore_clip, +zscore_clip]``.
+
+        Pass ``None`` to disable both guards (reproduces the pre-fix
+        behavior). Integer values < 3 are not recommended — heavy
+        clipping biases the spectrum towards low frequencies.
 
     Returns
     -------
@@ -266,9 +291,19 @@ def compute_sample_spectrum(
     if center == "mean":
         work = sample - dc[:, None, None]
     elif center == "zscore":
-        sd = sample.std(axis=(1, 2), keepdims=True)
-        sd = np.clip(sd, 1e-12, None)
-        work = (sample - dc[:, None, None]) / sd.squeeze(axis=(1, 2))[:, None, None]
+        sd = sample.std(axis=(1, 2))  # (n_genes,)
+        if zscore_clip is not None:
+            # Robust floor: median of the positive per-gene stds. Sparse / near
+            # constant genes get floored at this typical scale, so the ratio
+            # (value - mean) / std does not explode.
+            positive = sd[sd > 0]
+            floor = float(np.median(positive)) if positive.size else 1.0
+            sd_safe = np.maximum(sd, floor * 0.1)
+        else:
+            sd_safe = np.clip(sd, 1e-12, None)
+        work = (sample - dc[:, None, None]) / sd_safe[:, None, None]
+        if zscore_clip is not None:
+            np.clip(work, -float(zscore_clip), float(zscore_clip), out=work)
     else:
         work = sample
 
@@ -487,22 +522,30 @@ def align_spectra_by_rotation(
     reference_index: int = 0,
     n_theta: int = 180,
     n_radius: int = 64,
+    landmark_indices: Sequence[int] | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     """
-    Rotate each non-reference sample's 2D spectrum to maximize similarity with the
-    reference's *mean* spectrum (mean across genes).
+    Rotate each non-reference sample's 2D spectrum to maximize similarity with a
+    per-sample **template** spectrum (either a user-supplied set of landmark
+    genes, or — by default — the global mean spectrum across every gene).
 
     Implementation
     --------------
     For each sample we:
 
-    1. Reduce to a single 2D template by averaging spectra across genes.
+    1. Reduce to a single 2D template by averaging the spectra of the
+       landmark genes (``landmark_indices``). If no landmarks are supplied,
+       the template is the global mean across all genes (the "background"
+       spectrum) — a robust default that mirrors the intuition behind
+       :func:`normalize_by_background`.
     2. fftshift so DC is at the image center.
     3. Resample onto a polar grid with ``n_theta`` angles in :math:`[0,\\pi)` (the 180°
        symmetry of :math:`|\\hat{x}|^2` for real ``x``).
     4. Cross-correlate the reference and sample polar templates along the angular
        axis to find the best rotation (peak of the circular cross-correlation).
-    5. Rotate the original 2D spectrum by that angle and return.
+    5. Apply that single rotation to **every** gene's 2D spectrum in the
+       sample — landmarks only decide the rotation, never which genes get
+       aligned.
 
     Parameters
     ----------
@@ -522,6 +565,14 @@ def align_spectra_by_rotation(
         accurate to ``180/n_theta`` degrees.
     n_radius : int, default 64
         Radial resolution of the polar resampling.
+    landmark_indices : sequence of int, optional
+        Indices (into the gene axis) of a small set of "landmark" genes whose
+        spectra define the alignment template. Useful when a few genes have
+        strong, biologically conserved anisotropy (cortical layer markers,
+        spatial domain priors) and the global gene-mean is isotropic or
+        dominated by housekeeping noise. If None (default), the template is
+        the global mean spectrum — equivalent to using every gene as a
+        landmark.
 
     Returns
     -------
@@ -530,6 +581,12 @@ def align_spectra_by_rotation(
     angles_deg : np.ndarray
         Recovered rotation angles in degrees, length ``len(spectra)``. Reference
         sample's angle is 0.
+
+    Raises
+    ------
+    ValueError
+        If ``reference_index`` is out of range, or ``landmark_indices`` is
+        empty / contains indices outside ``[0, n_genes)``.
 
     Notes
     -----
@@ -541,9 +598,23 @@ def align_spectra_by_rotation(
     if reference_index < 0 or reference_index >= n_samples:
         raise ValueError(f"reference_index {reference_index} out of range [0, {n_samples})")
 
+    if landmark_indices is not None:
+        n_genes = spectra[reference_index].shape[0]
+        lm = np.asarray(list(landmark_indices), dtype=int)
+        if lm.size == 0:
+            raise ValueError("landmark_indices must be a non-empty sequence when supplied.")
+        if lm.min() < 0 or lm.max() >= n_genes:
+            raise ValueError(
+                f"landmark_indices out of range [0, {n_genes}); got [{lm.min()}, {lm.max()}]."
+            )
+        lm_set: np.ndarray | None = lm
+    else:
+        lm_set = None  # fall back to global mean (all genes)
+
     def _prep(sp: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
         full = _to_full_2d(sp, shape, fft_solver)  # (n_genes, ny, nx)
-        mean_2d = full.mean(axis=0)
+        picked = full if lm_set is None else full[lm_set]
+        mean_2d = picked.mean(axis=0)
         return np.fft.fftshift(mean_2d)
 
     ref_polar = _polar_resample(
@@ -615,6 +686,22 @@ def normalize_by_background(
     -------
     np.ndarray
         Background-normalized spectra, same shape as the input.
+
+    Notes
+    -----
+    **Equivalence with a per-sample one-hot covariate.** When stacking all
+    ``(sample, gene)`` log-spectra as rows and regressing each frequency bin
+    against a one-hot *sample-ID* indicator (i.e., a fixed sample effect
+    per bin), the residuals are, by construction, the per-sample demeaned
+    log-spectra — which is exactly what this function computes in log-space.
+    That is: running this function sample-by-sample is mathematically
+    identical to fitting a one-hot-sample covariate in log-space and
+    residualizing. This is why a separate "residualize against
+    per-sample one-hot" step is unnecessary — it is already covered here.
+
+    :func:`residualize_against_covariates` is the complementary step for
+    non-trivial covariates whose shape across frequency bins is not
+    constant (cell-type proportion spectra, tissue-domain maps, etc.).
     """
     log_spec = np.log(spectra + eps)
     bg = log_spec.mean(axis=-2, keepdims=True)
@@ -679,19 +766,21 @@ def shape_normalize(
     eps: float = 1e-12,
 ) -> np.ndarray:
     """
-    Normalize spectra to unit geometric mean along ``axis`` (shape-only).
+    Normalize spectra to sum-1 along ``axis`` (probability-vector shape).
 
-    Equivalent to dividing each slice along ``axis`` by its own geometric mean:
-    ``out = spectra / exp(mean(log(spectra + eps), axis))``. After this
-    transform, two rows that differ only by a multiplicative rescaling —
-    exactly the fingerprint of a gene that is expressed in one group but
-    absent in the other — become identical; only the *shape* of the
-    power-vs-frequency curve remains.
+    Divides each slice along ``axis`` by its own L1 norm so the resulting
+    slice is a proper probability distribution over frequency bins:
+    ``out = spectra / spectra.sum(axis)``. Rows that differ only by a
+    positive scalar (the fingerprint of a gene expressed in one group and
+    absent in another) become identical — only the **shape** of the
+    power-vs-frequency curve survives.
 
     This is the natural companion to :func:`normalize_by_background`:
     background normalization cancels per-sample gain across genes;
     :func:`shape_normalize` cancels per-(sample, gene) magnitude across
-    frequencies. Composed, they leave a pure radial pattern signature.
+    frequencies. Composed, they leave a pure, unit-sum radial pattern
+    signature that is directly comparable as a distribution (so e.g.
+    Jensen-Shannon / total-variation distances are well-defined).
 
     Parameters
     ----------
@@ -699,27 +788,30 @@ def shape_normalize(
         Non-negative radial spectra. Any leading dimensions are preserved;
         normalization acts along ``axis`` only.
     axis : int, default -1
-        Axis along which to enforce unit geometric mean (typically the K /
+        Axis along which to enforce the sum-1 constraint (typically the K /
         frequency-bin axis).
     eps : float, default 1e-12
-        Floor added before the log to avoid ``log(0)``.
+        Floor added to the denominator to avoid division-by-zero when an
+        entire slice is numerically zero.
 
     Returns
     -------
     np.ndarray
-        Shape-normalized spectra, same shape as the input, with unit geometric
-        mean along ``axis``.
+        Shape-normalized spectra, same shape as the input, summing to 1 along
+        ``axis``.
 
     Examples
     --------
     >>> import numpy as np
     >>> x = np.array([[1.0, 2.0, 4.0], [10.0, 20.0, 40.0]])
     >>> out = shape_normalize(x, axis=-1)
+    >>> np.allclose(out.sum(axis=-1), 1.0)
+    True
     >>> np.allclose(out[0], out[1])  # only the shape survives
     True
     """
-    log_spec = np.log(spectra + eps)
-    return np.exp(log_spec - log_spec.mean(axis=axis, keepdims=True))
+    total = spectra.sum(axis=axis, keepdims=True)
+    return spectra / (total + eps)
 
 
 # ---------------------------------------------------------------------------
@@ -727,16 +819,53 @@ def shape_normalize(
 # ---------------------------------------------------------------------------
 
 
-def _stat_log_l2(group_a: np.ndarray, group_b: np.ndarray) -> np.ndarray:
-    """L2 distance between mean log-spectra. Vectorized over genes."""
+def _resolve_freq_weights(freq_weights: np.ndarray | None, K: int) -> np.ndarray:
+    """Validate / normalize frequency-bin weights; return a length-``K`` array summing to 1.
+
+    Passing None yields uniform weights ``1/K`` — recovering the unweighted
+    statistic. Any other input is cast to ``float``, required to be
+    non-negative and not all-zero, and rescaled to sum-1. Non-uniform
+    weights are how users express a kernel-like frequency preference (e.g.,
+    low-pass polynomial vs exponential decay) inside the spectral distance.
+    """
+    if freq_weights is None:
+        return np.full(K, 1.0 / K)
+    w = np.asarray(freq_weights, dtype=float).ravel()
+    if w.shape != (K,):
+        raise ValueError(f"freq_weights must have length K={K}, got shape {w.shape}.")
+    if np.any(w < 0):
+        raise ValueError("freq_weights must be non-negative.")
+    total = float(w.sum())
+    if total <= 0:
+        raise ValueError("freq_weights must not sum to zero.")
+    return w / total
+
+
+def _stat_log_l2(
+    group_a: np.ndarray,
+    group_b: np.ndarray,
+    freq_weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """Weighted L2 distance between mean log-spectra. Vectorized over genes.
+
+    The (default) uniform-weight case reduces to the plain L2 distance on
+    ``K`` frequency bins — up to an overall ``1/sqrt(K)`` scale that is
+    irrelevant under a permutation null. Non-uniform weights (which must be
+    non-negative and sum to 1) let the user emphasize low or high
+    frequencies the same way a kernel spectrum does (polynomial vs
+    exponential decay, etc.).
+    """
     eps = 1e-12
     log_a = np.log(np.maximum(group_a, eps)).mean(axis=0)  # (n_genes, K)
     log_b = np.log(np.maximum(group_b, eps)).mean(axis=0)
-    return np.linalg.norm(log_a - log_b, axis=-1)
+    diff = log_a - log_b  # (n_genes, K)
+    K = diff.shape[-1]
+    w = _resolve_freq_weights(freq_weights, K)
+    return np.sqrt(np.sum(w * diff**2, axis=-1))
 
 
-def _stat_max_welch(group_a: np.ndarray, group_b: np.ndarray) -> np.ndarray:
-    """Max |Welch t| across radial bins. Vectorized over genes."""
+def _welch_t_per_bin(group_a: np.ndarray, group_b: np.ndarray) -> np.ndarray:
+    """Per-bin Welch t-statistic (signed). Shape ``(n_genes, K)``."""
     n_a = group_a.shape[0]
     n_b = group_b.shape[0]
     mean_a = group_a.mean(axis=0)
@@ -744,8 +873,44 @@ def _stat_max_welch(group_a: np.ndarray, group_b: np.ndarray) -> np.ndarray:
     var_a = group_a.var(axis=0, ddof=1) if n_a > 1 else np.zeros_like(mean_a)
     var_b = group_b.var(axis=0, ddof=1) if n_b > 1 else np.zeros_like(mean_b)
     se = np.sqrt(var_a / max(n_a, 1) + var_b / max(n_b, 1) + 1e-30)
-    t = (mean_a - mean_b) / se
-    return np.max(np.abs(t), axis=-1)
+    return (mean_a - mean_b) / se
+
+
+def _stat_welch_abs_per_bin(group_a: np.ndarray, group_b: np.ndarray) -> np.ndarray:
+    """Per-bin ``|Welch t|``. Shape ``(n_genes, K)`` — the raw statistic for
+    the Cauchy-combined pattern test."""
+    return np.abs(_welch_t_per_bin(group_a, group_b))
+
+
+def _cauchy_combine(pvals: np.ndarray, axis: int = -1) -> np.ndarray:
+    """
+    Cauchy combination test (Liu & Xie 2020).
+
+    For p-values :math:`p_1, \\dots, p_K`, forms
+    :math:`T = \\frac{1}{K}\\sum_k \\tan(\\pi\\,(0.5 - p_k))` and returns
+    the analytic tail probability under the standard Cauchy null,
+    :math:`p = 0.5 - \\arctan(T) / \\pi`. Robust to arbitrary dependence
+    between the input p-values — that is the whole point of Cauchy
+    combination — so it is safe to apply over correlated frequency bins
+    without decorrelating them first.
+
+    Parameters
+    ----------
+    pvals : np.ndarray
+        Input p-values in ``[0, 1]``. Values at the exact endpoints are
+        clipped away from them to keep :math:`\\tan` finite.
+    axis : int, default -1
+        Axis along which to combine.
+
+    Returns
+    -------
+    np.ndarray
+        Combined p-value(s); one less axis than ``pvals``.
+    """
+    eps = np.finfo(float).eps
+    clipped = np.clip(pvals, eps, 1.0 - eps)
+    T = np.mean(np.tan(np.pi * (0.5 - clipped)), axis=axis)
+    return 0.5 - np.arctan(T) / np.pi
 
 
 def _ledoit_wolf_shrinkage(X: np.ndarray) -> np.ndarray:
@@ -813,10 +978,13 @@ def _stat_mmd_rbf(group_a: np.ndarray, group_b: np.ndarray) -> np.ndarray:
 
 _STAT_FNS = {
     "log_l2": _stat_log_l2,
-    "max_welch": _stat_max_welch,
     "hotelling_lw": _stat_hotelling_lw,
     "mmd_rbf": _stat_mmd_rbf,
 }
+
+# `cauchy_welch` lives outside _STAT_FNS because it returns a ``(n_genes, K)``
+# per-bin array (not a per-gene scalar) and needs a bespoke runner that turns
+# per-bin permutation p-values into a Cauchy-combined gene-level p-value.
 
 
 # ---------------------------------------------------------------------------
@@ -851,18 +1019,68 @@ def _run_statistic_with_perm(
     spectra: np.ndarray,
     groups: np.ndarray,
     perm_indices: np.ndarray,
+    *,
+    freq_weights: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute observed statistic + null distribution for one statistic. Internal."""
+    """Compute observed statistic + null distribution for one statistic. Internal.
+
+    ``freq_weights`` is forwarded only to statistics that accept it (currently
+    ``log_l2``); other statistics ignore it.
+    """
     fn = _STAT_FNS[stat_name]
     a_mask = groups == 0
-    observed = fn(spectra[a_mask], spectra[~a_mask])
+
+    def _call(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        if stat_name == "log_l2":
+            return fn(a, b, freq_weights=freq_weights)
+        return fn(a, b)
+
+    observed = _call(spectra[a_mask], spectra[~a_mask])
     n_perm = perm_indices.shape[0]
     null = np.empty((n_perm, spectra.shape[1]))
     for p in range(n_perm):
         perm_groups = groups[perm_indices[p]]
         a = perm_groups == 0
-        null[p] = fn(spectra[a], spectra[~a])
+        null[p] = _call(spectra[a], spectra[~a])
     return observed, null
+
+
+def _run_cauchy_welch_with_perm(
+    spectra: np.ndarray,
+    groups: np.ndarray,
+    perm_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-bin ``|Welch t|`` with Cauchy-combined final p-value.
+
+    Returns
+    -------
+    observed : np.ndarray
+        ``(n_genes, K)`` observed per-bin ``|t|`` — used as the reported
+        statistic summary (max across bins, by convention, so it sorts the
+        output table sensibly).
+    combined_pvals : np.ndarray
+        ``(n_genes,)`` Cauchy-combined gene-level p-values built from per-bin
+        permutation p-values.
+    per_bin_pvals : np.ndarray
+        ``(n_genes, K)`` per-bin permutation p-values (one-sided, with the
+        standard ``+1`` correction).
+    """
+    a_mask = groups == 0
+    observed = _stat_welch_abs_per_bin(spectra[a_mask], spectra[~a_mask])  # (n_genes, K)
+    n_perm = perm_indices.shape[0]
+    n_genes, K = observed.shape
+    # null[p, g, k] = |t|_(g, k) under label permutation p.
+    # Accumulate a per-bin exceedance count instead of storing the full
+    # (n_perm, n_genes, K) tensor — it would blow up RAM for large K.
+    ge = np.zeros((n_genes, K), dtype=np.int64)
+    for p in range(n_perm):
+        perm_groups = groups[perm_indices[p]]
+        a = perm_groups == 0
+        null_stat = _stat_welch_abs_per_bin(spectra[a], spectra[~a])
+        ge += (null_stat >= observed).astype(np.int64)
+    per_bin_pvals = (ge + 1.0) / (n_perm + 1.0)
+    combined = _cauchy_combine(per_bin_pvals, axis=-1)
+    return observed, combined, per_bin_pvals
 
 
 # ---------------------------------------------------------------------------
@@ -870,7 +1088,7 @@ def _run_statistic_with_perm(
 # ---------------------------------------------------------------------------
 
 
-def compare_two_groups(
+def compare_two_groups(  # noqa: C901
     spectra: np.ndarray,
     groups: np.ndarray,
     gene_names: Sequence[str] | None = None,
@@ -878,6 +1096,7 @@ def compare_two_groups(
     n_perm: int = 1000,
     random_state: int | None = None,
     n_jobs: int = 1,
+    freq_weights: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """
     Test, for every gene, whether its spatial-pattern spectrum differs between two groups.
@@ -891,8 +1110,15 @@ def compare_two_groups(
         (mapped internally to 0/1 in sorted order).
     gene_names : sequence of str, optional
         Names for the gene axis. If None, integer indices are used.
-    statistic : {'log_l2', 'hotelling_lw', 'mmd_rbf', 'max_welch'}, default 'log_l2'
-        Test statistic. See module docstring for trade-offs.
+    statistic : {'log_l2', 'hotelling_lw', 'mmd_rbf', 'cauchy_welch'}, default 'log_l2'
+        Test statistic:
+
+        - ``'log_l2'`` — (optionally weighted) L2 distance between mean
+          log-spectra. Global / summary statistic.
+        - ``'hotelling_lw'`` — regularized Hotelling :math:`T^2`.
+        - ``'mmd_rbf'`` — RBF-kernel maximum mean discrepancy.
+        - ``'cauchy_welch'`` — per-bin Welch :math:`|t|` with a Cauchy
+          combination across bins. Also yields a ``P_value_per_bin`` column.
     n_perm : int, default 1000
         Number of label permutations for the null distribution.
     random_state : int, optional
@@ -900,12 +1126,22 @@ def compare_two_groups(
     n_jobs : int, default 1
         Reserved for future parallelism over genes; currently unused (the per-stat
         implementations are already vectorized over genes).
+    freq_weights : np.ndarray, optional
+        Only used by ``statistic='log_l2'``. Non-negative weights of length
+        ``K`` (the number of frequency bins); internally renormalized to
+        sum-1. Lets the user emphasize specific frequencies — e.g., a
+        polynomial low-pass shape to mirror a CAR kernel, or an exponential
+        high-pass shape to mirror a Gaussian kernel. ``None`` (default)
+        means uniform weights.
 
     Returns
     -------
     pd.DataFrame
-        Columns ``Feature``, ``Statistic``, ``P_value``, ``P_adj`` (BH-FDR), sorted
-        by descending statistic.
+        Columns ``Feature``, ``Statistic``, ``P_value``, ``P_adj``
+        (BH-FDR), sorted by descending statistic. When
+        ``statistic='cauchy_welch'``, the frame also carries a
+        ``P_value_per_bin`` object column — each entry is an
+        ``(K,)`` numpy array of per-bin permutation p-values for that gene.
 
     Raises
     ------
@@ -913,8 +1149,9 @@ def compare_two_groups(
         If ``statistic`` is unknown, ``groups`` does not contain exactly two values,
         or shapes are inconsistent.
     """
-    if statistic not in _STAT_FNS:
-        raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_STAT_FNS)}.")
+    _available = set(_STAT_FNS) | {"cauchy_welch"}
+    if statistic not in _available:
+        raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_available)}.")
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, K), got {spectra.shape}.")
     n_samples, n_genes, _ = spectra.shape
@@ -928,7 +1165,31 @@ def compare_two_groups(
 
     rng = np.random.default_rng(random_state)
     perm_idx = _permutation_indices(n_samples, n_perm, rng)
-    observed, null = _run_statistic_with_perm(statistic, spectra, g_int, perm_idx)
+
+    if statistic == "cauchy_welch":
+        if freq_weights is not None:
+            logger.debug("freq_weights is ignored by statistic='cauchy_welch'.")
+        observed, combined_p, per_bin_p = _run_cauchy_welch_with_perm(spectra, g_int, perm_idx)
+        summary_stat = observed.max(axis=-1)  # reportable scalar per gene
+        if gene_names is None:
+            gene_names = [str(i) for i in range(n_genes)]
+        df = pd.DataFrame(
+            {
+                "Feature": list(gene_names),
+                "Statistic": summary_stat,
+                "P_value": combined_p,
+                "P_value_per_bin": list(per_bin_p),
+            }
+        )
+        _apply_bh_correction(df)
+        df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
+        if n_jobs != 1:  # noqa: PLR2004
+            logger.debug("n_jobs ignored: per-statistic implementations are already vectorized.")
+        return df
+
+    observed, null = _run_statistic_with_perm(
+        statistic, spectra, g_int, perm_idx, freq_weights=freq_weights
+    )
     pvals = _permutation_pvalue(observed, null)
 
     if gene_names is None:
@@ -959,23 +1220,26 @@ def benchmark_statistics(
     ----------
     spectra, groups, gene_names, n_perm, random_state
         Same meaning as :func:`compare_two_groups`.
-    statistics : sequence of str, default ('log_l2', 'hotelling_lw', 'mmd_rbf', 'max_welch')
-        Subset of the four implemented statistics to evaluate.
+    statistics : sequence of str, default ``_AVAILABLE_STATISTICS``
+        Subset of the implemented statistics (``'log_l2'``,
+        ``'hotelling_lw'``, ``'mmd_rbf'``, ``'cauchy_welch'``).
 
     Returns
     -------
     dict
         Mapping ``stat_name -> DataFrame`` (each DataFrame as in
-        :func:`compare_two_groups`).
+        :func:`compare_two_groups`; ``'cauchy_welch'`` carries the extra
+        ``P_value_per_bin`` column).
 
     Raises
     ------
     ValueError
         If any statistic name is unknown or input shapes are inconsistent.
     """
+    _available = set(_STAT_FNS) | {"cauchy_welch"}
     for s in statistics:
-        if s not in _STAT_FNS:
-            raise ValueError(f"Unknown statistic '{s}'. Options: {sorted(_STAT_FNS)}.")
+        if s not in _available:
+            raise ValueError(f"Unknown statistic '{s}'. Options: {sorted(_available)}.")
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, K), got {spectra.shape}.")
     n_samples, n_genes, _ = spectra.shape
@@ -992,9 +1256,23 @@ def benchmark_statistics(
 
     out: dict[str, pd.DataFrame] = {}
     for s in statistics:
-        observed, null = _run_statistic_with_perm(s, spectra, g_int, perm_idx)
-        pvals = _permutation_pvalue(observed, null)
-        df = pd.DataFrame({"Feature": list(gene_names), "Statistic": observed, "P_value": pvals})
+        if s == "cauchy_welch":
+            observed, combined_p, per_bin_p = _run_cauchy_welch_with_perm(spectra, g_int, perm_idx)
+            summary = observed.max(axis=-1)
+            df = pd.DataFrame(
+                {
+                    "Feature": list(gene_names),
+                    "Statistic": summary,
+                    "P_value": combined_p,
+                    "P_value_per_bin": list(per_bin_p),
+                }
+            )
+        else:
+            observed, null = _run_statistic_with_perm(s, spectra, g_int, perm_idx)
+            pvals = _permutation_pvalue(observed, null)
+            df = pd.DataFrame(
+                {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
+            )
         _apply_bh_correction(df)
         df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
         out[s] = df
@@ -1480,18 +1758,28 @@ class SpectralComparator:
                     sq = X_src.multiply(X_src)
                     sq_mean = np.asarray(sq.mean(axis=0)).ravel()
                     sd = np.sqrt(np.maximum(sq_mean - dc**2, 0.0))
-                    sd = np.clip(sd, 1e-12, None)
                 else:
                     sd = None
                 X_csc = X_src.tocsc()
             else:
                 dc = np.asarray(X_src, dtype=np.float64).mean(axis=0)
                 sd = (
-                    np.clip(np.asarray(X_src, dtype=np.float64).std(axis=0), 1e-12, None)
+                    np.asarray(X_src, dtype=np.float64).std(axis=0)
                     if self.center == "zscore"
                     else None
                 )
                 X_csc = None  # dense path
+
+            # Zscore guard: robust per-sample std floor + post-hoc clip to
+            # prevent sparse genes (few non-zero spots) from producing
+            # pattern-dominating outliers. Mirrors the logic in
+            # ``compute_sample_spectrum``.
+            if self.center == "zscore":
+                positive = sd[sd > 0] if sd is not None else np.empty(0)
+                sd_floor = float(np.median(positive)) * 0.1 if positive.size else 1.0
+                sd_safe = np.maximum(sd, sd_floor) if sd is not None else None
+            else:
+                sd_safe = None
 
             ny, nx = grid_i
             spec_stack = np.empty((n_genes, ny, nx), dtype=np.float64)
@@ -1506,7 +1794,8 @@ class SpectralComparator:
                 if self.center == "mean":
                     col = col - dc[g]
                 elif self.center == "zscore":
-                    col = (col - dc[g]) / sd[g]
+                    col = (col - dc[g]) / sd_safe[g]
+                    np.clip(col, -_ZSCORE_CLIP, _ZSCORE_CLIP, out=col)
                 # center=None: leave untouched.
 
                 p_g = power_spectrum_2d_nufft(
@@ -1562,7 +1851,11 @@ class SpectralComparator:
         return raw_2d, dc
 
     # ------------------------------------------------------------------
-    def fit(self, n_jobs: int = -1) -> SpectralComparator:
+    def fit(
+        self,
+        n_jobs: int = -1,
+        landmark_genes: Sequence[str] | None = None,
+    ) -> SpectralComparator:
         """
         Compute per-sample power spectra and (if ``feature_mode='2d'``) rotation-align.
 
@@ -1570,11 +1863,25 @@ class SpectralComparator:
         ----------
         n_jobs : int, default -1
             Parallelism over samples for the per-sample FFT.
+        landmark_genes : sequence of str, optional
+            Only used in ``feature_mode='2d'``. Names of genes (matched
+            against :attr:`gene_names`) whose spectra define the
+            rotation-alignment template. The recovered rotation is still
+            applied to every gene; landmarks only choose what the per-sample
+            template "looks like". If None (default), the global mean
+            spectrum across all genes is used — the robust default for
+            unsupervised data.
 
         Returns
         -------
         SpectralComparator
             ``self``, for chaining.
+
+        Raises
+        ------
+        KeyError
+            If any ``landmark_genes`` entry is missing from
+            :attr:`gene_names`.
         """
         logger.info(
             "Computing per-sample spectra (mode=%s, n_samples=%d, center=%s)...",
@@ -1588,10 +1895,18 @@ class SpectralComparator:
             self._raw_2d_spectra, self.dc_ = self._compute_fft_spectra(n_jobs=n_jobs)
 
         if self.feature_mode == "2d":
+            landmark_indices: list[int] | None = None
+            if landmark_genes is not None:
+                name_to_idx = {g: i for i, g in enumerate(self.gene_names)}
+                missing = [g for g in landmark_genes if g not in name_to_idx]
+                if missing:
+                    raise KeyError(f"landmark_genes not in gene_names: {missing}")
+                landmark_indices = [name_to_idx[g] for g in landmark_genes]
             aligned, angles = align_spectra_by_rotation(
                 self._raw_2d_spectra,
                 grid_shapes=self._grid_shapes,
                 fft_solver=self.fft_solver,
+                landmark_indices=landmark_indices,
             )
             self._raw_2d_spectra = aligned
             self.rotation_angles_ = angles
@@ -1723,6 +2038,7 @@ class SpectralComparator:
         statistic: str = "log_l2",
         n_perm: int = 1000,
         random_state: int | None = None,
+        freq_weights: np.ndarray | None = None,
     ) -> pd.DataFrame:
         """
         Two-group spectral-pattern test on the cached :attr:`spectra_`.
@@ -1730,6 +2046,13 @@ class SpectralComparator:
         With ``center='mean'`` (the default), the spectrum is DC-free and this
         test is statistically orthogonal to :meth:`test_expression`. See
         :func:`compare_two_groups` for parameters and return format.
+
+        ``freq_weights`` (optional, currently consumed by ``statistic='log_l2'``)
+        is a non-negative length-``K`` array that is internally renormalized
+        to sum-1 and used to bias the L2 distance toward specific frequency
+        bands — e.g., a polynomial low-pass profile to mirror a CAR kernel
+        or an exponential tail to mirror a Gaussian kernel. Equal weights
+        (default) recover the plain ``log_l2`` statistic.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .test_pattern().")
@@ -1740,6 +2063,7 @@ class SpectralComparator:
             statistic=statistic,
             n_perm=n_perm,
             random_state=random_state,
+            freq_weights=freq_weights,
         )
 
     # Back-compat alias — `test()` still runs the pattern test.

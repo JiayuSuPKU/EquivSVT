@@ -150,6 +150,60 @@ class TestRotationAlignment:
         # Tolerance: 2 angular bins (180 / n_theta = 0.5°) plus interpolation slack.
         assert diff < 5.0, f"recovered={recovered}, true={true_mod}, diff={diff}"
 
+    def test_landmark_indices_drive_alignment(self):
+        """Landmarks decide the rotation; non-landmark genes don't need to be
+        anisotropic for alignment to succeed."""
+        import scipy.ndimage
+
+        ny = nx = 48
+        stripes = self._anisotropic_pattern(ny, nx)
+        rng = np.random.default_rng(0)
+        noise = rng.standard_normal((ny, nx))
+        true_angle = 25.0
+
+        # Sample A (reference): gene 0 = stripes, gene 1 = noise.
+        a = np.stack([stripes, noise], axis=0)
+        # Sample B: gene 0 = rotated stripes, gene 1 = independent noise.
+        b = np.stack(
+            [
+                scipy.ndimage.rotate(
+                    stripes, angle=true_angle, reshape=False, order=1, mode="reflect"
+                ),
+                rng.standard_normal((ny, nx)),
+            ],
+            axis=0,
+        )
+        sp_a = compute_sample_spectrum(a, fft_solver="fft2")
+        sp_b = compute_sample_spectrum(b, fft_solver="fft2")
+
+        # Without landmarks: global mean mixes stripes with pure noise; angle
+        # recovery could be noisy. With landmark_indices=[0]: only the
+        # striped gene is used, so recovery locks onto the true angle.
+        _, angles = align_spectra_by_rotation(
+            [sp_a, sp_b],
+            grid_shapes=[(ny, nx), (ny, nx)],
+            fft_solver="fft2",
+            n_theta=360,
+            landmark_indices=[0],
+        )
+        recovered = angles[1] % 180.0
+        true_mod = true_angle % 180.0
+        diff = min(abs(recovered - true_mod), 180.0 - abs(recovered - true_mod))
+        assert diff < 5.0, f"landmark rotation mis-aligned: diff={diff}"
+
+    def test_landmark_indices_validation(self):
+        sp = compute_sample_spectrum(
+            np.random.default_rng(0).standard_normal((3, 16, 16)), fft_solver="fft2"
+        )
+        with pytest.raises(ValueError, match="non-empty"):
+            align_spectra_by_rotation(
+                [sp, sp], grid_shapes=[(16, 16), (16, 16)], landmark_indices=[]
+            )
+        with pytest.raises(ValueError, match="out of range"):
+            align_spectra_by_rotation(
+                [sp, sp], grid_shapes=[(16, 16), (16, 16)], landmark_indices=[99]
+            )
+
 
 # ---------------------------------------------------------------------------
 # Background normalization & residualization
@@ -223,7 +277,7 @@ class TestTwoGroupPower:
 
 
 class TestStatisticAliases:
-    @pytest.mark.parametrize("stat", ["log_l2", "max_welch", "hotelling_lw", "mmd_rbf"])
+    @pytest.mark.parametrize("stat", ["log_l2", "cauchy_welch", "hotelling_lw", "mmd_rbf"])
     def test_each_statistic_runs(self, stat):
         rng = np.random.default_rng(0)
         spectra = rng.uniform(0.1, 5.0, size=(6, 8, 6))
@@ -232,6 +286,12 @@ class TestStatisticAliases:
         assert df.shape[0] == 8
         assert {"Feature", "Statistic", "P_value", "P_adj"} <= set(df.columns)
         assert df["P_value"].between(0, 1).all()
+        if stat == "cauchy_welch":
+            assert "P_value_per_bin" in df.columns
+            # Each entry is an (K,) array of per-bin p-values in [0, 1].
+            per_bin = np.stack(df["P_value_per_bin"].to_numpy())
+            assert per_bin.shape == (8, 6)
+            assert ((per_bin >= 0) & (per_bin <= 1)).all()
 
     def test_unknown_statistic_raises(self):
         with pytest.raises(ValueError, match="Unknown statistic"):
@@ -241,6 +301,55 @@ class TestStatisticAliases:
                 statistic="bogus",
             )
 
+    def test_log_l2_freq_weights(self):
+        """Non-uniform weights should shift gene ranking compared to uniform."""
+        rng = np.random.default_rng(0)
+        n_samples, n_genes, K = 6, 4, 8
+        # Gene 0: low-frequency difference only.
+        # Gene 1: high-frequency difference only.
+        base = rng.uniform(0.5, 1.5, size=(n_samples, n_genes, K))
+        base[3:, 0, :2] *= 3.0  # low-freq bump in group B for gene 0
+        base[3:, 1, -2:] *= 3.0  # high-freq bump in group B for gene 1
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        # Uniform weights: both genes score similarly.
+        df_equal = compare_two_groups(base, groups, statistic="log_l2", n_perm=200, random_state=0)
+        # Low-pass weights: gene 0 should come out on top.
+        low_pass = np.concatenate([np.ones(2), np.zeros(K - 2)])
+        df_low = compare_two_groups(
+            base,
+            groups,
+            statistic="log_l2",
+            n_perm=200,
+            random_state=0,
+            freq_weights=low_pass,
+        )
+        assert df_low["Feature"].iloc[0] == "0"
+        # Sanity: equal-weights result is different from the low-pass ranking.
+        assert df_equal["Feature"].iloc[0] != df_low["Feature"].iloc[-1]
+
+    def test_log_l2_freq_weights_validation(self):
+        rng = np.random.default_rng(0)
+        spectra = rng.uniform(0.1, 5.0, size=(4, 3, 6))
+        groups = np.array([0, 0, 1, 1])
+        # Wrong length:
+        with pytest.raises(ValueError, match="length K="):
+            compare_two_groups(
+                spectra,
+                groups,
+                statistic="log_l2",
+                n_perm=10,
+                freq_weights=np.ones(5),
+            )
+        # Negative weight:
+        with pytest.raises(ValueError, match="non-negative"):
+            compare_two_groups(
+                spectra,
+                groups,
+                statistic="log_l2",
+                n_perm=10,
+                freq_weights=np.array([1.0, -1.0, 1.0, 1.0, 1.0, 1.0]),
+            )
+
 
 class TestBenchmark:
     def test_benchmark_returns_one_df_per_statistic(self):
@@ -248,10 +357,12 @@ class TestBenchmark:
         spectra = rng.uniform(0.1, 5.0, size=(8, 12, 8))
         groups = np.array([0, 0, 0, 0, 1, 1, 1, 1])
         out = benchmark_statistics(spectra, groups, n_perm=50, random_state=0)
-        assert set(out.keys()) == {"log_l2", "hotelling_lw", "mmd_rbf", "max_welch"}
+        assert set(out.keys()) == {"log_l2", "hotelling_lw", "mmd_rbf", "cauchy_welch"}
         for _stat, df in out.items():
             assert df.shape[0] == 12
             assert df["P_value"].between(0, 1).all()
+        # cauchy_welch specifically carries per-bin p-values.
+        assert "P_value_per_bin" in out["cauchy_welch"].columns
 
 
 # ---------------------------------------------------------------------------
@@ -459,13 +570,11 @@ class TestSpectralComparatorDcAccess:
 
 
 class TestShapeNormalize:
-    def test_unit_geometric_mean_along_axis(self):
+    def test_sum_to_one_along_axis(self):
         rng = np.random.default_rng(0)
         x = rng.uniform(0.1, 10.0, size=(4, 7, 12))
         out = shape_normalize(x, axis=-1)
-        # exp(mean(log x)) == 1 for every row
-        log_mean = np.log(out).mean(axis=-1)
-        np.testing.assert_allclose(log_mean, 0.0, atol=1e-9)
+        np.testing.assert_allclose(out.sum(axis=-1), 1.0, rtol=1e-12)
 
     def test_cancels_scalar_rescale(self):
         """Two rows that differ only by a positive scalar get the same shape."""
@@ -474,11 +583,10 @@ class TestShapeNormalize:
         scales = np.array([[0.3], [1.0], [50.0]])
         stack = scales * row[None, :]
         out = shape_normalize(stack, axis=-1)
-        # All three rows should be identical after normalization. Tolerance is
-        # loose because the +eps floor before log breaks exact scale equivariance
-        # at small values; practically the agreement is ~10 significant figures.
-        np.testing.assert_allclose(out[0], out[1], rtol=1e-9, atol=1e-10)
-        np.testing.assert_allclose(out[1], out[2], rtol=1e-9, atol=1e-10)
+        # All three rows become identical probability vectors after L1
+        # normalization (the shared shape of the row).
+        np.testing.assert_allclose(out[0], out[1], rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(out[1], out[2], rtol=1e-10, atol=1e-12)
 
     def test_preserves_shape(self):
         x = np.random.default_rng(0).uniform(0.1, 5.0, size=(3, 8, 6))
@@ -500,9 +608,8 @@ class TestShapeNormalize:
         ret = cmp.shape_normalize()
         # Chainable: returns self
         assert ret is cmp
-        # spectra_ now has unit geometric mean along the last axis
-        geo_means = np.exp(np.log(cmp.spectra_).mean(axis=-1))
-        np.testing.assert_allclose(geo_means, 1.0, atol=1e-9)
+        # spectra_ now sums to 1 along the last axis (probability-vector shape)
+        np.testing.assert_allclose(cmp.spectra_.sum(axis=-1), 1.0, rtol=1e-10)
         # dc_ is untouched
         np.testing.assert_array_equal(cmp.dc_, before_dc)
 
