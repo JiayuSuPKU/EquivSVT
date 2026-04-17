@@ -13,6 +13,7 @@ from quadsv.spectral_compare import (
     align_spectra_by_rotation,
     benchmark_statistics,
     compare_two_groups,
+    compare_two_groups_masked,
     compare_two_groups_scalar,
     compute_sample_spectrum,
     normalize_by_background,
@@ -687,3 +688,97 @@ class TestSpectralComparatorWithSpacings:
         assert cmp.spectra_.shape == (4, 3, 7)
         assert cmp.freq_edges is not None
         assert cmp.freq_edges.shape == (9,)
+
+
+class TestIncompleteData:
+    def test_masked_matches_unmasked_when_full(self):
+        """With all-True presence mask, masked == unmasked (same rng)."""
+        rng = np.random.default_rng(0)
+        spectra = rng.uniform(0.1, 5.0, size=(6, 4, 5))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        presence = np.ones((6, 4), dtype=bool)
+        df_full = compare_two_groups(spectra, groups, statistic="log_l2", n_perm=50, random_state=0)
+        df_mask = compare_two_groups_masked(
+            spectra, groups, presence, statistic="log_l2", n_perm=50, random_state=0
+        )
+        # Features line up after sort; the statistic column agrees exactly.
+        np.testing.assert_allclose(
+            df_full.set_index("Feature").loc[df_mask["Feature"], "Statistic"].to_numpy(),
+            df_mask["Statistic"].to_numpy(),
+            rtol=1e-10,
+        )
+        # n_obs columns should be fully populated at n_samples each.
+        assert (df_mask["n_obs_A"] == 3).all()
+        assert (df_mask["n_obs_B"] == 3).all()
+
+    def test_gene_skipped_when_below_min_samples_per_group(self):
+        rng = np.random.default_rng(0)
+        spectra = rng.uniform(0.1, 5.0, size=(6, 3, 5))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        # Gene 0 only observed in one sample of group B → must be skipped.
+        presence = np.array(
+            [
+                [True, True, True],
+                [True, True, True],
+                [True, True, True],
+                [False, True, True],
+                [False, True, True],
+                [True, True, True],
+            ]
+        )
+        df = compare_two_groups_masked(
+            spectra,
+            groups,
+            presence,
+            statistic="log_l2",
+            n_perm=20,
+            random_state=0,
+            min_samples_per_group=2,
+        )
+        skipped_row = df[df.Feature == "0"].iloc[0]
+        assert np.isnan(skipped_row["P_value"])
+        assert np.isnan(skipped_row["P_adj"])
+        assert skipped_row["n_obs_A"] == 3
+        assert skipped_row["n_obs_B"] == 1
+
+    def test_presence_threshold_propagates_to_comparator(self):
+        import anndata as ad
+
+        rng = np.random.default_rng(0)
+        ny = nx = 12
+        gene_names = ["g0", "g1", "g2"]
+        # Build four samples, each on the same regular grid.
+        samples = []
+        for _ in range(4):
+            coords = (
+                np.stack(
+                    np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij"),
+                    axis=-1,
+                )
+                .reshape(-1, 2)
+                .astype(float)
+            )
+            X = rng.uniform(0.1, 1.0, size=(ny * nx, 3))
+            a = ad.AnnData(X=X)
+            a.var_names = gene_names
+            a.obsm["spatial"] = coords
+            samples.append(a)
+        # Zero gene 0 in samples 0 and 1 → presence_ will drop it there.
+        for i in (0, 1):
+            samples[i].X[:, 0] = 0.0
+        groups = np.array([0, 0, 1, 1])
+        cmp = SpectralComparator(
+            samples,
+            groups,
+            gene_names,
+            presence_threshold=0.5,
+        ).fit()
+        assert cmp.presence_.shape == (4, 3)
+        # Gene 0 should be absent in the two samples we zeroed, present elsewhere.
+        assert not cmp.presence_[0, 0]
+        assert not cmp.presence_[1, 0]
+        assert cmp.presence_[2, 0]
+        # Running test_pattern should dispatch to the masked path and return
+        # n_obs_A / n_obs_B columns.
+        df = cmp.test_pattern(statistic="log_l2", n_perm=20, random_state=0)
+        assert {"n_obs_A", "n_obs_B"}.issubset(df.columns)

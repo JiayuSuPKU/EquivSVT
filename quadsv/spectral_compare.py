@@ -62,6 +62,7 @@ __all__ = [
     "residualize_against_covariates",
     "shape_normalize",
     "compare_two_groups",
+    "compare_two_groups_masked",
     "compare_two_groups_scalar",
     "benchmark_statistics",
     "SpectralComparator",
@@ -1284,6 +1285,124 @@ def benchmark_statistics(
 # ---------------------------------------------------------------------------
 
 
+def compare_two_groups_masked(  # noqa: C901
+    spectra: np.ndarray,
+    groups: np.ndarray,
+    presence: np.ndarray,
+    gene_names: Sequence[str] | None = None,
+    statistic: str = "log_l2",
+    n_perm: int = 1000,
+    random_state: int | None = None,
+    min_samples_per_group: int = 2,
+    freq_weights: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """
+    Per-gene two-group pattern test with **incomplete data** across samples.
+
+    For each gene, only the subset of samples with ``presence[:, g] == True``
+    contributes to the observed statistic and to the label-permutation null.
+    Genes that fail to reach ``min_samples_per_group`` observations in at
+    least one group are reported with ``NaN`` p-values and the number of
+    observed samples per group, so the user sees why they were skipped.
+
+    Parameters
+    ----------
+    spectra : np.ndarray
+        ``(n_samples, n_genes, K)``.
+    groups : np.ndarray
+        ``(n_samples,)``, exactly two distinct labels.
+    presence : np.ndarray
+        ``(n_samples, n_genes)`` boolean mask. ``True`` = gene is observed
+        in that sample (contributes); ``False`` = gene is absent (ignored).
+    gene_names : sequence of str, optional
+    statistic : {'log_l2', 'hotelling_lw', 'mmd_rbf', 'cauchy_welch'}, default 'log_l2'
+    n_perm : int, default 1000
+    random_state : int, optional
+    min_samples_per_group : int, default 2
+        Minimum observed samples in each group for the gene to be tested.
+    freq_weights : np.ndarray, optional
+        Only consumed by ``statistic='log_l2'`` (same semantics as
+        :func:`compare_two_groups`).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``Feature``, ``Statistic``, ``P_value``, ``P_adj``,
+        ``n_obs_A``, ``n_obs_B``. For ``'cauchy_welch'`` a
+        ``P_value_per_bin`` column is also included (``None`` for skipped
+        genes). BH-FDR is computed only over tested genes.
+    """
+    _available = set(_STAT_FNS) | {"cauchy_welch"}
+    if statistic not in _available:
+        raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_available)}.")
+    if spectra.ndim != 3:
+        raise ValueError(f"spectra must be 3D, got {spectra.shape}.")
+    n_samples, n_genes, K = spectra.shape
+    if presence.shape != (n_samples, n_genes):
+        raise ValueError(
+            f"presence shape {presence.shape} != (n_samples, n_genes) = "
+            f"({n_samples}, {n_genes})."
+        )
+    groups = np.asarray(groups)
+    uniq = np.unique(groups)
+    if uniq.size != 2:
+        raise ValueError("groups must contain exactly two distinct values.")
+    g_int = (groups == uniq[1]).astype(int)
+    rng = np.random.default_rng(random_state)
+
+    if gene_names is None:
+        gene_names = [str(i) for i in range(n_genes)]
+
+    rows: list[dict[str, Any]] = []
+    for g in range(n_genes):
+        mask = presence[:, g]
+        ga = g_int[mask] == 0
+        gb = g_int[mask] == 1
+        n_a, n_b = int(ga.sum()), int(gb.sum())
+        row: dict[str, Any] = {
+            "Feature": gene_names[g],
+            "n_obs_A": n_a,
+            "n_obs_B": n_b,
+            "Statistic": np.nan,
+            "P_value": np.nan,
+        }
+        if statistic == "cauchy_welch":
+            row["P_value_per_bin"] = None
+
+        if n_a < min_samples_per_group or n_b < min_samples_per_group:
+            rows.append(row)
+            continue
+
+        sub = spectra[mask, g : g + 1, :]  # (n_obs, 1, K)
+        sub_groups = g_int[mask]
+        # One-shot permutation matrix for this gene.
+        perm_idx = _permutation_indices(mask.sum(), n_perm, rng)
+
+        if statistic == "cauchy_welch":
+            observed, combined_p, per_bin_p = _run_cauchy_welch_with_perm(sub, sub_groups, perm_idx)
+            row["Statistic"] = float(observed.max())
+            row["P_value"] = float(combined_p[0])
+            row["P_value_per_bin"] = per_bin_p[0]
+        else:
+            observed, null = _run_statistic_with_perm(
+                statistic, sub, sub_groups, perm_idx, freq_weights=freq_weights
+            )
+            pval = _permutation_pvalue(observed, null)
+            row["Statistic"] = float(observed[0])
+            row["P_value"] = float(pval[0])
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    # BH-correction over tested (non-NaN) genes only.
+    tested = df["P_value"].notna()
+    df["P_adj"] = np.nan
+    if tested.any():
+        sub_df = df.loc[tested, ["Feature", "P_value"]].copy()
+        _apply_bh_correction(sub_df)
+        df.loc[tested, "P_adj"] = sub_df["P_adj"].to_numpy()
+    return df.sort_values("Statistic", ascending=False, na_position="last").reset_index(drop=True)
+
+
 def _welch_abs_t(group_a: np.ndarray, group_b: np.ndarray) -> np.ndarray:
     """Per-feature absolute Welch t-statistic. Inputs shape ``(n, n_features)``."""
     n_a, n_b = group_a.shape[0], group_b.shape[0]
@@ -1499,6 +1618,8 @@ class SpectralComparator:
         freq_edges: np.ndarray | None = None,
         center: str | None = "mean",
         eps: float = 1e-6,
+        presence_threshold: float = 0.0,
+        min_samples_per_group: int = 2,
     ) -> None:
         """
         Build a comparator over a list of spatial-omics samples.
@@ -1545,6 +1666,23 @@ class SpectralComparator:
             ``spacing``.
         eps : float, default 1e-6
             NUFFT tolerance (AnnData path only).
+        presence_threshold : float, default 0.0
+            Per-(sample, gene) minimum *fraction of non-zero spots* for the
+            gene to count as "observed" in that sample. Genes that do not
+            clear the threshold in a sample are marked absent in
+            :attr:`presence_` and their spectrum rows are excluded from the
+            pattern test on a per-gene basis. ``0.0`` (default) means every
+            (sample, gene) pair counts as observed — the classical
+            complete-data behavior. Typical relaxed values are
+            ``0.01`` – ``0.05``.
+        min_samples_per_group : int, default 2
+            Minimum number of observed samples in *each* group for a gene
+            to be tested by :meth:`test_pattern`. Genes below the threshold
+            receive ``NaN`` p-values and a ``None`` ``P_value_per_bin``
+            (when applicable); they remain listed so the user sees why
+            they were skipped. :meth:`test_expression` always uses every
+            sample regardless of ``presence_``, matching the user
+            expectation that absence itself is informative for DE.
         """
         if center not in ("mean", "zscore", None):
             raise ValueError(f"center must be 'mean', 'zscore', or None, got {center!r}.")
@@ -1587,10 +1725,27 @@ class SpectralComparator:
         self._table_key = table_key
         self._coordinates_key = coordinates_key
         self._nufft_eps = float(eps)
+        self.presence_threshold: float = float(presence_threshold)
+        self.min_samples_per_group: int = int(min_samples_per_group)
+
+        if not 0.0 <= self.presence_threshold <= 1.0:
+            raise ValueError(
+                f"presence_threshold must be in [0, 1], got {self.presence_threshold}."
+            )
+        if self.min_samples_per_group < 2:
+            raise ValueError(
+                f"min_samples_per_group must be >= 2, got {self.min_samples_per_group}."
+            )
 
         # Populated in _prepare_* below.
         self.spectra_: np.ndarray | None = None
         self.dc_: np.ndarray | None = None
+        self.presence_: np.ndarray | None = None
+        """Per-sample, per-gene presence mask of shape ``(n_samples, n_genes)``.
+        ``True`` = the gene clears ``presence_threshold`` in that sample and
+        contributes to the pattern test; ``False`` = the gene is treated as
+        incomplete for that sample (excluded from pattern test, still counted
+        by :meth:`test_expression`). Populated by :meth:`fit`."""
         self.rotation_angles_: np.ndarray | None = None
         self._raw_2d_spectra: list[np.ndarray] | None = None
         self._grid_shapes: list[tuple[int, int]] = []
@@ -1733,15 +1888,25 @@ class SpectralComparator:
         self.spacings = spacings
 
     # ------------------------------------------------------------------
-    def _compute_nufft_spectra(self, n_jobs: int = -1) -> tuple[list[np.ndarray], np.ndarray]:
+    def _compute_nufft_spectra(
+        self, n_jobs: int = -1
+    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
         """NUFFT per-sample spectrum pass. Reads expression **one gene column at
         a time** from each AnnData — never densifies the full ``.X`` slab.
 
-        Returns ``(raw_2d_spectra, dc)`` with the same layout as the FFT path.
+        Returns
+        -------
+        raw_2d : list of np.ndarray
+            Per-sample ``(n_genes, ny, nx)`` 2D power spectra.
+        dc : np.ndarray
+            ``(n_samples, n_genes)`` DC scalars (per-gene grid means).
+        presence : np.ndarray
+            ``(n_samples, n_genes)`` boolean mask: True = gene cleared the
+            presence threshold in that sample.
         """
         from quadsv.nufft import power_spectrum_2d_nufft
 
-        def _one(i: int) -> tuple[np.ndarray, np.ndarray]:
+        def _one(i: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             adata = self.samples[i]
             pts = self._coords[i]
             scale = self._unit_scales[i]
@@ -1750,9 +1915,12 @@ class SpectralComparator:
 
             X_src = adata.X if self._layer is None else adata.layers[self._layer]
             n_genes = len(self.gene_names)
+            n_spots = X_src.shape[0]
             # Per-sample DC (means) can be pulled without densifying.
             if sp.issparse(X_src):
                 dc = np.asarray(X_src.mean(axis=0)).ravel()
+                # nnz per gene → presence fraction without densifying.
+                nnz_per = np.asarray((X_src != 0).sum(axis=0)).ravel()
                 # E[X^2] - E[X]^2 for per-gene std (zscore path).
                 if self.center == "zscore":
                     sq = X_src.multiply(X_src)
@@ -1762,13 +1930,13 @@ class SpectralComparator:
                     sd = None
                 X_csc = X_src.tocsc()
             else:
-                dc = np.asarray(X_src, dtype=np.float64).mean(axis=0)
-                sd = (
-                    np.asarray(X_src, dtype=np.float64).std(axis=0)
-                    if self.center == "zscore"
-                    else None
-                )
+                X_dense = np.asarray(X_src, dtype=np.float64)
+                dc = X_dense.mean(axis=0)
+                nnz_per = (X_dense != 0).sum(axis=0)
+                sd = X_dense.std(axis=0) if self.center == "zscore" else None
                 X_csc = None  # dense path
+
+            presence_i = (nnz_per / max(n_spots, 1)) >= self.presence_threshold
 
             # Zscore guard: robust per-sample std floor + post-hoc clip to
             # prevent sparse genes (few non-zero spots) from producing
@@ -1809,22 +1977,26 @@ class SpectralComparator:
                 )
                 # p_g is (ny, nx) for a 1D input.
                 spec_stack[g] = p_g
-            return spec_stack, dc
+            return spec_stack, dc, presence_i
 
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(_one)(i) for i in range(len(self.samples))
         )
         raw_2d = [r[0] for r in results]
         dc = np.stack([r[1] for r in results], axis=0)
-        return raw_2d, dc
+        presence = np.stack([r[2] for r in results], axis=0)
+        return raw_2d, dc, presence
 
     # ------------------------------------------------------------------
-    def _compute_fft_spectra(self, n_jobs: int = -1) -> tuple[list[np.ndarray], np.ndarray]:
+    def _compute_fft_spectra(
+        self, n_jobs: int = -1
+    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
         """FFT per-sample spectrum pass for SpatialData inputs. Rasterizes each
         sample's table to a ``(n_genes, ny, nx)`` block **one gene at a time**
-        when the source table is sparse."""
+        when the source table is sparse. Returns ``(raw_2d, dc, presence)``
+        matching :meth:`_compute_nufft_spectra`."""
 
-        def _one(i: int) -> tuple[np.ndarray, np.ndarray]:
+        def _one(i: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             sd_obj = self.samples[i]
             shape = self._grid_shapes[i]
             raster = _rasterize_spatialdata_lazy(
@@ -1833,7 +2005,11 @@ class SpectralComparator:
                 table_key=self._table_key,
                 gene_names=self.gene_names,
             )
-            # raster shape is (n_genes, ny, nx).
+            # raster shape is (n_genes, ny, nx). Presence = fraction of
+            # non-zero pixels per gene.
+            ny, nx = raster.shape[-2:]
+            frac_nonzero = (raster != 0).reshape(raster.shape[0], -1).mean(axis=1)
+            presence_i = frac_nonzero >= self.presence_threshold
             spec, dc = compute_sample_spectrum(
                 raster,
                 fft_solver=self.fft_solver,
@@ -1841,14 +2017,15 @@ class SpectralComparator:
                 center=self.center,
                 return_dc=True,
             )
-            return spec, dc
+            return spec, dc, presence_i
 
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(_one)(i) for i in range(len(self.samples))
         )
         raw_2d = [r[0] for r in results]
         dc = np.stack([r[1] for r in results], axis=0)
-        return raw_2d, dc
+        presence = np.stack([r[2] for r in results], axis=0)
+        return raw_2d, dc, presence
 
     # ------------------------------------------------------------------
     def fit(
@@ -1890,9 +2067,13 @@ class SpectralComparator:
             self.center,
         )
         if self.mode == "nufft":
-            self._raw_2d_spectra, self.dc_ = self._compute_nufft_spectra(n_jobs=n_jobs)
+            self._raw_2d_spectra, self.dc_, self.presence_ = self._compute_nufft_spectra(
+                n_jobs=n_jobs
+            )
         else:
-            self._raw_2d_spectra, self.dc_ = self._compute_fft_spectra(n_jobs=n_jobs)
+            self._raw_2d_spectra, self.dc_, self.presence_ = self._compute_fft_spectra(
+                n_jobs=n_jobs
+            )
 
         if self.feature_mode == "2d":
             landmark_indices: list[int] | None = None
@@ -2047,6 +2228,14 @@ class SpectralComparator:
         test is statistically orthogonal to :meth:`test_expression`. See
         :func:`compare_two_groups` for parameters and return format.
 
+        When the comparator was constructed with ``presence_threshold > 0``
+        and at least one ``(sample, gene)`` pair is absent, the test
+        automatically switches to :func:`compare_two_groups_masked` so that
+        genes are evaluated only over samples where they were observed
+        (returned frame then carries ``n_obs_A`` / ``n_obs_B`` columns and
+        ``NaN`` p-values for genes with too few observations in either
+        group).
+
         ``freq_weights`` (optional, currently consumed by ``statistic='log_l2'``)
         is a non-negative length-``K`` array that is internally renormalized
         to sum-1 and used to bias the L2 distance toward specific frequency
@@ -2056,6 +2245,19 @@ class SpectralComparator:
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .test_pattern().")
+        use_masked = self.presence_ is not None and not self.presence_.all()
+        if use_masked:
+            return compare_two_groups_masked(
+                self.spectra_,
+                self.groups,
+                self.presence_,
+                gene_names=self.gene_names,
+                statistic=statistic,
+                n_perm=n_perm,
+                random_state=random_state,
+                min_samples_per_group=self.min_samples_per_group,
+                freq_weights=freq_weights,
+            )
         return compare_two_groups(
             self.spectra_,
             self.groups,
