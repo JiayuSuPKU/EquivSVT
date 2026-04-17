@@ -112,14 +112,19 @@ def compute_null_params(
     Pre-compute null distribution parameters for spatial tests.
 
     Call this ONCE before running parallel tests on thousands of features.
-    Caches the expensive computations (traces, eigenvalues) for reuse.
+    Caches the expensive computations (traces, eigenvalues) for reuse across
+    both Q-tests and R-tests.
 
     Parameters
     ----------
     kernel : Kernel
-        The spatial kernel object (SpatialKernel, FFTKernel, or compatible).
+        The spatial kernel object (SpatialKernel, FFTKernel, NUFFTKernel, or compatible).
     method : {'clt', 'welch', 'liu'}, default 'welch'
-        Null approximation method:
+        Null approximation method for the **Q-test**. The R-test entry
+        ``var_R = trace(K²)`` is always populated alongside, regardless of
+        ``method`` — R-tests use a Normal approximation and only need this
+        one moment.
+
         - 'clt': Central Limit Theorem (Z-score normal approximation)
         - 'welch': Welch-Satterthwaite moment matching (fast, uses traces)
         - 'liu': Liu eigenvalue-based approximation (accurate tail, slower)
@@ -130,10 +135,13 @@ def compute_null_params(
     Returns
     -------
     dict[str, float or np.ndarray]
-        Parameters keyed by null_approx method:
-        - 'method': The method used
-        - For 'liu': 'eigenvalues' (np.ndarray of kernel eigenvalues)
-        - For 'welch'/'clt': 'mean_Q', 'var_Q', and for 'welch' also 'scale_g', 'df_h'
+        Parameters shared by Q-tests and R-tests:
+
+        - ``'method'`` — the method used (for Q-tests).
+        - ``'var_R'`` — ``trace(K²)``, the null variance of the R statistic.
+        - For ``'liu'``: ``'eigenvalues'`` (np.ndarray of kernel eigenvalues).
+        - For ``'welch'`` / ``'clt'``: ``'mean_Q'``, ``'var_Q'``, and for
+          ``'welch'`` also ``'scale_g'``, ``'df_h'``.
 
     Raises
     ------
@@ -145,10 +153,17 @@ def compute_null_params(
     >>> kernel = SpatialKernel.from_coordinates(coords, method='gaussian')
     >>> params = compute_null_params(kernel, method='welch')
     >>> Q, pval = spatial_q_test(data, kernel, null_params=params)
+    >>> R, r_pval = spatial_r_test(x, y, kernel, null_params=params)
     """
     params = {"method": method}
 
     assert method in ["clt", "welch", "liu"], "Method must be 'clt', 'welch', or 'liu'."
+
+    # trace(K²) is the null variance of R = x^T K y and is cheap enough
+    # that we always populate it so the same params dict can feed both
+    # Q-tests and R-tests.
+    tr_K2 = kernel.square_trace()
+    params["var_R"] = float(tr_K2)
 
     if method == "liu":
         # Requires eigenvalues
@@ -157,10 +172,8 @@ def compute_null_params(
         # Filter numerical noise
         params["eigenvalues"] = vals[np.abs(vals) > 1e-9]
     else:
-        # Compute trace and trace squared
+        # Q-test moments
         tr_K = kernel.trace()
-        tr_K2 = kernel.square_trace()
-
         params["mean_Q"] = tr_K
         params["var_Q"] = 2 * tr_K2
 
@@ -486,32 +499,12 @@ def spatial_r_test(  # noqa: C901
         if np.any(valid_mask):
             Zy[:, valid_mask] = (Yn[:, valid_mask] - means[valid_mask]) / stds[valid_mask]
 
-    # 2. Compute R = Zx.T @ K @ Zy
-    # We use the kernel's optimized multiplication
-    # K @ Zy
-    if hasattr(kernel, "is_implicit") and kernel.is_implicit:
-        # Implicit solve: M^-1 * Zy
-        if sp.issparse(kernel._K):
-            # Check for cached LU factorization
-            if kernel._lu is None:
-                from scipy.sparse.linalg import splu
+    # 2. Compute R = Zx.T @ K @ Zy through the public Kx primitive so the
+    # implicit / explicit / sparse / dense branching lives in one place
+    # (Kernel.Kx) instead of being duplicated here.
+    K_Zy = kernel.Kx(Zy)
 
-                kernel._lu = splu(kernel._K.tocsc())
-            K_Zy = kernel._lu.solve(Zy)
-        else:
-            # Check for cached LU factorization
-            if kernel._lu is None:
-                from scipy.linalg import lu_factor, lu_solve
-
-                kernel._lu = lu_factor(kernel._K)
-            K_Zy = lu_solve(kernel._lu, Zy)
-    else:
-        # Explicit dot
-        K_Zy = kernel._K.dot(Zy)
-
-    # Dot product: Zx.T @ (K @ Zy)
-    # We only want the paired elements (diagonal of the result matrix)
-    # sum(Zx_ij * (K_Zy)_ij) along axis 0
+    # Paired bilinear diagonal: sum(Zx_ij * (K Zy)_ij) along axis 0.
     R = np.sum(Zx * K_Zy, axis=0)
 
     # Unwrap if M=1
@@ -522,13 +515,11 @@ def spatial_r_test(  # noqa: C901
         return R
 
     # 3. P-value (Normal Approximation)
-    # R ~ N(0, Tr(K K^T))
-    if null_params is None:
-        # Compute on fly (expensive)
-        tr_K2 = kernel.square_trace()
-        var_R = tr_K2
+    # R ~ N(0, Tr(K²)).
+    if null_params is not None and "var_R" in null_params:
+        var_R = float(null_params["var_R"])
     else:
-        var_R = null_params.get("var_R", 1.0)
+        var_R = float(kernel.square_trace())
 
     sigma = np.sqrt(var_R)
 

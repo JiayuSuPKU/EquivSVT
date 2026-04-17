@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import anndata as ad
 import numpy as np
 import pytest
 from scipy.stats import kstest
@@ -19,6 +20,35 @@ from quadsv.spectral_compare import (
     residualize_against_covariates,
     shape_normalize,
 )
+
+# ---------------------------------------------------------------------------
+# Test helpers for the AnnData-based SpectralComparator API (Phase D)
+# ---------------------------------------------------------------------------
+
+
+def _grid_to_adata(sample: np.ndarray, gene_names, spacing=(1.0, 1.0)):
+    """Wrap a pre-rasterized ``(n_genes, ny, nx)`` array into an AnnData with a
+    regular-grid ``obsm['spatial']``. The NUFFT path will evaluate the spectrum
+    on (approximately) the same grid, and radial binning with explicit
+    ``spacing`` makes feature vectors cross-sample comparable."""
+    n_genes, ny, nx = sample.shape
+    X = sample.reshape(n_genes, ny * nx).T  # (ny*nx, n_genes)
+    yy, xx = np.meshgrid(
+        np.arange(ny) * spacing[0],
+        np.arange(nx) * spacing[1],
+        indexing="ij",
+    )
+    coords = np.stack([yy.ravel(), xx.ravel()], axis=1)
+    a = ad.AnnData(X=X.astype(np.float64))
+    a.var_names = list(gene_names)
+    a.obsm["spatial"] = coords
+    return a
+
+
+def _samples_to_adata_list(samples, gene_names, spacings=None):
+    spacings = spacings if spacings is not None else [(1.0, 1.0)] * len(samples)
+    return [_grid_to_adata(s, gene_names, spacing=spacings[i]) for i, s in enumerate(samples)]
+
 
 # ---------------------------------------------------------------------------
 # Sanity: power spectrum
@@ -240,7 +270,6 @@ class TestSpectralComparatorEndToEnd:
         def make_sample(group: int) -> np.ndarray:
             x = rng.standard_normal((n_genes, ny, nx)) * 0.1
             if group == 1:
-                # Add a low-frequency stripe pattern only on gene 0.
                 yy = np.arange(ny)[:, None]
                 stripes = np.broadcast_to(np.sin(2 * np.pi * yy / 16.0), (ny, nx))
                 x[0] += stripes * 1.5
@@ -249,37 +278,37 @@ class TestSpectralComparatorEndToEnd:
         samples = [make_sample(0) for _ in range(n_per)] + [make_sample(1) for _ in range(n_per)]
         groups = np.array([0] * n_per + [1] * n_per)
 
-        cmp = SpectralComparator(samples, groups, gene_names).fit().normalize_background()
+        cmp = (
+            SpectralComparator(_samples_to_adata_list(samples, gene_names), groups, gene_names)
+            .fit()
+            .normalize_background()
+        )
         df = cmp.test(statistic="log_l2", n_perm=300, random_state=0)
-        # gene 0 should rank near the top.
         assert df["Feature"].iloc[0] == "g0", f"expected g0 first, got {df.head().to_dict()}"
 
     def test_pipeline_residualize_runs(self):
         rng = np.random.default_rng(0)
         n_per = 3
         ny = nx = 16
+        gene_names = [f"g{i}" for i in range(4)]
         samples = [rng.standard_normal((4, ny, nx)) for _ in range(2 * n_per)]
         covariates = [rng.standard_normal((1, ny, nx)) for _ in range(2 * n_per)]
         groups = np.array([0] * n_per + [1] * n_per)
-        cmp = SpectralComparator(samples, groups, [f"g{i}" for i in range(4)])
+        cmp = SpectralComparator(_samples_to_adata_list(samples, gene_names), groups, gene_names)
         cmp.fit().residualize(covariates)
         df = cmp.test(statistic="log_l2", n_perm=50, random_state=0)
         assert df.shape[0] == 4
 
     def test_invalid_groups_raises(self):
+        gene_names = ["a", "b"]
+        adatas = _samples_to_adata_list([np.zeros((2, 4, 4))] * 3, gene_names)
         with pytest.raises(ValueError, match="exactly two distinct"):
-            SpectralComparator(
-                [np.zeros((2, 4, 4))] * 3,
-                np.array([0, 1, 2]),
-                ["a", "b"],
-            )
+            SpectralComparator(adatas, np.array([0, 1, 2]), gene_names)
 
     def test_must_fit_before_test(self):
-        cmp = SpectralComparator(
-            [np.zeros((2, 4, 4)), np.zeros((2, 4, 4))],
-            np.array([0, 1]),
-            ["a", "b"],
-        )
+        gene_names = ["a", "b"]
+        adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
+        cmp = SpectralComparator(adatas, np.array([0, 1]), gene_names)
         with pytest.raises(RuntimeError, match=r"\.fit\(\)"):
             cmp.test()
 
@@ -364,10 +393,11 @@ class TestDeAndPatternOrthogonality:
             samples[i][0] += 10.0
 
         groups = np.array([0] * n_per + [1] * n_per)
+        gene_names = [f"g{i}" for i in range(n_genes)]
         cmp = SpectralComparator(
-            samples,
+            _samples_to_adata_list(samples, gene_names),
             groups,
-            gene_names=[f"g{i}" for i in range(n_genes)],
+            gene_names=gene_names,
             n_radial_bins=8,
             center="mean",
         ).fit()
@@ -405,7 +435,10 @@ class TestSpectralComparatorDcAccess:
         rng = np.random.default_rng(0)
         samples = [rng.standard_normal((3, 8, 10)) + s for s in range(4)]
         groups = np.array([0, 0, 1, 1])
-        cmp = SpectralComparator(samples, groups, ["a", "b", "c"]).fit()
+        gene_names = ["a", "b", "c"]
+        cmp = SpectralComparator(
+            _samples_to_adata_list(samples, gene_names), groups, gene_names
+        ).fit()
         assert cmp.dc_ is not None
         assert cmp.dc_.shape == (4, 3)
         # DC equals per-sample grid mean of the raw signal.
@@ -413,11 +446,9 @@ class TestSpectralComparatorDcAccess:
         np.testing.assert_allclose(cmp.dc_, expected, rtol=1e-12)
 
     def test_test_expression_requires_fit(self):
-        cmp = SpectralComparator(
-            [np.zeros((2, 4, 4)), np.zeros((2, 4, 4))],
-            np.array([0, 1]),
-            ["a", "b"],
-        )
+        gene_names = ["a", "b"]
+        adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
+        cmp = SpectralComparator(adatas, np.array([0, 1]), gene_names)
         with pytest.raises(RuntimeError, match="fit"):
             cmp.test_expression()
 
@@ -457,8 +488,11 @@ class TestShapeNormalize:
         rng = np.random.default_rng(0)
         samples = [rng.standard_normal((4, 12, 14)) for _ in range(4)]
         groups = np.array([0, 0, 1, 1])
+        gene_names = ["g0", "g1", "g2", "g3"]
         cmp = (
-            SpectralComparator(samples, groups, ["g0", "g1", "g2", "g3"], n_radial_bins=8)
+            SpectralComparator(
+                _samples_to_adata_list(samples, gene_names), groups, gene_names, n_radial_bins=8
+            )
             .fit()
             .normalize_background()
         )
@@ -473,11 +507,9 @@ class TestShapeNormalize:
         np.testing.assert_array_equal(cmp.dc_, before_dc)
 
     def test_shape_normalize_requires_fit(self):
-        cmp = SpectralComparator(
-            [np.zeros((2, 4, 4)), np.zeros((2, 4, 4))],
-            np.array([0, 1]),
-            ["a", "b"],
-        )
+        gene_names = ["a", "b"]
+        adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
+        cmp = SpectralComparator(adatas, np.array([0, 1]), gene_names)
         with pytest.raises(RuntimeError, match="fit"):
             cmp.shape_normalize()
 
@@ -532,18 +564,17 @@ class TestPhysicalFrequencyBinning:
 
 class TestSpectralComparatorWithSpacings:
     def test_physical_spacings_produce_comparable_bins(self):
-        """SpectralComparator with spacings+auto-edges handles heterogeneous shapes."""
+        """SpectralComparator with per-sample auto-grids handles heterogeneous shapes."""
         rng = np.random.default_rng(0)
         shapes = [(32, 40), (30, 42), (34, 38), (33, 41)]
         samples = [rng.standard_normal((3, ny, nx)) for (ny, nx) in shapes]
         groups = np.array([0, 0, 1, 1])
-        spacings = [(1.0, 1.0)] * 4
+        gene_names = ["g0", "g1", "g2"]
         cmp = SpectralComparator(
-            samples,
+            _samples_to_adata_list(samples, gene_names),
             groups,
-            gene_names=["g0", "g1", "g2"],
+            gene_names=gene_names,
             n_radial_bins=8,
-            spacings=spacings,
         ).fit()
         # 8 edges -> 7 bins after DC-drop.
         assert cmp.spectra_.shape == (4, 3, 7)

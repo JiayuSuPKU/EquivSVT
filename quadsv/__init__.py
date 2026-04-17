@@ -1,114 +1,66 @@
 """
-quadsv: Spatial statistics library for kernel-based hypothesis testing
+quadsv: kernel-based spatial variability / co-expression tests for spatial omics.
 
-This package implements kernel-based hypothesis tests for detecting
-spatial variability and equivalence testing using different kernel methods
-(Moran, Gaussian RBF, Matérn, Laplacian).
+The top-level namespace exposes exactly four conceptual layers, nothing else:
+
+1. **Kernels** — :class:`SpatialKernel` (dense / sparse), :class:`FFTKernel`
+   (regular grid), :class:`NUFFTKernel` (irregular 2D coordinates).
+2. **Statistical tests** — ``spatial_q_test`` / ``spatial_r_test`` (dense),
+   plus the FFT and NUFFT variants. All share the same signature shape:
+   ``(x, kernel, null_params=None, return_pval=True, is_standardized=False)``.
+3. **PatternDetector** — :class:`PatternDetector` consumes
+   :class:`anndata.AnnData` (irregular grids, matrix/NUFFT backends),
+   :class:`PatternDetectorFFT` consumes :class:`spatialdata.SpatialData`
+   (regular grids, FFT backend).
+4. **SpectralComparator** — cross-sample pattern comparison on a list of
+   AnnData (NUFFT backend) or SpatialData (FFT backend).
+
+Utilities, constants, and internal primitives (Liu's SF, Visium I/O,
+radial binning, etc.) remain accessible under their submodules
+(``quadsv.io_visium``, ``quadsv.statistics``, ``quadsv.fft``, ``quadsv.nufft``,
+``quadsv.spectral_compare``) but are not re-exported at the top level.
 """
 
 import logging
 
-# Library-style logging: attach a NullHandler so no records are emitted unless the
-# consumer configures a handler. User code can do
-# ``logging.getLogger('quadsv').setLevel(logging.INFO)`` to see progress messages.
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
-# Automatically read version from installed package or fallback to hardcoded
 try:
     from importlib.metadata import PackageNotFoundError, version
 
     __version__ = version("quadsv")
 except (ImportError, PackageNotFoundError):
-    # Fallback for development environments where package is not installed
     __version__ = "0.1.0"
 
-# Import core classes and functions
-# Application classes for pattern detection
+# Layer 1: Kernels
+# Layer 3: PatternDetector
 from quadsv.detector import PatternDetector
-from quadsv.fft import FFTKernel, power_spectrum_2d, spatial_q_test_fft, spatial_r_test_fft
-from quadsv.io_visium import (
-    VISIUM_V1_SPOT_SPACING_UM,
-    load_visium_sample,
-    visium_hex_spacing_um,
-    visium_to_grid,
-)
+from quadsv.detector_fft import PatternDetectorFFT
+
+# Layer 2: Statistical tests
+from quadsv.fft import FFTKernel, spatial_q_test_fft, spatial_r_test_fft
 from quadsv.kernels import SpatialKernel
-from quadsv.spectral_compare import (
-    SpectralComparator,
-    benchmark_statistics,
-    compare_two_groups,
-    compare_two_groups_scalar,
-    shape_normalize,
-)
+from quadsv.nufft import NUFFTKernel, spatial_q_test_nufft, spatial_r_test_nufft
+
+# Layer 4: SpectralComparator (cross-sample)
+from quadsv.spectral_compare import SpectralComparator
 from quadsv.statistics import spatial_q_test, spatial_r_test
 
-# NUFFT is an optional extra; only surface it at the top level when finufft is
-# actually installed, so `import quadsv` stays light for rasterized workflows.
-try:
-    from quadsv.nufft import (  # noqa: F401
-        NUFFTKernel,
-        power_spectrum_2d_nufft,
-        spatial_q_test_nufft,
-        spatial_r_test_nufft,
-    )
-
-    _HAS_NUFFT = True
-except ImportError:  # pragma: no cover
-    _HAS_NUFFT = False
-
-if _HAS_NUFFT:
-    try:
-        from quadsv.detector_nufft import PatternDetectorNUFFT  # noqa: F401
-
-        _HAS_NUFFT_DETECTOR = True
-    except ImportError:  # pragma: no cover
-        _HAS_NUFFT_DETECTOR = False
-else:
-    _HAS_NUFFT_DETECTOR = False
-
-# Define public API
 __all__ = [
-    # Core classes
+    # Kernels
     "SpatialKernel",
     "FFTKernel",
-    # Statistical functions
+    "NUFFTKernel",
+    # Statistical tests
     "spatial_q_test",
     "spatial_r_test",
     "spatial_q_test_fft",
     "spatial_r_test_fft",
-    "power_spectrum_2d",
-    # Detector classes
+    "spatial_q_test_nufft",
+    "spatial_r_test_nufft",
+    # Detectors
     "PatternDetector",
-    # Cross-sample spectral comparison
+    "PatternDetectorFFT",
+    # Cross-sample
     "SpectralComparator",
-    "compare_two_groups",
-    "compare_two_groups_scalar",
-    "benchmark_statistics",
-    "shape_normalize",
-    # Visium I/O
-    "load_visium_sample",
-    "visium_to_grid",
-    "visium_hex_spacing_um",
-    "VISIUM_V1_SPOT_SPACING_UM",
 ]
-
-# PatternDetectorFFT requires optional spatialdata dependency
-try:
-    from quadsv.detector_fft import PatternDetectorFFT
-
-    __all__.append("PatternDetectorFFT")
-except ImportError:
-    pass
-
-# Append NUFFT symbols only if the optional finufft dep is present.
-if _HAS_NUFFT:
-    __all__.extend(
-        [
-            "power_spectrum_2d_nufft",
-            "NUFFTKernel",
-            "spatial_q_test_nufft",
-            "spatial_r_test_nufft",
-        ]
-    )
-if _HAS_NUFFT_DETECTOR:
-    __all__.append("PatternDetectorNUFFT")

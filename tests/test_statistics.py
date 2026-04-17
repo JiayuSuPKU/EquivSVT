@@ -220,5 +220,98 @@ class TestStatisticalFunctions(unittest.TestCase):
         self.assertAlmostEqual(pval, 1.0, places=8)
 
 
+class TestPhaseBUnification(unittest.TestCase):
+    """Phase B cross-cutting checks: shared signature shape, var_R hand-off,
+    and equivalence of spatial_r_test's public Kx path with the legacy
+    `kernel._K`-based computation."""
+
+    def setUp(self):
+        np.random.seed(0)
+        x = np.linspace(0, 4, 5)
+        y = np.linspace(0, 4, 5)
+        xx, yy = np.meshgrid(x, y)
+        self.coords = np.column_stack((xx.ravel(), yy.ravel()))
+        self.kernel = SpatialKernel.from_coordinates(self.coords, method="matern")
+        self.n = self.coords.shape[0]
+
+    def test_compute_null_params_populates_var_R(self):
+        """compute_null_params should always populate var_R alongside Q-test moments."""
+        for method in ("clt", "welch", "liu"):
+            params = compute_null_params(self.kernel, method=method)
+            self.assertIn("var_R", params)
+            self.assertGreater(params["var_R"], 0.0)
+
+    def test_spatial_r_test_consumes_var_R(self):
+        """Supplying var_R via null_params should match the on-the-fly path exactly."""
+        x = np.random.randn(self.n)
+        y = np.random.randn(self.n)
+        R_auto, p_auto = spatial_r_test(x, y, self.kernel)
+        params = compute_null_params(self.kernel, method="welch")
+        R_given, p_given = spatial_r_test(x, y, self.kernel, null_params=params)
+        self.assertAlmostEqual(R_auto, R_given, places=10)
+        self.assertAlmostEqual(p_auto, p_given, places=10)
+
+    def test_kernel_Kx_matches_dense_matmul(self):
+        """Kernel.Kx(z) must equal K @ z for explicit kernels."""
+        K = self.kernel.realization()
+        z = np.random.randn(self.n, 3)
+        np.testing.assert_allclose(self.kernel.Kx(z), K @ z, rtol=1e-10, atol=1e-12)
+
+    def test_kernel_xtKy_matches_paired_diagonal(self):
+        """Kernel.xtKy(x, y) must equal the paired diagonal of x^T K y."""
+        K = self.kernel.realization()
+        X = np.random.randn(self.n, 4)
+        Y = np.random.randn(self.n, 4)
+        expected = np.einsum("ij,ik,kj->j", X, K, Y)
+        np.testing.assert_allclose(self.kernel.xtKy(X, Y), expected, rtol=1e-10, atol=1e-12)
+
+    def test_qtest_sparse_input_matches_dense(self):
+        """Phase E: spatial_q_test must produce the same Q on CSR and ndarray inputs.
+
+        The sparse path in `spatial_q_test` densifies **per chunk** (not the full
+        slab), so the statistic should be bit-identical up to floating-point noise.
+        """
+        rng = np.random.default_rng(0)
+        X_dense = rng.standard_normal((self.n, 50))
+        # Sprinkle zeros to make sparsity meaningful.
+        X_dense[X_dense < -0.5] = 0.0
+        X_sparse = csr_matrix(X_dense)
+        Q_dense = spatial_q_test(X_dense, self.kernel, return_pval=False)
+        Q_sparse = spatial_q_test(X_sparse, self.kernel, return_pval=False)
+        np.testing.assert_allclose(Q_dense, Q_sparse, rtol=1e-10, atol=1e-12)
+
+    def test_six_tests_share_signature(self):
+        """All top-level Q/R test variants should accept the canonical kwargs."""
+        import inspect
+
+        from quadsv import (
+            spatial_q_test,
+            spatial_q_test_fft,
+            spatial_r_test,
+            spatial_r_test_fft,
+        )
+
+        canonical_q = {"null_params", "return_pval", "is_standardized"}
+        canonical_r = {"null_params", "return_pval", "is_standardized"}
+        for fn in (spatial_q_test, spatial_q_test_fft):
+            sig = set(inspect.signature(fn).parameters)
+            self.assertTrue(canonical_q.issubset(sig), f"{fn.__name__} missing {canonical_q - sig}")
+        for fn in (spatial_r_test, spatial_r_test_fft):
+            sig = set(inspect.signature(fn).parameters)
+            self.assertTrue(canonical_r.issubset(sig), f"{fn.__name__} missing {canonical_r - sig}")
+        # NUFFT variants are optional (finufft may be missing in this env).
+        try:
+            from quadsv import spatial_q_test_nufft, spatial_r_test_nufft
+
+            for fn in (spatial_q_test_nufft,):
+                sig = set(inspect.signature(fn).parameters)
+                self.assertTrue(canonical_q.issubset(sig))
+            for fn in (spatial_r_test_nufft,):
+                sig = set(inspect.signature(fn).parameters)
+                self.assertTrue(canonical_r.issubset(sig))
+        except ImportError:
+            pass
+
+
 if __name__ == "__main__":
     unittest.main()

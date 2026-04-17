@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 
+import finufft
 import numpy as np
 from scipy.stats import chi2, norm
 
@@ -49,17 +50,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-
-def _check_finufft() -> None:
-    """Import finufft lazily; raise a helpful error if it is not installed."""
-    try:
-        import finufft  # noqa: F401
-    except ImportError as e:  # pragma: no cover
-        raise ImportError(
-            "power_spectrum_2d_nufft requires the finufft package. "
-            "Install with `pip install 'quadsv[nufft]'` or `pip install finufft`."
-        ) from e
 
 
 def _infer_grid_from_coords(
@@ -175,9 +165,6 @@ def power_spectrum_2d_nufft(
     >>> P.shape
     (32, 32)
     """
-    _check_finufft()
-    import finufft
-
     if coords.ndim != 2 or coords.shape[1] != 2:
         raise ValueError(f"coords must have shape (N, 2), got {coords.shape}.")
     if values.shape[0] != coords.shape[0]:
@@ -324,8 +311,6 @@ class NUFFTKernel:
         workers: int | None = None,
         **kwargs,
     ) -> None:
-        _check_finufft()
-
         coords = np.asarray(coords, dtype=np.float64)
         if coords.ndim != 2 or coords.shape[1] != 2:
             raise ValueError(f"coords must be shape (N, 2), got {coords.shape}.")
@@ -458,8 +443,8 @@ class NUFFTKernel:
         return (np.sum(weighted, axis=(0, 1)) / (ny * nx)).astype(np.float64)
 
     # ------------------------------------------------------------------
-    def Kz(self, z: np.ndarray) -> np.ndarray:
-        """Matrix-vector product ``K z`` at the kernel's irregular coordinates.
+    def Kx(self, z: np.ndarray) -> np.ndarray:
+        """Matrix-vector product ``K x`` at the kernel's irregular coordinates.
 
         Implemented as type-1 NUFFT → multiply by ``λ(k)`` → type-2 NUFFT.
         Complexity: ``O(N log N + K log K)`` per feature.
@@ -474,8 +459,6 @@ class NUFFTKernel:
         np.ndarray
             ``K z`` of matching shape.
         """
-        import finufft
-
         if z.shape[0] != self.n:
             raise ValueError(f"z first dim {z.shape[0]} does not match n={self.n}.")
         ny, nx = self.grid_shape
@@ -544,9 +527,10 @@ def _standardize_features(X: np.ndarray) -> np.ndarray:
     return out
 
 
-def spatial_q_test_nufft(
+def spatial_q_test_nufft(  # noqa: C901
     Xn: np.ndarray,
     kernel: NUFFTKernel,
+    null_params: dict | None = None,
     return_pval: bool = True,
     is_standardized: bool = False,
 ) -> float | np.ndarray | tuple[float, float] | tuple[np.ndarray, np.ndarray]:
@@ -567,6 +551,15 @@ def spatial_q_test_nufft(
         standardized internally unless ``is_standardized=True``.
     kernel : NUFFTKernel
         Pre-constructed NUFFT kernel.
+    null_params : dict, optional
+        Pre-computed null parameters from
+        :func:`quadsv.statistics.compute_null_params`. When supplied, the
+        cached ``eigenvalues`` / ``mean_Q`` / ``var_Q`` entries are reused
+        so the spectrum does not need to be re-fetched per feature. Note
+        that the cached entries are assumed to have **already been
+        rescaled** to the N-point operator (i.e., multiplied by
+        ``N / (ny * nx)``) — the on-the-fly path below does this
+        rescaling internally for callers that pass ``None``.
     return_pval : bool, default True
         If True, return ``(Q, pval)`` tuple; else just ``Q``.
     is_standardized : bool, default False
@@ -610,8 +603,12 @@ def spatial_q_test_nufft(
     scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
 
     if kernel.method == "moran":
-        mean_Q = kernel.trace() * scale
-        var_Q = 2.0 * kernel.square_trace() * (scale**2)
+        if null_params is not None and "mean_Q" in null_params and "var_Q" in null_params:
+            mean_Q = float(null_params["mean_Q"])
+            var_Q = float(null_params["var_Q"])
+        else:
+            mean_Q = kernel.trace() * scale
+            var_Q = 2.0 * kernel.square_trace() * (scale**2)
         sigma = float(np.sqrt(var_Q))
         if sigma <= 1e-12:
             pvals = np.ones_like(Q_arr)
@@ -619,12 +616,15 @@ def spatial_q_test_nufft(
             z_scores = (Q_arr - mean_Q) / sigma
             pvals = chi2.sf(z_scores**2, df=1)
     else:
-        evals = kernel.eigenvalues(return_full=True)
-        if evals.min() < -0.1:
-            raise ValueError(
-                "Kernel has significant negative eigenvalues; Liu's method may be invalid."
-            )
-        sig_evals = evals[evals > 1e-9] * scale
+        if null_params is not None and "eigenvalues" in null_params:
+            sig_evals = np.asarray(null_params["eigenvalues"], dtype=float)
+        else:
+            evals = kernel.eigenvalues(return_full=True)
+            if evals.min() < -0.1:
+                raise ValueError(
+                    "Kernel has significant negative eigenvalues; Liu's method may be invalid."
+                )
+            sig_evals = evals[evals > 1e-9] * scale
         pvals = np.array([liu_sf(float(q), sig_evals) for q in Q_arr])
 
     if batched:
@@ -636,6 +636,7 @@ def spatial_r_test_nufft(
     Xn: np.ndarray,
     Yn: np.ndarray,
     kernel: NUFFTKernel,
+    null_params: dict | None = None,
     return_pval: bool = True,
     is_standardized: bool = False,
 ) -> float | np.ndarray | tuple[float, float] | tuple[np.ndarray, np.ndarray]:
@@ -654,6 +655,13 @@ def spatial_r_test_nufft(
         ``(M,)``. When shapes differ, returns an ``(M_x, M_y)`` pair matrix.
     kernel : NUFFTKernel
         Pre-constructed NUFFT kernel.
+    null_params : dict, optional
+        Pre-computed null parameters from
+        :func:`quadsv.statistics.compute_null_params`. Only the
+        ``var_R`` entry is consumed here; it is expected to already be
+        rescaled to the N-point operator (``trace(K²) * (N/(ny*nx))²``).
+        If None, this rescaling is done internally from
+        ``kernel.square_trace()``.
     return_pval : bool, default True
         If True, return ``(R, pval)``; else just ``R``.
     is_standardized : bool, default False
@@ -685,7 +693,7 @@ def spatial_r_test_nufft(
     Xz = Xn if is_standardized else _standardize_features(Xn)
     Yz = Yn if is_standardized else _standardize_features(Yn)
 
-    KY = kernel.Kz(Yz)  # (n, M_y)
+    KY = kernel.Kx(Yz)  # (n, M_y)
     R = Xz.T @ KY  # (M_x, M_y)
 
     if not return_pval:
@@ -693,8 +701,11 @@ def spatial_r_test_nufft(
 
     # Rescale trace(K²) to the N-point effective operator, matching the
     # eigenvalue rescaling used by spatial_q_test_nufft.
-    scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
-    var_R = float(kernel.square_trace()) * (scale**2)
+    if null_params is not None and "var_R" in null_params:
+        var_R = float(null_params["var_R"])
+    else:
+        scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
+        var_R = float(kernel.square_trace()) * (scale**2)
     sigma = float(np.sqrt(max(var_R, 1e-30)))
     z_scores = R / sigma
     pvals = 2.0 * norm.sf(np.abs(z_scores))

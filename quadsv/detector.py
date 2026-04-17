@@ -11,6 +11,7 @@ from scipy.stats import norm
 from tqdm import tqdm
 
 from quadsv.kernels import Kernel, SpatialKernel
+from quadsv.nufft import NUFFTKernel, spatial_q_test_nufft, spatial_r_test_nufft
 from quadsv.statistics import compute_null_params, spatial_q_test
 from quadsv.utils import _apply_bh_correction
 
@@ -184,7 +185,11 @@ def _rstat_worker_chunked(
     results = []
     sigma = np.sqrt(null_params["var_R"])
 
-    # 1. Extract and standardize Y chunk
+    # 1. Extract and standardize Y chunk.
+    # spatial_r_test standardizes both X and Y (subtracts means, divides by
+    # stds), which destroys sparsity, so each per-pair-chunk slice has to be
+    # dense. This is still only `chunk_size` columns at a time — a small
+    # (N, chunk_size) block — not the full AnnData.
     Y_chunk = X_csc[:, y_chunk_indices].toarray()  # (N, n_y)
     y_means = means[y_chunk_indices]
     y_stds = stds[y_chunk_indices]
@@ -343,12 +348,18 @@ class PatternDetector:
         else:
             self.min_cells = min(min_cells, self.n)
         """Minimum number of non-zero observations a feature must have to be tested."""
-        self.kernel_: Kernel | None = None
-        """Active :class:`~quadsv.kernels.Kernel` object, set by ``build_kernel_*`` methods."""
+        self.kernel_: Any | None = None
+        """Active kernel object (``SpatialKernel`` for ``backend='matrix'`` or
+        ``NUFFTKernel`` for ``backend='nufft'``), set by ``build_kernel*`` methods."""
         self.kernel_method_: str | None = None
         """Name of the kernel method used to build :attr:`kernel_`, or ``None`` until built."""
         self.kernel_params_: dict | None = None
         """Parameters used to build :attr:`kernel_`, or ``None`` until built."""
+        self.backend_: str | None = None
+        """Which backend built the kernel — ``'matrix'`` (SpatialKernel, dense or
+        sparse-implicit) or ``'nufft'`` (NUFFTKernel on irregular points). ``None``
+        until :meth:`build_kernel` / :meth:`build_kernel_from_coordinates` /
+        :meth:`build_kernel_from_obsp` has been called."""
 
     def _get_default_params(self, method: str) -> dict[str, Any]:
         """
@@ -372,6 +383,95 @@ class PatternDetector:
             "car": {"rho": 0.9, "k_neighbors": 4, "standardize": False},
         }
         return method_defaults.get(method, {})
+
+    def build_kernel(
+        self,
+        backend: str = "matrix",
+        method: str = "matern",
+        coordinates_key: str = "spatial",
+        **kernel_params: Any,
+    ) -> PatternDetector:
+        """
+        Build a kernel over ``adata.obsm[coordinates_key]``.
+
+        This is the unified builder — a single entry point that picks the
+        right kernel representation for the data. Irregular spots on a
+        regular grid work with either backend; irregular spots on an
+        arbitrary layout essentially require ``backend='nufft'`` at
+        large ``N``.
+
+        Parameters
+        ----------
+        backend : {'matrix', 'nufft'}, default 'matrix'
+            - ``'matrix'`` — builds a :class:`~quadsv.kernels.SpatialKernel`.
+              The kernel class decides internally whether to materialize
+              the dense ``(N, N)`` kernel or keep the sparse precision
+              matrix and solve linear systems on demand (switch at
+              ``N > 5000``). The caller does not choose representation;
+              the switch is memory-driven.
+            - ``'nufft'`` — builds a :class:`~quadsv.nufft.NUFFTKernel`
+              that evaluates ``x^T K x`` and ``K x`` via type-1/type-2
+              non-uniform FFTs in ``O(N log N + K log K)``. Needs
+              ``finufft`` installed. Ideal for ≥ 10⁴ irregular spots.
+        method : str, default 'matern'
+            Kernel method. One of ``'gaussian'``, ``'matern'``, ``'moran'``,
+            ``'graph_laplacian'``, ``'car'``.
+        coordinates_key : str, default 'spatial'
+            Key in ``adata.obsm`` containing the ``(n_obs, 2)`` spatial
+            coordinates.
+        **kernel_params
+            Kernel parameters forwarded to the underlying kernel class.
+            Matrix backend: ``bandwidth``, ``nu``, ``rho``, ``k_neighbors``.
+            NUFFT backend: ``bandwidth``, ``nu``, ``rho``, plus
+            ``grid_shape``, ``spacing``, ``unit_scale``, ``oversample``,
+            ``eps`` (see :class:`NUFFTKernel`). For NUFFT, ``grid_shape``
+            and ``spacing`` are auto-inferred from the coordinates alone
+            when not supplied.
+
+        Returns
+        -------
+        PatternDetector
+            ``self`` for chaining.
+
+        Raises
+        ------
+        ValueError
+            If ``backend`` is not recognized, if ``method`` is not one of
+            the available kernels, or if the backend requires an optional
+            dependency that is not installed.
+        KeyError
+            If ``coordinates_key`` is missing from ``adata.obsm``.
+        """
+        if backend not in ("matrix", "nufft"):
+            raise ValueError(f"backend must be 'matrix' or 'nufft', got '{backend}'.")
+        if method not in self._available_kernels:
+            raise ValueError(
+                f"Method '{method}' not recognized. Must be one of {self._available_kernels}."
+            )
+        if coordinates_key not in self.adata.obsm:
+            raise KeyError(
+                f"adata.obsm has no key '{coordinates_key}'; "
+                f"available: {list(self.adata.obsm.keys())}."
+            )
+        coords = np.asarray(self.adata.obsm[coordinates_key], dtype=np.float64)
+        if coords.ndim != 2 or coords.shape[1] != 2:
+            raise ValueError(
+                f"adata.obsm['{coordinates_key}'] must be (n_obs, 2), got {coords.shape}."
+            )
+        if coords.shape[0] != self.n:
+            raise ValueError(
+                f"coords shape {coords.shape} inconsistent with adata.shape=({self.n}, ...)."
+            )
+
+        if backend == "matrix":
+            self.build_kernel_from_coordinates(coords, method=method, **kernel_params)
+        else:
+            logger.info("Building %s NUFFTKernel over %d spots...", method, self.n)
+            self.kernel_ = NUFFTKernel(coords=coords, method=method, **kernel_params)
+            self.kernel_method_ = method
+            self.kernel_params_ = dict(self.kernel_.params)
+            self.backend_ = "nufft"
+        return self
 
     def build_kernel_from_coordinates(
         self, coords: np.ndarray, method: str = "car", **kernel_params: Any
@@ -440,6 +540,7 @@ class PatternDetector:
         self.kernel_ = SpatialKernel.from_coordinates(coords, method=method, **kernel_params_)
         self.kernel_method_ = method
         self.kernel_params_ = kernel_params_
+        self.backend_ = "matrix"
 
     def build_kernel_from_obsp(  # noqa: C901
         self, key: str, is_distance: bool = False, method: str = "car", **kernel_params: Any
@@ -508,6 +609,7 @@ class PatternDetector:
             self.kernel_ = SpatialKernel.from_matrix(matrix, is_inverse=False)
             self.kernel_params_ = kernel_params
             self.kernel_method_ = method
+            self.backend_ = "matrix"
             return
 
         logger.info(
@@ -624,6 +726,8 @@ class PatternDetector:
 
             else:
                 raise ValueError(f"Method {method} not supported for connectivity matrices.")
+
+        self.backend_ = "matrix"
 
     def _prepare_data(
         self, source: str, keys: list[str] | None, min_cells: int, layer: str | None = None
@@ -811,7 +915,20 @@ class PatternDetector:
         # 1. Ensure Kernel Exists
         if self.kernel_ is None:
             raise ValueError(
-                "Kernel not initialized. Please run 'build_kernel_from_coordinates' or 'build_kernel_from_obsp' first."
+                "Kernel not initialized. Call .build_kernel(), "
+                ".build_kernel_from_coordinates(), or .build_kernel_from_obsp() first."
+            )
+
+        # NUFFT backend takes a different code path (no dense K, different
+        # null rescaling). Dispatch early and delegate.
+        if self.backend_ == "nufft":
+            return self._compute_qstat_nufft(
+                source=source,
+                features=features,
+                n_jobs=n_jobs,
+                layer=layer,
+                return_pval=return_pval,
+                chunk_size=chunk_size,
             )
 
         # 2. Compute Null Distribution
@@ -867,7 +984,7 @@ class PatternDetector:
 
         return df.sort_values(by="Q", ascending=False)
 
-    def compute_rstat(
+    def compute_rstat(  # noqa: C901
         self,
         features_x: list[str] | None = None,
         features_y: list[str] | None = None,
@@ -949,6 +1066,17 @@ class PatternDetector:
         """
         if self.kernel_ is None:
             raise ValueError("Kernel not initialized.")
+
+        if self.backend_ == "nufft":
+            return self._compute_rstat_nufft(
+                features_x=features_x,
+                features_y=features_y,
+                source=source,
+                n_jobs=n_jobs,
+                layer=layer,
+                return_pval=return_pval,
+                chunk_size=chunk_size,
+            )
 
         # 1. Compute Null Params for R
         # We need Trace(KK^T) which is Trace(K^2) for symmetric K
@@ -1045,3 +1173,222 @@ class PatternDetector:
             _apply_bh_correction(df)
 
         return df.sort_values(by="Z_score", key=abs, ascending=False)
+
+    # ------------------------------------------------------------------
+    # NUFFT backend paths
+    # ------------------------------------------------------------------
+
+    def _prepare_features_nufft(
+        self, source: str, features: list[str] | None, layer: str | None
+    ) -> tuple[sp.csc_matrix, list[str], np.ndarray, np.ndarray]:
+        """Pull a sparse ``(n_spots, n_features)`` CSC + names + per-feature
+        mean/std. NUFFT-friendly: computes variance from sparse moments and
+        never materializes a full dense ``X``."""
+        if source == "var":
+            X = self.adata.X if layer is None else self.adata.layers[layer]
+            X_csc = X.tocsc() if sp.issparse(X) else sp.csc_matrix(X)
+            names = list(self.adata.var_names)
+            if features is not None:
+                selected = [g for g in features if g in names]
+                missing = set(features) - set(selected)
+                if missing:
+                    logger.warning(
+                        "Requested features not in adata.var_names: %s", sorted(missing)[:5]
+                    )
+                idx = [names.index(g) for g in selected]
+                X_csc = X_csc[:, idx]
+                names = selected
+        elif source == "obs":
+            if features is None:
+                raise ValueError("source='obs' requires `features` (obs column names).")
+            cols = [features] if isinstance(features, str) else list(features)
+            missing = [c for c in cols if c not in self.adata.obs.columns]
+            if missing:
+                raise KeyError(f"obs columns missing: {missing}")
+            X_csc = sp.csc_matrix(self.adata.obs[cols].to_numpy(dtype=np.float64))
+            names = list(cols)
+        else:
+            raise ValueError(f"source must be 'var' or 'obs', got '{source}'.")
+
+        nnz_per = np.asarray((X_csc != 0).sum(axis=0)).ravel()
+        means = np.asarray(X_csc.mean(axis=0)).ravel()
+        sq = X_csc.multiply(X_csc)
+        sq_mean = np.asarray(sq.mean(axis=0)).ravel()
+        var = np.maximum(sq_mean - means**2, 0.0)
+        stds = np.sqrt(var)
+        keep = (stds > 0) & (nnz_per >= self.min_cells)
+
+        X_kept = X_csc[:, keep]
+        names_kept = [names[i] for i, k in enumerate(keep) if k]
+        return X_kept, names_kept, means[keep], stds[keep]
+
+    def _compute_qstat_nufft(  # noqa: C901
+        self,
+        source: str,
+        features: list[str] | None,
+        n_jobs: int,
+        layer: str | None,
+        return_pval: bool,
+        chunk_size: int,
+    ) -> pd.DataFrame:
+        """NUFFT dispatch for :meth:`compute_qstat`. Builds null params once and
+        delegates per-feature work to :func:`spatial_q_test_nufft`."""
+        kernel = self.kernel_
+        scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
+        null_params: dict[str, float | np.ndarray] | None = None
+        if return_pval:
+            if kernel.method == "moran":
+                null_params = {
+                    "method": "clt",
+                    "mean_Q": kernel.trace() * scale,
+                    "var_Q": 2.0 * kernel.square_trace() * (scale**2),
+                }
+            else:
+                full = kernel.eigenvalues(return_full=True)
+                if full.min() < -0.1:
+                    raise ValueError(
+                        "Kernel has significant negative eigenvalues; "
+                        "Liu's method may be invalid."
+                    )
+                null_params = {
+                    "method": "liu",
+                    "eigenvalues": full[full > 1e-9] * scale,
+                }
+
+        logger.info("Preparing %s features (layer=%s)...", source, layer)
+        X_kept, names_kept, means, stds = self._prepare_features_nufft(source, features, layer)
+        n_feats = len(names_kept)
+        if n_feats == 0:
+            cols = ["Feature", "Q", "Z_score", "P_value", "P_adj"]
+            return pd.DataFrame(columns=cols)
+
+        logger.info("Testing %d features via NUFFT (n_jobs=%s)...", n_feats, n_jobs)
+
+        def _batch(batch_idx: np.ndarray) -> list[dict[str, Any]]:
+            # Densify one small block at a time; never materialize full X.
+            block = np.asarray(X_kept[:, batch_idx].todense(), dtype=np.float64)
+            block_std = (block - means[batch_idx][None, :]) / np.where(
+                stds[batch_idx] > 0, stds[batch_idx], 1.0
+            )[None, :]
+            if return_pval:
+                Q_arr, P_arr = spatial_q_test_nufft(
+                    block_std, kernel, null_params=null_params, is_standardized=True
+                )
+                Q_arr = np.atleast_1d(Q_arr)
+                P_arr = np.atleast_1d(P_arr)
+            else:
+                Q_arr = np.atleast_1d(
+                    spatial_q_test_nufft(block_std, kernel, return_pval=False, is_standardized=True)
+                )
+                P_arr = np.full_like(Q_arr, np.nan)
+            # Reference trace and trace²-based Z for reporting.
+            if null_params is not None:
+                if "eigenvalues" in null_params:
+                    evals = np.asarray(null_params["eigenvalues"], dtype=float)
+                    trK = float(evals.sum())
+                    varQ = 2.0 * float((evals**2).sum())
+                else:
+                    trK = float(null_params["mean_Q"])
+                    varQ = float(null_params["var_Q"])
+                sigma = float(np.sqrt(varQ)) if varQ > 0 else 0.0
+                Z_arr = (Q_arr - trK) / sigma if sigma > 0 else np.zeros_like(Q_arr)
+            else:
+                Z_arr = np.full_like(Q_arr, np.nan)
+
+            out = []
+            for local_i, gi in enumerate(batch_idx):
+                out.append(
+                    {
+                        "Feature": names_kept[gi],
+                        "Q": float(Q_arr[local_i]),
+                        "Z_score": float(Z_arr[local_i]),
+                        "P_value": float(P_arr[local_i]),
+                    }
+                )
+            return out
+
+        idx_all = np.arange(n_feats)
+        batches = [idx_all[i : i + chunk_size] for i in range(0, n_feats, chunk_size)]
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_batch)(batch)
+            for batch in tqdm(batches, desc=f"Q (NUFFT, {self.kernel_method_})")
+        )
+        flat = [row for chunk in results for row in chunk]
+        df = pd.DataFrame(flat)
+        if not return_pval:
+            df = df.drop(columns=["P_value", "Z_score"], errors="ignore")
+        elif return_pval:
+            _apply_bh_correction(df)
+        return df.sort_values("Q", ascending=False).reset_index(drop=True)
+
+    def _compute_rstat_nufft(
+        self,
+        features_x: list[str] | None,
+        features_y: list[str] | None,
+        source: str,
+        n_jobs: int,
+        layer: str | None,
+        return_pval: bool,
+        chunk_size: int,
+    ) -> pd.DataFrame:
+        """NUFFT dispatch for :meth:`compute_rstat`."""
+        kernel = self.kernel_
+        scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
+        var_R = float(kernel.square_trace()) * (scale**2) if return_pval else 0.0
+        null_params = {"var_R": var_R}
+
+        if features_x is None and features_y is not None:
+            raise ValueError("Provide features_x when features_y is specified.")
+
+        X_kept, names_kept, means_x, stds_x = self._prepare_features_nufft(
+            source, features_x, layer
+        )
+        if features_y is None:
+            X_y, names_y, means_y, stds_y = X_kept, names_kept, means_x, stds_x
+        else:
+            X_y, names_y, means_y, stds_y = self._prepare_features_nufft(source, features_y, layer)
+
+        if len(names_kept) == 0 or len(names_y) == 0:
+            return pd.DataFrame(
+                columns=["Feature_1", "Feature_2", "R", "Z_score", "P_value", "P_adj"]
+            )
+
+        logger.info("Testing %d x %d feature pairs via NUFFT...", len(names_kept), len(names_y))
+
+        # Densify the X block once (kept dense in memory for standardization).
+        X_block = np.asarray(X_kept.todense())
+        X_std = (X_block - means_x[None, :]) / np.where(stds_x > 0, stds_x, 1.0)[None, :]
+
+        results: list[dict[str, Any]] = []
+        y_chunks = [slice(i, i + chunk_size) for i in range(0, len(names_y), chunk_size)]
+        for ysl in tqdm(y_chunks, desc=f"R (NUFFT, {self.kernel_method_})"):
+            Y_block = np.asarray(X_y[:, ysl].todense())
+            Y_std = (Y_block - means_y[ysl][None, :]) / np.where(stds_y[ysl] > 0, stds_y[ysl], 1.0)[
+                None, :
+            ]
+            # Use the R-test on the chunk so null-param handling lives in one place.
+            R_chunk = spatial_r_test_nufft(
+                X_std,
+                Y_std,
+                kernel,
+                null_params=null_params,
+                return_pval=False,
+                is_standardized=True,
+            )
+            R_chunk = np.atleast_2d(R_chunk)
+            if R_chunk.shape != (len(names_kept), Y_std.shape[1]):
+                R_chunk = R_chunk.reshape(len(names_kept), Y_std.shape[1])
+            for i, name_x in enumerate(names_kept):
+                for j, name_y in enumerate(names_y[ysl]):
+                    r = float(R_chunk[i, j])
+                    row = {"Feature_1": name_x, "Feature_2": name_y, "R": r}
+                    if return_pval and var_R > 0:
+                        z = r / np.sqrt(var_R)
+                        row["Z_score"] = z
+                        row["P_value"] = float(2.0 * norm.sf(abs(z)))
+                    results.append(row)
+
+        df = pd.DataFrame(results)
+        if return_pval:
+            _apply_bh_correction(df)
+        return df.sort_values("R", ascending=False).reset_index(drop=True)

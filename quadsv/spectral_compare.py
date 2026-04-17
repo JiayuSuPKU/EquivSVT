@@ -42,10 +42,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import scipy.ndimage
+import scipy.sparse as sp
 from joblib import Parallel, delayed
 from scipy.stats import ks_2samp  # noqa: F401  (exposed for downstream calibration tests)
 
@@ -68,6 +70,133 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _AVAILABLE_STATISTICS = ("log_l2", "hotelling_lw", "mmd_rbf", "max_welch")
+
+
+# ---------------------------------------------------------------------------
+# SpatialData helpers (Phase D)
+# ---------------------------------------------------------------------------
+
+
+def _sd_get_table(sd_obj: Any, table_key: str | None):
+    """Fetch the expression table from a :class:`spatialdata.SpatialData` object.
+
+    When ``table_key`` is None, fall back to the single table present (error if
+    there are multiple). Returns an :class:`anndata.AnnData` table.
+    """
+    tables = sd_obj.tables
+    if table_key is None:
+        keys = list(tables.keys())
+        if len(keys) == 0:
+            raise ValueError("SpatialData has no tables; supply `table_key` explicitly.")
+        if len(keys) > 1:
+            raise ValueError(
+                f"SpatialData has multiple tables {keys}; supply `table_key` explicitly."
+            )
+        return tables[keys[0]]
+    if table_key not in tables:
+        raise KeyError(f"SpatialData has no table '{table_key}'; available: {list(tables.keys())}.")
+    return tables[table_key]
+
+
+def _sd_infer_grid_and_spacing(
+    sd_obj: Any,
+    *,
+    table_key: str | None,
+    override_shape: tuple[int, int] | None = None,
+    override_spacing: tuple[float, float] | None = None,
+) -> tuple[tuple[int, int], tuple[float, float]]:
+    """Infer ``(grid_shape, spacing)`` for a SpatialData sample.
+
+    Preferred order:
+      1. explicit user overrides, when both ``override_shape`` and
+         ``override_spacing`` are supplied;
+      2. the SpatialData object's first rasterized image's
+         ``(ny, nx)`` dims and pixel pitch;
+      3. fall back to the table's attached coordinates via
+         :func:`quadsv.nufft._infer_grid_from_coords`.
+    """
+    if override_shape is not None and override_spacing is not None:
+        return (
+            (int(override_shape[0]), int(override_shape[1])),
+            (float(override_spacing[0]), float(override_spacing[1])),
+        )
+
+    # Try image layers (they encode both shape and spacing).
+    images = getattr(sd_obj, "images", {}) or {}
+    if images:
+        first_key = next(iter(images))
+        img = images[first_key]
+        # DataArray-like: look at the last two dims.
+        try:
+            ny, nx = int(img.shape[-2]), int(img.shape[-1])
+            grid = (ny, nx)
+            spacing = (1.0, 1.0)
+            return grid, spacing
+        except Exception:  # pragma: no cover
+            pass
+
+    # Fall back: coords from the table's obsm.
+    table = _sd_get_table(sd_obj, table_key)
+    if "spatial" in table.obsm:
+        from quadsv.nufft import _infer_grid_from_coords
+
+        coords = np.asarray(table.obsm["spatial"], dtype=np.float64)
+        return _infer_grid_from_coords(coords, oversample=2.0)
+
+    raise ValueError(
+        "Could not infer (grid_shape, spacing) from SpatialData — no images and no "
+        "obsm['spatial'] on the requested table. Supply `grid_shape` and `spacing` "
+        "explicitly."
+    )
+
+
+def _rasterize_spatialdata_lazy(
+    sd_obj: Any,
+    *,
+    grid_shape: tuple[int, int],
+    table_key: str | None,
+    gene_names: Sequence[str],
+) -> np.ndarray:
+    """Project a SpatialData table onto a regular ``(ny, nx)`` grid, one gene
+    at a time if the source is sparse. Returns ``(n_genes, ny, nx)``.
+
+    This is a minimal implementation: spots / cells are nearest-neighbor-
+    binned onto the target grid by rescaling their ``obsm['spatial']``
+    coordinates. It is designed so we never materialize the dense
+    ``.X`` slab — only one gene column is ever dense in memory.
+    """
+    table = _sd_get_table(sd_obj, table_key)
+    if "spatial" not in table.obsm:
+        raise ValueError("SpatialData table has no obsm['spatial']; cannot rasterize.")
+    coords = np.asarray(table.obsm["spatial"], dtype=np.float64)
+    ny, nx = grid_shape
+
+    # Map coordinates to integer bin indices.
+    y = coords[:, 0]
+    x = coords[:, 1]
+    y_norm = (y - y.min()) / max(y.max() - y.min(), 1e-12)
+    x_norm = (x - x.min()) / max(x.max() - x.min(), 1e-12)
+    row = np.clip((y_norm * (ny - 1)).round().astype(int), 0, ny - 1)
+    col = np.clip((x_norm * (nx - 1)).round().astype(int), 0, nx - 1)
+
+    X = table.X
+    is_sparse = sp.issparse(X)
+    if is_sparse:
+        X_csc = X.tocsc()
+
+    out = np.zeros((len(gene_names), ny, nx), dtype=np.float64)
+    name_to_col = {g: j for j, g in enumerate(table.var_names)}
+    for gi, gname in enumerate(gene_names):
+        if gname not in name_to_col:
+            raise KeyError(f"gene '{gname}' not found in SpatialData table.")
+        j = name_to_col[gname]
+        if is_sparse:
+            vals = np.asarray(X_csc[:, j].toarray(), dtype=np.float64).ravel()
+        else:
+            vals = np.asarray(X[:, j], dtype=np.float64).ravel()
+        # Accumulate into the grid cell (sum); duplicates at the same bin are added.
+        np.add.at(out[gi], (row, col), vals)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -424,11 +553,11 @@ def align_spectra_by_rotation(
 
     rotated: list[np.ndarray] = []
     angles = np.zeros(n_samples)
-    for i, (sp, shape) in enumerate(zip(spectra, grid_shapes, strict=True)):
+    for i, (spec_i, shape) in enumerate(zip(spectra, grid_shapes, strict=True)):
         if i == reference_index:
-            rotated.append(sp.copy())
+            rotated.append(spec_i.copy())
             continue
-        cur_polar = _polar_resample(_prep(sp, shape), n_theta, n_radius)
+        cur_polar = _polar_resample(_prep(spec_i, shape), n_theta, n_radius)
         cur_polar -= cur_polar.mean(axis=0, keepdims=True)
         # Circular cross-correlation along axis 0 (theta), summed across radii.
         # corr[k] = sum_r sum_t ref[t, r] * cur[(t-k) mod n_theta, r]
@@ -441,7 +570,7 @@ def align_spectra_by_rotation(
         angles[i] = angle_deg
 
         # Rotate every gene's full 2D spectrum by the recovered angle.
-        full = _to_full_2d(sp, shape, fft_solver)  # (n_genes, ny, nx)
+        full = _to_full_2d(spec_i, shape, fft_solver)  # (n_genes, ny, nx)
         full_shift = np.fft.fftshift(full, axes=(-2, -1))
         rot = scipy.ndimage.rotate(
             full_shift, angle=-angle_deg, axes=(-2, -1), reshape=False, order=1, mode="reflect"
@@ -1048,20 +1177,72 @@ class SpectralComparator:
 
     def __init__(  # noqa: C901
         self,
-        samples: Sequence[np.ndarray],
+        samples: Sequence[Any],
         groups: np.ndarray,
-        gene_names: Sequence[str],
+        gene_names: Sequence[str] | None = None,
+        *,
         feature_mode: str = "radial",
         n_radial_bins: int = 30,
         fft_solver: str = "rfft2",
         workers: int | None = None,
-        spacings: Sequence[tuple[float, float]] | None = None,
+        coordinates_key: str = "spatial",
+        layer: str | None = None,
+        table_key: str | None = None,
+        unit_scales: Sequence[float] | None = None,
+        grid_shape: tuple[int, int] | None = None,
+        spacing: tuple[float, float] | None = None,
         freq_edges: np.ndarray | None = None,
         center: str | None = "mean",
+        eps: float = 1e-6,
     ) -> None:
+        """
+        Build a comparator over a list of spatial-omics samples.
+
+        Parameters
+        ----------
+        samples : list of :class:`anndata.AnnData` or list of :class:`spatialdata.SpatialData`
+            Per-sample objects. All entries must be of the same concrete type:
+
+            - list of ``AnnData`` → irregular-grid samples; the NUFFT backend
+              is used. Each sample's ``obsm[coordinates_key]`` is treated as
+              ``(y, x)`` spot coordinates; its ``.X`` (or ``.layers[layer]``
+              if ``layer`` is given) provides the expression matrix. Sparse
+              matrices are converted to dense **one gene column at a time**
+              inside the per-sample spectrum loop — ``adata.X`` is never
+              fully densified.
+            - list of ``SpatialData`` → regular-grid samples; the FFT
+              backend is used. Each sample is rasterized to
+              ``(n_genes, ny, nx)`` via the :class:`SpatialData` table at
+              ``table_key``; same per-gene densification rule applies.
+        groups : np.ndarray
+            Group labels of length ``n_samples`` with exactly two distinct values.
+        gene_names : sequence of str, optional
+            Gene names. If ``None``, inferred from the first sample's
+            ``.var_names``; all samples must then share the same ``.var_names``.
+        feature_mode, n_radial_bins, fft_solver, workers, freq_edges, center
+            Same meaning as before (see class docstring).
+        coordinates_key : str, default ``'spatial'``
+            ``obsm`` key holding ``(n_obs, 2)`` coordinates (AnnData inputs only).
+        layer : str, optional
+            Layer key to read instead of ``.X`` (AnnData inputs only).
+        table_key : str, optional
+            Table name inside the :class:`SpatialData` object to use as the
+            expression matrix. If None, the default table is used.
+        unit_scales : sequence of float, optional
+            Per-sample multiplier for AnnData coords (e.g., pixel → μm). Default
+            ``[1.0] * n_samples``.
+        grid_shape, spacing : optional
+            When supplied, used for every sample; otherwise auto-inferred
+            per sample (NUFFT auto-inference via
+            :func:`quadsv.nufft._infer_grid_from_coords`). Different samples
+            keep their own grid sizes; cross-sample alignment happens in
+            physical-frequency space via radial binning with per-sample
+            ``spacing``.
+        eps : float, default 1e-6
+            NUFFT tolerance (AnnData path only).
+        """
         if center not in ("mean", "zscore", None):
             raise ValueError(f"center must be 'mean', 'zscore', or None, got {center!r}.")
-        self.center: str | None = center
         if feature_mode not in ("radial", "2d"):
             raise ValueError(f"feature_mode must be 'radial' or '2d', got '{feature_mode}'.")
         if feature_mode == "2d" and fft_solver != "fft2":
@@ -1070,225 +1251,284 @@ class SpectralComparator:
             )
             fft_solver = "fft2"
 
-        self.samples: list[np.ndarray] = list(samples)
-        self.groups: np.ndarray = np.asarray(groups)
-        self.gene_names: list[str] = list(gene_names)
-        self.feature_mode: str = feature_mode
-        self.n_radial_bins: int = n_radial_bins
-        self.fft_solver: str = fft_solver
-        self.workers: int | None = workers
+        samples_list = list(samples)
+        if len(samples_list) == 0:
+            raise ValueError("samples must be a non-empty list.")
+        n_samples = len(samples_list)
 
-        n_samples = len(self.samples)
-        if self.groups.shape != (n_samples,):
-            raise ValueError(
-                f"groups length {self.groups.shape} does not match n_samples={n_samples}."
-            )
-        if np.unique(self.groups).size != 2:
-            raise ValueError("groups must contain exactly two distinct labels.")
-        for i, s in enumerate(self.samples):
-            if s.ndim != 3:
-                raise ValueError(f"sample {i} must be 3D, got shape {s.shape}.")
-            if s.shape[0] != len(self.gene_names):
-                raise ValueError(
-                    f"sample {i} has n_genes={s.shape[0]} but gene_names has "
-                    f"{len(self.gene_names)}."
-                )
-
-        if spacings is not None:
-            spacings_list = [tuple(float(v) for v in sp) for sp in spacings]
-            if len(spacings_list) != n_samples:
-                raise ValueError(
-                    f"spacings length {len(spacings_list)} does not match n_samples={n_samples}."
-                )
-            if any(len(sp) != 2 for sp in spacings_list):
-                raise ValueError("each entry in spacings must be a (dy, dx) pair.")
-            self.spacings: list[tuple[float, float]] | None = spacings_list
-        else:
-            self.spacings = None
-        self.freq_edges: np.ndarray | None = (
-            None if freq_edges is None else np.asarray(freq_edges, dtype=float)
-        )
-
-        self.spectra_: np.ndarray | None = None
-        self.dc_: np.ndarray | None = None
-        self.rotation_angles_: np.ndarray | None = None
-        self._raw_2d_spectra: list[np.ndarray] | None = None
-        self._grid_shapes: list[tuple[int, int]] = [(s.shape[1], s.shape[2]) for s in self.samples]
-
-        # Non-uniform FFT mode: set by :meth:`from_coords`, never here.
-        self.mode: str = "fft"
-        self._coords: list[np.ndarray] | None = None
-        self._values: list[np.ndarray] | None = None
-        self._unit_scales: list[float] | None = None
-        self._nufft_grid_shape: tuple[int, int] | None = None
-        self._nufft_spacing: tuple[float, float] | None = None
-        self._nufft_eps: float = 1e-6
-
-    # ------------------------------------------------------------------
-    @classmethod
-    def from_coords(  # noqa: C901
-        cls,
-        coords: Sequence[np.ndarray],
-        values: Sequence[np.ndarray],
-        groups: np.ndarray,
-        gene_names: Sequence[str],
-        grid_shape: tuple[int, int],
-        spacing: tuple[float, float],
-        unit_scales: Sequence[float] | None = None,
-        feature_mode: str = "radial",
-        n_radial_bins: int = 30,
-        center: str | None = "mean",
-        freq_edges: np.ndarray | None = None,
-        eps: float = 1e-6,
-    ) -> SpectralComparator:
-        """
-        Build a comparator over **non-uniform** spatial samples via NUFFT.
-
-        Unlike the default constructor — which expects per-sample *rasterized*
-        arrays — this alternative entry point takes the raw per-spot
-        coordinates and expression matrices and uses a 2D type-1 non-uniform
-        FFT (:func:`quadsv.nufft.power_spectrum_2d_nufft`) to evaluate
-        :math:`|\\hat c(k)|^2` on a *common* uniform k-space grid. All
-        downstream steps (radial binning, background normalization,
-        :meth:`test_pattern`, :meth:`test_expression`) work identically.
-
-        Parameters
-        ----------
-        coords : sequence of np.ndarray
-            Per-sample spot coordinates of shape ``(N_s, 2)`` in order
-            ``(y, x)``. Units are per-sample (see ``unit_scales``).
-        values : sequence of np.ndarray
-            Per-sample expression matrices of shape ``(N_s, n_genes)``. The
-            gene axis must be aligned across samples (second axis, length
-            equal to ``len(gene_names)``).
-        groups : np.ndarray
-            Group labels of length ``n_samples`` with exactly two distinct values.
-        gene_names : sequence of str
-            Gene names; must match the second axis of every entry of ``values``.
-        grid_shape : tuple[int, int]
-            ``(ny, nx)`` of the common k-space grid.
-        spacing : tuple[float, float]
-            ``(dy, dx)`` per-cell spacing of the common grid, in whatever
-            **common** physical unit all samples should be compared in
-            (typically μm). This is the same ``spacing`` used by
-            :func:`radial_bin_spectrum` so radial bins come out in cycles per
-            that unit.
-        unit_scales : sequence of float, optional
-            Per-sample multiplier that converts each sample's raw ``coords``
-            into the common unit of ``spacing``. For example, if sample A's
-            coords are already in μm and sample B's coords are in Visium
-            full-res pixels at 0.35 μm/pixel, pass ``unit_scales=[1.0, 0.35]``
-            with ``spacing`` in μm. Default: ``[1.0] * n_samples``.
-        feature_mode, n_radial_bins, center, freq_edges
-            Same meaning as in the default constructor.
-        eps : float, default 1e-6
-            NUFFT tolerance.
-
-        Returns
-        -------
-        SpectralComparator
-            A fresh instance in ``mode='nufft'``. Call :meth:`fit` as usual
-            to populate :attr:`spectra_` / :attr:`dc_`.
-
-        Raises
-        ------
-        ValueError
-            If inputs have inconsistent shapes, or ``unit_scales`` has a
-            wrong length.
-        """
-        if len(coords) != len(values):
-            raise ValueError(
-                f"coords and values must have the same length; got {len(coords)} vs {len(values)}."
-            )
-        n_samples = len(coords)
         groups = np.asarray(groups)
         if groups.shape != (n_samples,):
             raise ValueError(f"groups length {groups.shape} does not match n_samples={n_samples}.")
         if np.unique(groups).size != 2:
             raise ValueError("groups must contain exactly two distinct labels.")
-        n_genes = len(gene_names)
-        for i, (c_i, v_i) in enumerate(zip(coords, values, strict=True)):
-            if c_i.ndim != 2 or c_i.shape[1] != 2:
-                raise ValueError(f"coords[{i}] must be shape (N, 2), got {c_i.shape}.")
-            if v_i.ndim != 2 or v_i.shape != (c_i.shape[0], n_genes):
+
+        mode, resolved_gene_names = self._detect_mode_and_genes(
+            samples_list, gene_names, layer=layer, table_key=table_key
+        )
+
+        self.center: str | None = center
+        self.groups: np.ndarray = groups
+        self.gene_names: list[str] = list(resolved_gene_names)
+        self.feature_mode: str = feature_mode
+        self.n_radial_bins: int = int(n_radial_bins)
+        self.fft_solver: str = fft_solver
+        self.workers: int | None = workers
+        self.freq_edges: np.ndarray | None = (
+            None if freq_edges is None else np.asarray(freq_edges, dtype=float)
+        )
+        self.mode: str = mode
+        self.samples: list[Any] = samples_list
+        self._layer = layer
+        self._table_key = table_key
+        self._coordinates_key = coordinates_key
+        self._nufft_eps = float(eps)
+
+        # Populated in _prepare_* below.
+        self.spectra_: np.ndarray | None = None
+        self.dc_: np.ndarray | None = None
+        self.rotation_angles_: np.ndarray | None = None
+        self._raw_2d_spectra: list[np.ndarray] | None = None
+        self._grid_shapes: list[tuple[int, int]] = []
+        self.spacings: list[tuple[float, float]] | None = None
+
+        # NUFFT-only fields; unused in FFT mode.
+        self._coords: list[np.ndarray] | None = None
+        self._unit_scales: list[float] | None = None
+
+        if self.mode == "nufft":
+            self._prepare_nufft_inputs(
+                unit_scales=unit_scales,
+                grid_shape=grid_shape,
+                spacing=spacing,
+            )
+        else:  # fft / SpatialData
+            self._prepare_fft_inputs(grid_shape=grid_shape, spacing=spacing)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _detect_mode_and_genes(
+        samples_list: list[Any],
+        gene_names: Sequence[str] | None,
+        *,
+        layer: str | None,
+        table_key: str | None,
+    ) -> tuple[str, list[str]]:
+        """Determine which backend to use and resolve gene_names from the first sample."""
+        import anndata as _ad
+        import spatialdata as _sd
+
+        is_anndata = all(isinstance(s, _ad.AnnData) for s in samples_list)
+        is_spatialdata = all(isinstance(s, _sd.SpatialData) for s in samples_list)
+        if not (is_anndata or is_spatialdata):
+            raise TypeError(
+                "samples must be a list of all AnnData (→ NUFFT backend) or "
+                "all SpatialData (→ FFT backend). Mixed lists and other "
+                "types are not supported."
+            )
+
+        if is_anndata:
+            first = samples_list[0]
+            if gene_names is None:
+                gene_names = list(first.var_names)
+            # Validate consistent gene axis (names must all match).
+            for i, s in enumerate(samples_list):
+                if list(s.var_names) != list(gene_names):
+                    raise ValueError(
+                        f"sample {i} has var_names that do not match the reference "
+                        "(all AnnData samples must share the same gene axis)."
+                    )
+                if layer is not None and layer not in s.layers:
+                    raise KeyError(f"sample {i} is missing layer '{layer}'.")
+            return "nufft", list(gene_names)
+
+        # SpatialData path — gene names live on the requested table.
+        first = samples_list[0]
+        table = _sd_get_table(first, table_key)
+        if gene_names is None:
+            gene_names = list(table.var_names)
+        for i, s in enumerate(samples_list):
+            tbl = _sd_get_table(s, table_key)
+            if list(tbl.var_names) != list(gene_names):
                 raise ValueError(
-                    f"values[{i}] must be shape (N={c_i.shape[0]}, n_genes={n_genes}), "
-                    f"got {v_i.shape}."
+                    f"sample {i}'s table has var_names that do not match the reference."
                 )
+        return "fft", list(gene_names)
+
+    # ------------------------------------------------------------------
+    def _prepare_nufft_inputs(
+        self,
+        *,
+        unit_scales: Sequence[float] | None,
+        grid_shape: tuple[int, int] | None,
+        spacing: tuple[float, float] | None,
+    ) -> None:
+        """AnnData path: pull coords per sample, auto-infer per-sample
+        (grid_shape, spacing) when unset, keep .X references for per-gene
+        lazy densification inside the spectrum loop."""
+        from quadsv.nufft import _infer_grid_from_coords
+
+        n_samples = len(self.samples)
         if unit_scales is None:
             unit_scales = [1.0] * n_samples
         if len(unit_scales) != n_samples:
             raise ValueError(
                 f"unit_scales length {len(unit_scales)} does not match n_samples={n_samples}."
             )
-
-        # Construct the instance WITHOUT running __init__'s sample-shape checks.
-        # We need the same attribute layout, populated with NUFFT metadata.
-        self = cls.__new__(cls)
-        if feature_mode not in ("radial", "2d"):
-            raise ValueError(f"feature_mode must be 'radial' or '2d', got '{feature_mode}'.")
-        if center not in ("mean", "zscore", None):
-            raise ValueError(f"center must be 'mean', 'zscore', or None, got {center!r}.")
-
-        self.samples: list[np.ndarray] = []  # not used in nufft mode
-        self.groups = groups
-        self.gene_names = list(gene_names)
-        self.feature_mode = feature_mode
-        self.n_radial_bins = int(n_radial_bins)
-        self.fft_solver = "fft2"  # NUFFT output is full-spectrum; match that layout
-        self.workers = None
-        self.center = center
-        self.spacings = [tuple(float(v) for v in spacing)] * n_samples
-        self.freq_edges = None if freq_edges is None else np.asarray(freq_edges, dtype=float)
-        self.spectra_ = None
-        self.dc_ = None
-        self.rotation_angles_ = None
-        self._raw_2d_spectra = None
-        self._grid_shapes = [tuple(int(v) for v in grid_shape)] * n_samples
-
-        self.mode = "nufft"
-        self._coords = [np.asarray(c, dtype=np.float64) for c in coords]
-        self._values = [np.asarray(v, dtype=np.float64) for v in values]
         self._unit_scales = [float(s) for s in unit_scales]
-        self._nufft_grid_shape = (int(grid_shape[0]), int(grid_shape[1]))
-        self._nufft_spacing = (float(spacing[0]), float(spacing[1]))
-        self._nufft_eps = float(eps)
-        return self
+
+        coords_list: list[np.ndarray] = []
+        grids: list[tuple[int, int]] = []
+        spacings: list[tuple[float, float]] = []
+        for i, ad_s in enumerate(self.samples):
+            if self._coordinates_key not in ad_s.obsm:
+                raise KeyError(
+                    f"sample {i} has no obsm['{self._coordinates_key}']; "
+                    f"available: {list(ad_s.obsm.keys())}."
+                )
+            c = np.asarray(ad_s.obsm[self._coordinates_key], dtype=np.float64)
+            if c.ndim != 2 or c.shape[1] != 2:
+                raise ValueError(
+                    f"sample {i} obsm['{self._coordinates_key}'] must be (N, 2), got {c.shape}."
+                )
+            coords_list.append(c)
+            if grid_shape is not None and spacing is not None:
+                gs_i = (int(grid_shape[0]), int(grid_shape[1]))
+                sp_i = (float(spacing[0]), float(spacing[1]))
+            else:
+                gs_i, sp_i = _infer_grid_from_coords(c * self._unit_scales[i], oversample=2.0)
+            grids.append(gs_i)
+            spacings.append(sp_i)
+
+        self._coords = coords_list
+        self._grid_shapes = grids
+        self.spacings = spacings
+
+    # ------------------------------------------------------------------
+    def _prepare_fft_inputs(
+        self,
+        *,
+        grid_shape: tuple[int, int] | None,
+        spacing: tuple[float, float] | None,
+    ) -> None:
+        """SpatialData path: lock in per-sample grid_shape / spacing. Actual
+        rasterization happens lazily in :meth:`fit` to keep construction
+        cheap and avoid holding dense arrays before necessary."""
+        grids: list[tuple[int, int]] = []
+        spacings: list[tuple[float, float]] = []
+        for sd_s in self.samples:
+            gs_i, sp_i = _sd_infer_grid_and_spacing(
+                sd_s,
+                table_key=self._table_key,
+                override_shape=grid_shape,
+                override_spacing=spacing,
+            )
+            grids.append(gs_i)
+            spacings.append(sp_i)
+        self._grid_shapes = grids
+        self.spacings = spacings
 
     # ------------------------------------------------------------------
     def _compute_nufft_spectra(self, n_jobs: int = -1) -> tuple[list[np.ndarray], np.ndarray]:
-        """NUFFT equivalent of the FFT-mode per-sample spectrum pass. Returns
-        ``(raw_2d_spectra, dc)`` with the same layout as the FFT path."""
+        """NUFFT per-sample spectrum pass. Reads expression **one gene column at
+        a time** from each AnnData — never densifies the full ``.X`` slab.
+
+        Returns ``(raw_2d_spectra, dc)`` with the same layout as the FFT path.
+        """
         from quadsv.nufft import power_spectrum_2d_nufft
 
         def _one(i: int) -> tuple[np.ndarray, np.ndarray]:
+            adata = self.samples[i]
             pts = self._coords[i]
-            vals = self._values[i]  # (N, n_genes)
             scale = self._unit_scales[i]
+            grid_i = self._grid_shapes[i]
+            spacing_i = self.spacings[i]
 
-            # DC = mean expression per gene at the real (non-uniform) spots.
-            dc = vals.mean(axis=0)
+            X_src = adata.X if self._layer is None else adata.layers[self._layer]
+            n_genes = len(self.gene_names)
+            # Per-sample DC (means) can be pulled without densifying.
+            if sp.issparse(X_src):
+                dc = np.asarray(X_src.mean(axis=0)).ravel()
+                # E[X^2] - E[X]^2 for per-gene std (zscore path).
+                if self.center == "zscore":
+                    sq = X_src.multiply(X_src)
+                    sq_mean = np.asarray(sq.mean(axis=0)).ravel()
+                    sd = np.sqrt(np.maximum(sq_mean - dc**2, 0.0))
+                    sd = np.clip(sd, 1e-12, None)
+                else:
+                    sd = None
+                X_csc = X_src.tocsc()
+            else:
+                dc = np.asarray(X_src, dtype=np.float64).mean(axis=0)
+                sd = (
+                    np.clip(np.asarray(X_src, dtype=np.float64).std(axis=0), 1e-12, None)
+                    if self.center == "zscore"
+                    else None
+                )
+                X_csc = None  # dense path
 
-            centered = vals - dc if self.center == "mean" else vals
-            if self.center == "zscore":
-                sd = vals.std(axis=0)
-                sd = np.clip(sd, 1e-12, None)
-                centered = (vals - dc) / sd
+            ny, nx = grid_i
+            spec_stack = np.empty((n_genes, ny, nx), dtype=np.float64)
 
-            spec = power_spectrum_2d_nufft(
-                pts,
-                centered,
-                grid_shape=self._nufft_grid_shape,
-                spacing=self._nufft_spacing,
-                unit_scale=scale,
-                eps=self._nufft_eps,
-                center_coords=True,
-            )  # shape (ny, nx, n_genes)
-            # Conform to (n_genes, ny, nx) like compute_sample_spectrum.
-            return np.moveaxis(spec, -1, 0), dc
+            # Densify one gene column at a time, NUFFT it, discard.
+            for g in range(n_genes):
+                if X_csc is not None:
+                    col = np.asarray(X_csc[:, g].toarray(), dtype=np.float64).ravel()
+                else:
+                    col = np.asarray(X_src[:, g], dtype=np.float64).ravel()
+
+                if self.center == "mean":
+                    col = col - dc[g]
+                elif self.center == "zscore":
+                    col = (col - dc[g]) / sd[g]
+                # center=None: leave untouched.
+
+                p_g = power_spectrum_2d_nufft(
+                    pts,
+                    col,
+                    grid_shape=grid_i,
+                    spacing=spacing_i,
+                    unit_scale=scale,
+                    eps=self._nufft_eps,
+                    center_coords=True,
+                )
+                # p_g is (ny, nx) for a 1D input.
+                spec_stack[g] = p_g
+            return spec_stack, dc
 
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_one)(i) for i in range(len(self._coords))
+            delayed(_one)(i) for i in range(len(self.samples))
+        )
+        raw_2d = [r[0] for r in results]
+        dc = np.stack([r[1] for r in results], axis=0)
+        return raw_2d, dc
+
+    # ------------------------------------------------------------------
+    def _compute_fft_spectra(self, n_jobs: int = -1) -> tuple[list[np.ndarray], np.ndarray]:
+        """FFT per-sample spectrum pass for SpatialData inputs. Rasterizes each
+        sample's table to a ``(n_genes, ny, nx)`` block **one gene at a time**
+        when the source table is sparse."""
+
+        def _one(i: int) -> tuple[np.ndarray, np.ndarray]:
+            sd_obj = self.samples[i]
+            shape = self._grid_shapes[i]
+            raster = _rasterize_spatialdata_lazy(
+                sd_obj,
+                grid_shape=shape,
+                table_key=self._table_key,
+                gene_names=self.gene_names,
+            )
+            # raster shape is (n_genes, ny, nx).
+            spec, dc = compute_sample_spectrum(
+                raster,
+                fft_solver=self.fft_solver,
+                workers=self.workers,
+                center=self.center,
+                return_dc=True,
+            )
+            return spec, dc
+
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_one)(i) for i in range(len(self.samples))
         )
         raw_2d = [r[0] for r in results]
         dc = np.stack([r[1] for r in results], axis=0)
@@ -1318,18 +1558,7 @@ class SpectralComparator:
         if self.mode == "nufft":
             self._raw_2d_spectra, self.dc_ = self._compute_nufft_spectra(n_jobs=n_jobs)
         else:
-            results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(compute_sample_spectrum)(
-                    s,
-                    fft_solver=self.fft_solver,
-                    workers=self.workers,
-                    center=self.center,
-                    return_dc=True,
-                )
-                for s in self.samples
-            )
-            self._raw_2d_spectra = [r[0] for r in results]
-            self.dc_ = np.stack([r[1] for r in results], axis=0)  # (n_samples, n_genes)
+            self._raw_2d_spectra, self.dc_ = self._compute_fft_spectra(n_jobs=n_jobs)
 
         if self.feature_mode == "2d":
             aligned, angles = align_spectra_by_rotation(
@@ -1356,15 +1585,17 @@ class SpectralComparator:
 
         # Reduce to per-sample feature matrices of shape (n_genes, K) and stack.
         feats = []
-        for i, (sp, shape) in enumerate(zip(self._raw_2d_spectra, self._grid_shapes, strict=True)):
+        for i, (spec_i, shape) in enumerate(
+            zip(self._raw_2d_spectra, self._grid_shapes, strict=True)
+        ):
             if self.feature_mode == "radial":
-                spacing = self.spacings[i] if self.spacings is not None else None
+                spacing_i = self.spacings[i] if self.spacings is not None else None
                 f = radial_bin_spectrum(
-                    sp,
+                    spec_i,
                     grid_shape=shape,
                     n_bins=self.n_radial_bins,
                     fft_solver=self.fft_solver,
-                    spacing=spacing,
+                    spacing=spacing_i,
                     edges=self.freq_edges,
                 )
             else:
@@ -1373,7 +1604,7 @@ class SpectralComparator:
                 # parameter as a low-pass cutoff). This keeps K manageable.
                 ny, nx = shape
                 k = min(self.n_radial_bins, ny // 2, nx // 2)
-                low = sp[:, :k, :k] if sp.shape[-1] > k else sp[:, :k, :]
+                low = spec_i[:, :k, :k] if spec_i.shape[-1] > k else spec_i[:, :k, :]
                 f = low.reshape(low.shape[0], -1)
             feats.append(f)
         # Resample to common K (samples may differ slightly due to truncation).

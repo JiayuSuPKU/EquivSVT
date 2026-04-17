@@ -187,6 +187,96 @@ class Kernel(ABC):
         self._spectrum = np.sort(vals)[::-1]  # always store descending
         return self._spectrum if k_orig is None else self._spectrum[:k_orig]
 
+    def Kx(self, x: np.ndarray | sp.spmatrix) -> np.ndarray:
+        """
+        Apply the kernel operator to ``x``, returning ``K @ x``.
+
+        This is the single public primitive for kernel–vector products. It
+        handles the explicit case (dense or sparse kernel matrix stored in
+        ``_K``) and the implicit case (precision matrix stored in ``_K``;
+        a cached LU factorization is used to solve ``K^{-1} y = x``). Callers
+        that need a quadratic or bilinear form should go through
+        :meth:`xtKx` or :meth:`xtKy` instead of calling :meth:`Kx` twice.
+
+        Parameters
+        ----------
+        x : np.ndarray or scipy.sparse matrix
+            Input vector of shape ``(N,)`` or batch ``(N, M)``. Sparse inputs
+            are densified internally because the downstream solvers / BLAS
+            paths require dense RHS.
+
+        Returns
+        -------
+        np.ndarray
+            ``K @ x`` with the same number of columns as ``x``; shape
+            ``(N,)`` if ``x`` was 1D, otherwise ``(N, M)``.
+        """
+        if sp.issparse(x):
+            x_in = x.toarray()
+        else:
+            x_in = np.asarray(x)
+
+        squeeze = x_in.ndim == 1
+        if squeeze:
+            x_in = x_in.reshape(-1, 1)
+
+        if self.is_implicit:
+            # _K is the precision matrix M = K^{-1}; solve M y = x.
+            if sp.issparse(self._K):
+                with self._lu_lock:
+                    if self._lu is None:
+                        self._lu = splu(self._K.tocsc())
+                y = self._lu.solve(x_in)
+            else:
+                with self._lu_lock:
+                    if self._lu is None:
+                        self._lu = lu_factor(self._K)
+                y = lu_solve(self._lu, x_in)
+        else:
+            # Explicit: K is stored directly; dispatch to sparse or dense matmul.
+            y = self._K.dot(x_in)
+            if sp.issparse(y):  # pragma: no cover (sparse @ dense is dense today)
+                y = np.asarray(y.todense())
+
+        return y.ravel() if squeeze else np.asarray(y)
+
+    def xtKy(self, x: np.ndarray | sp.spmatrix, y: np.ndarray | sp.spmatrix) -> float | np.ndarray:
+        """
+        Bilinear form ``x^T K y`` at the kernel's coordinates.
+
+        For a single pair of vectors returns a scalar; for batched inputs
+        ``(N, M)`` returns the *paired* diagonal — ``sum(x_i * (K y)_i, axis=0)``
+        of shape ``(M,)`` — matching the convention used by
+        :func:`quadsv.spatial_r_test`.
+
+        Parameters
+        ----------
+        x, y : np.ndarray or scipy.sparse matrix
+            Input vectors of shape ``(N,)`` or batches of shape ``(N, M)``.
+            Must share the same leading dimension ``N = self.n``.
+
+        Returns
+        -------
+        float or np.ndarray
+            Scalar if both inputs are 1D; shape ``(M,)`` when batched.
+        """
+        if sp.issparse(x):
+            x_dense = np.asarray(x.toarray())
+        else:
+            x_dense = np.asarray(x)
+
+        Ky = self.Kx(y)
+
+        if x_dense.ndim == 1 and Ky.ndim == 1:
+            return float(np.dot(x_dense, Ky))
+
+        x_mat = x_dense.reshape(-1, 1) if x_dense.ndim == 1 else x_dense
+        Ky_mat = Ky.reshape(-1, 1) if Ky.ndim == 1 else Ky
+        out = np.sum(x_mat * Ky_mat, axis=0)
+        if out.size == 1:
+            return float(out.item())
+        return out
+
     def xtKx(self, x: np.ndarray | sp.spmatrix) -> float | np.ndarray:  # noqa: C901
         """
         Efficiently compute the quadratic form x^T K x.

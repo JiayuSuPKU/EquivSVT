@@ -493,6 +493,79 @@ class FFTKernel:
         # Unwrap if M=1
         return Q.item() if M == 1 else Q.ravel()
 
+    def Kx(self, x: np.ndarray) -> np.ndarray:
+        """
+        Apply the kernel operator to ``x`` via FFT in O(N log N).
+
+        Implemented as ``K x = F^{-1}(λ · F(x))`` where ``λ`` is the full
+        eigenvalue spectrum on the torus. The result is returned on the
+        spatial grid (not the feature-axis first layout used by
+        :class:`NUFFTKernel`); callers that want a quadratic / bilinear form
+        should prefer :meth:`xtKx` / :meth:`xtKy`, which avoid the inverse
+        FFT by using Parseval's theorem.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Grid signal of shape ``(ny, nx)`` or ``(ny, nx, M)``.
+
+        Returns
+        -------
+        np.ndarray
+            ``K @ x`` with the same shape as ``x``.
+        """
+        x = np.asarray(x)
+        squeeze = x.ndim == 2
+        if squeeze:
+            x = x[..., np.newaxis]
+
+        ny, nx, M = x.shape
+        if ny != self.ny or nx != self.nx:
+            raise ValueError(
+                f"Data shape ({ny}, {nx}) does not match kernel ({self.ny}, {self.nx})"
+            )
+
+        if self.fft_solver == "fft2":
+            x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=self.workers)
+            lam = self.spectrum.reshape(ny, nx, 1)
+            out = np.real(scipy.fft.ifft2(lam * x_hat, axes=(0, 1), workers=self.workers))
+        else:
+            x_hat = scipy.fft.rfft2(x, axes=(0, 1), workers=self.workers)
+            lam = self.spectrum.reshape(ny, nx // 2 + 1, 1)
+            out = scipy.fft.irfft2(lam * x_hat, s=(ny, nx), axes=(0, 1), workers=self.workers)
+
+        return out[..., 0] if squeeze else out
+
+    def xtKy(self, x: np.ndarray, y: np.ndarray) -> float | np.ndarray:
+        """
+        Bilinear form ``x^T K y`` on the grid via Parseval's theorem.
+
+        Parameters
+        ----------
+        x, y : np.ndarray
+            Grid signals of shape ``(ny, nx)`` or ``(ny, nx, M)``. Both must
+            have the same shape.
+
+        Returns
+        -------
+        float or np.ndarray
+            Scalar if inputs are 2D; shape ``(M,)`` if 3D.
+        """
+        x = np.asarray(x)
+        y = np.asarray(y)
+        if x.shape != y.shape:
+            raise ValueError(f"x and y must share shape; got {x.shape} vs {y.shape}.")
+        squeeze = x.ndim == 2
+        if squeeze:
+            x = x[..., np.newaxis]
+            y = y[..., np.newaxis]
+        ny, nx, _ = x.shape
+        R_sum = _spectral_cross_product(x, y, self, ny, nx)
+        R = R_sum / (ny * nx)
+        if squeeze:
+            return float(R.item()) if R.size == 1 else R.ravel()
+        return R.ravel()
+
     def eigenvalues(self, k: int | None = None, return_full: bool = False) -> np.ndarray:
         """
         Get the eigenvalues of the kernel matrix.
@@ -567,8 +640,12 @@ class FFTKernel:
         return np.sum(self.eigenvalues(return_full=True) ** 2)
 
 
-def spatial_q_test_fft(
-    Xn: np.ndarray, kernel: FFTKernel, return_pval: bool = True, is_standardized: bool = False
+def spatial_q_test_fft(  # noqa: C901
+    Xn: np.ndarray,
+    kernel: FFTKernel,
+    null_params: dict | None = None,
+    return_pval: bool = True,
+    is_standardized: bool = False,
 ) -> float | np.ndarray | tuple[float, float] | tuple[np.ndarray, np.ndarray]:
     """
     FFT-accelerated spatial Q-test for grid data.
@@ -584,6 +661,14 @@ def spatial_q_test_fft(
         Order follows kernel dimensions. Will be automatically reshaped to 3D if 2D.
     kernel : FFTKernel
         Pre-constructed FFT kernel object for grid data.
+    null_params : dict, optional
+        Pre-computed null distribution parameters from
+        :func:`quadsv.statistics.compute_null_params`. When supplied, the
+        cached ``eigenvalues`` / ``mean_Q`` / ``var_Q`` entries are reused
+        in the p-value stage to avoid recomputing the spectrum on every
+        call — useful when running the same kernel against many features
+        (e.g., in :class:`quadsv.PatternDetectorFFT`). If None, the
+        spectrum and moments are computed on the fly.
     return_pval : bool, default True
         If True, returns (Q, pval) tuple; if False, returns Q only.
     is_standardized : bool, default False
@@ -657,13 +742,21 @@ def spatial_q_test_fft(
     if not return_pval:
         return Q
 
-    # 3. P-value approximation
+    # 3. P-value approximation. Moran's I has negative eigenvalues → Normal (CLT);
+    # every other FFT kernel uses Liu's chi-squared mixture. When `null_params`
+    # is supplied by the caller (detector loops, etc.), reuse its cached
+    # `mean_Q` / `var_Q` / `eigenvalues` so the expensive spectrum traversal
+    # doesn't happen once per feature.
 
     # Use clt approximation (Normal) for Moran's I since it has negative eigenvalues
     if kernel.method in ["moran"]:
         # Under null, Q ~ N(mean_Q, var_Q)
-        mean_Q = kernel.trace()
-        var_Q = 2.0 * kernel.square_trace()
+        if null_params is not None and "mean_Q" in null_params and "var_Q" in null_params:
+            mean_Q = float(null_params["mean_Q"])
+            var_Q = float(null_params["var_Q"])
+        else:
+            mean_Q = kernel.trace()
+            var_Q = 2.0 * kernel.square_trace()
 
         if np.ndim(Q) == 0:
             sigma = np.sqrt(var_Q)
@@ -677,14 +770,16 @@ def spatial_q_test_fft(
         return Q, pval
 
     # For other kernels, use Liu's method
-    evals = kernel.eigenvalues(return_full=True)
-    if evals.min() < -0.1:
-        raise ValueError(
-            "Kernel has significant negative eigenvalues; Liu's method may be invalid."
-        )
-
-    # Filter numerical noise
-    sig_evals = evals[evals > 1e-9]
+    if null_params is not None and "eigenvalues" in null_params:
+        sig_evals = np.asarray(null_params["eigenvalues"], dtype=float)
+    else:
+        evals = kernel.eigenvalues(return_full=True)
+        if evals.min() < -0.1:
+            raise ValueError(
+                "Kernel has significant negative eigenvalues; Liu's method may be invalid."
+            )
+        # Filter numerical noise
+        sig_evals = evals[evals > 1e-9]
 
     if np.ndim(Q) == 0:
         pval = liu_sf(Q, sig_evals)
@@ -730,6 +825,7 @@ def spatial_r_test_fft(
     Xn: np.ndarray,
     Yn: np.ndarray,
     kernel: FFTKernel,
+    null_params: dict | None = None,
     return_pval: bool = True,
     is_standardized: bool = False,
 ) -> float | np.ndarray | tuple[float, float] | tuple[np.ndarray, np.ndarray]:
@@ -748,6 +844,11 @@ def spatial_r_test_fft(
         Second input tensor. Must have the same shape as Xn.
     kernel : FFTKernel
         Pre-constructed FFT kernel object for grid data.
+    null_params : dict, optional
+        Pre-computed null parameters from
+        :func:`quadsv.statistics.compute_null_params`. Only the
+        ``var_R = trace(K²)`` entry is consumed here; when None, it is
+        computed on the fly from ``kernel.square_trace()``.
     return_pval : bool, default True
         If True, returns (R, pval) tuple; if False, returns R only.
     is_standardized : bool, default False
@@ -824,10 +925,14 @@ def spatial_r_test_fft(
     if not return_pval:
         return R
 
-    # 3. P-values (Normal Approximation)
-    # Assume x, y are effectively N(0, I) white noise.
-    # Variance of R is Trace(K^2) = sum(lambda^2)
-    sigma = np.sqrt(kernel.square_trace())
+    # 3. P-values (Normal Approximation). R is Normal under H₀ with
+    # variance trace(K²); honor a precomputed `var_R` if the caller
+    # supplied null_params.
+    if null_params is not None and "var_R" in null_params:
+        var_R = float(null_params["var_R"])
+    else:
+        var_R = float(kernel.square_trace())
+    sigma = np.sqrt(var_R)
 
     if sigma > 1e-12:
         z_scores = R / sigma

@@ -5,8 +5,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-finufft = pytest.importorskip("finufft", reason="NUFFT tests require finufft")
-
 from quadsv import SpectralComparator
 from quadsv.fft import power_spectrum_2d
 from quadsv.nufft import power_spectrum_2d_nufft
@@ -447,14 +445,14 @@ class TestNUFFTKernelxtKx:
 
 class TestNUFFTKernelKz:
     def test_Kz_consistent_with_xtKx(self):
-        """z^T K z computed via z·Kz(z) should match the direct xtKx(z) call."""
+        """z^T K z computed via z·Kx(z) should match the direct xtKx(z) call."""
         ny, nx = 16, 20
         yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
         coords = np.stack([yy.ravel(), xx.ravel()], axis=1).astype(float)
         k_nufft = NUFFTKernel(coords, (ny, nx), (1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5)
         rng = np.random.default_rng(0)
         z = rng.standard_normal(ny * nx)
-        Kz = k_nufft.Kz(z)
+        Kz = k_nufft.Kx(z)
         assert Kz.shape == (ny * nx,)
         assert abs(float(z @ Kz) - k_nufft.xtKx(z)) < 1e-4
 
@@ -464,11 +462,11 @@ class TestNUFFTKernelKz:
         coords = rng.uniform(0, 15, size=(N, 2))
         k = NUFFTKernel(coords, (32, 32), (0.5, 0.5), method="matern", bandwidth=1.5, nu=1.5)
         Z = rng.standard_normal((N, M))
-        KZ = k.Kz(Z)
+        KZ = k.Kx(Z)
         assert KZ.shape == (N, M)
         # Column-by-column check.
         for m in range(M):
-            np.testing.assert_allclose(KZ[:, m], k.Kz(Z[:, m]), rtol=1e-6, atol=1e-8)
+            np.testing.assert_allclose(KZ[:, m], k.Kx(Z[:, m]), rtol=1e-6, atol=1e-8)
 
 
 class TestNUFFTKernelTrace:
@@ -558,17 +556,18 @@ class TestSpatialRTestNUFFT:
 # ---------------------------------------------------------------------------
 
 
-class TestPatternDetectorNUFFT:
+class TestPatternDetectorNUFFTBackend:
+    """After Phase C, PatternDetectorNUFFT is gone — the same workflow runs
+    through :class:`PatternDetector` with ``backend='nufft'``."""
+
     def _mk_adata(self, n_spots=400, n_genes=10, with_signal=True, seed=0):
         import anndata as ad
 
         rng = np.random.default_rng(seed)
         coords = rng.uniform(0, 20, size=(n_spots, 2))
-        # Build expression: one gene carries a spatial signal, others are noise.
         X = rng.standard_normal((n_spots, n_genes))
         if with_signal:
             X[:, 0] = np.sin(2 * np.pi * coords[:, 0] / 5.0) + 0.3 * rng.standard_normal(n_spots)
-        # Shift to positive and round-up so nnz-per-gene is high.
         X = np.maximum(X + 3.0, 0.0)
         gene_names = [f"g{i}" for i in range(n_genes)]
         adata = ad.AnnData(X=X)
@@ -577,40 +576,30 @@ class TestPatternDetectorNUFFT:
         return adata
 
     def test_build_and_qstat(self):
-        from quadsv import PatternDetectorNUFFT
+        from quadsv import PatternDetector
 
         adata = self._mk_adata(n_spots=400, n_genes=8, with_signal=True)
-        det = PatternDetectorNUFFT(adata).build_kernel(
-            method="matern",
-            bandwidth=2.0,
-            nu=1.5,
+        det = PatternDetector(adata).build_kernel(
+            backend="nufft", method="matern", bandwidth=2.0, nu=1.5
         )
         assert det.kernel_ is not None
         assert det.kernel_method_ == "matern"
+        assert det.backend_ == "nufft"
         df = det.compute_qstat(n_jobs=1)
         assert df.shape[0] == 8
         assert {"Feature", "Q", "Z_score", "P_value", "P_adj"} <= set(df.columns)
-        # g0 carries the implanted signal and should rank first.
         assert df["Feature"].iloc[0] == "g0"
         assert df.set_index("Feature").loc["g0", "P_value"] < 0.05
 
     def test_rstat_on_correlated_pair(self):
-        from quadsv import PatternDetectorNUFFT
+        from quadsv import PatternDetector
 
         adata = self._mk_adata(n_spots=400, n_genes=4, with_signal=True)
-        # Copy g0 into g1 with noise so the pair correlates spatially.
         adata.X[:, 1] = adata.X[:, 0] + 0.3 * np.random.default_rng(1).standard_normal(adata.n_obs)
-        det = PatternDetectorNUFFT(adata).build_kernel(
-            method="matern",
-            bandwidth=2.0,
-            nu=1.5,
+        det = PatternDetector(adata).build_kernel(
+            backend="nufft", method="matern", bandwidth=2.0, nu=1.5
         )
-        df = det.compute_rstat(
-            features_x=["g0", "g1"],
-            features_y=["g0", "g1"],
-            n_jobs=1,
-        )
-        # Same-gene diagonals should be the biggest; (g0, g1) should be significant.
+        df = det.compute_rstat(features_x=["g0", "g1"], features_y=["g0", "g1"], n_jobs=1)
         row = df[(df.Feature_1 == "g0") & (df.Feature_2 == "g1")]
         assert not row.empty
         assert float(row.iloc[0]["R"]) > 0
@@ -618,16 +607,57 @@ class TestPatternDetectorNUFFT:
     def test_invalid_spatial_key(self):
         import anndata as ad
 
-        from quadsv import PatternDetectorNUFFT
+        from quadsv import PatternDetector
 
         adata = ad.AnnData(X=np.zeros((5, 3)))
+        det = PatternDetector(adata)
         with pytest.raises(KeyError, match="spatial"):
-            PatternDetectorNUFFT(adata)
+            det.build_kernel(backend="nufft", method="matern")
 
     def test_requires_build_kernel(self):
-        from quadsv import PatternDetectorNUFFT
+        from quadsv import PatternDetector
 
         adata = self._mk_adata(n_spots=50, n_genes=3)
-        det = PatternDetectorNUFFT(adata)
-        with pytest.raises(RuntimeError, match="build_kernel"):
+        det = PatternDetector(adata)
+        with pytest.raises(ValueError, match="Kernel not initialized"):
             det.compute_qstat(n_jobs=1)
+
+
+class TestPhaseBNUFFTUnification:
+    """Phase B: NUFFT Q/R tests accept the canonical kwargs and honor
+    `null_params` without changing results."""
+
+    def test_qtest_nufft_null_params_round_trip(self):
+        from quadsv.nufft import NUFFTKernel, spatial_q_test_nufft
+
+        rng = np.random.default_rng(0)
+        ny, nx = 16, 16
+        coords = rng.uniform(0, 15, size=(ny * nx, 2))
+        k = NUFFTKernel(coords, (ny, nx), (1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5)
+        z = rng.standard_normal(ny * nx)
+        Q_auto, p_auto = spatial_q_test_nufft(z, k)
+        # Pre-supply rescaled eigenvalues exactly as the internal branch does.
+        scale = k.n / (ny * nx)
+        evals = k.eigenvalues(return_full=True)
+        sig_evals = evals[evals > 1e-9] * scale
+        Q_given, p_given = spatial_q_test_nufft(
+            z, k, null_params={"method": "liu", "eigenvalues": sig_evals}
+        )
+        assert abs(Q_auto - Q_given) < 1e-10
+        assert abs(p_auto - p_given) < 1e-10
+
+    def test_rtest_nufft_null_params_round_trip(self):
+        from quadsv.nufft import NUFFTKernel, spatial_r_test_nufft
+
+        rng = np.random.default_rng(0)
+        ny, nx = 16, 16
+        coords = rng.uniform(0, 15, size=(ny * nx, 2))
+        k = NUFFTKernel(coords, (ny, nx), (1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5)
+        x = rng.standard_normal(ny * nx)
+        y = rng.standard_normal(ny * nx)
+        R_auto, p_auto = spatial_r_test_nufft(x, y, k)
+        scale = k.n / (ny * nx)
+        var_R = float(k.square_trace()) * (scale**2)
+        R_given, p_given = spatial_r_test_nufft(x, y, k, null_params={"var_R": var_R})
+        assert abs(R_auto - R_given) < 1e-10
+        assert abs(p_auto - p_given) < 1e-10

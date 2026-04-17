@@ -2,16 +2,9 @@ from __future__ import annotations
 
 import warnings
 
-# Suppress known deprecation warnings from SpatialData dependencies BEFORE importing anything else
+# Suppress known deprecation warnings from SpatialData dependencies BEFORE importing anything else.
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask DataFrame.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
-
-try:
-    import spatialdata as sd
-except ImportError as e:
-    raise ImportError(
-        "spatialdata is required for PatternDetectorFFT. Please install it via 'pip install spatialdata'."
-    ) from e
 
 import logging
 from typing import Any
@@ -19,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import scipy.fft
+import spatialdata as sd
 from joblib import Parallel, delayed
 from scipy.stats import norm
 from tqdm import tqdm
