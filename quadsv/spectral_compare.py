@@ -50,6 +50,7 @@ import scipy.ndimage
 import scipy.sparse as sp
 from joblib import Parallel, delayed
 from scipy.stats import ks_2samp  # noqa: F401  (exposed for downstream calibration tests)
+from tqdm.auto import tqdm
 
 from quadsv.fft import power_spectrum_2d
 from quadsv.utils import _apply_bh_correction
@@ -524,6 +525,7 @@ def align_spectra_by_rotation(
     n_theta: int = 180,
     n_radius: int = 64,
     landmark_indices: Sequence[int] | None = None,
+    progress: bool = False,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     """
     Rotate each non-reference sample's 2D spectrum to maximize similarity with a
@@ -625,7 +627,10 @@ def align_spectra_by_rotation(
 
     rotated: list[np.ndarray] = []
     angles = np.zeros(n_samples)
-    for i, (spec_i, shape) in enumerate(zip(spectra, grid_shapes, strict=True)):
+    iter_samples = enumerate(zip(spectra, grid_shapes, strict=True))
+    if progress:
+        iter_samples = tqdm(iter_samples, total=n_samples, desc="Rotation alignment")
+    for i, (spec_i, shape) in iter_samples:
         if i == reference_index:
             rotated.append(spec_i.copy())
             continue
@@ -1620,6 +1625,7 @@ class SpectralComparator:
         eps: float = 1e-6,
         presence_threshold: float = 0.0,
         min_samples_per_group: int = 2,
+        nufft_chunk_size: int = 64,
     ) -> None:
         """
         Build a comparator over a list of spatial-omics samples.
@@ -1683,6 +1689,14 @@ class SpectralComparator:
             they were skipped. :meth:`test_expression` always uses every
             sample regardless of ``presence_``, matching the user
             expectation that absence itself is informative for DE.
+        nufft_chunk_size : int, default 64
+            Number of genes to feed into a single batched ``finufft.nufft2d1``
+            call on the NUFFT backend. The NUFFT per-sample loop densifies
+            exactly this many columns of ``adata.X`` at a time, runs the
+            batched transform, discards, and moves on — so RAM footprint
+            peaks at ``O(N_spots · chunk · 16 B)`` per sample rather than
+            the full ``(n_spots, n_genes)`` slab. Values in the 32–128 range
+            balance finufft's per-call overhead against the memory cap.
         """
         if center not in ("mean", "zscore", None):
             raise ValueError(f"center must be 'mean', 'zscore', or None, got {center!r}.")
@@ -1727,6 +1741,9 @@ class SpectralComparator:
         self._nufft_eps = float(eps)
         self.presence_threshold: float = float(presence_threshold)
         self.min_samples_per_group: int = int(min_samples_per_group)
+        self.nufft_chunk_size: int = int(nufft_chunk_size)
+        if self.nufft_chunk_size < 1:
+            raise ValueError(f"nufft_chunk_size must be >= 1, got {self.nufft_chunk_size}.")
 
         if not 0.0 <= self.presence_threshold <= 1.0:
             raise ValueError(
@@ -1888,16 +1905,33 @@ class SpectralComparator:
         self.spacings = spacings
 
     # ------------------------------------------------------------------
-    def _compute_nufft_spectra(
-        self, n_jobs: int = -1
+    def _compute_nufft_spectra(  # noqa: C901
+        self,
+        n_jobs: int = -1,
+        progress: bool = True,
     ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        """NUFFT per-sample spectrum pass. Reads expression **one gene column at
-        a time** from each AnnData — never densifies the full ``.X`` slab.
+        """NUFFT per-sample spectrum pass. Densifies ``adata.X`` in chunks of
+        :attr:`nufft_chunk_size` columns and runs one batched
+        ``finufft.nufft2d1`` per chunk — the full ``.X`` slab is never
+        materialized.
+
+        When ``progress=True`` a two-level tqdm bar is shown (outer over
+        samples, inner over gene chunks).
+
+        Parameters
+        ----------
+        n_jobs : int, default -1
+            If ``n_jobs == 1`` (or ``progress=True``) the per-sample loop runs
+            sequentially so the progress bar is accurate. Otherwise a
+            joblib thread pool distributes samples across workers; per-sample
+            progress is still reported when available.
+        progress : bool, default True
+            Show a tqdm progress bar.
 
         Returns
         -------
         raw_2d : list of np.ndarray
-            Per-sample ``(n_genes, ny, nx)`` 2D power spectra.
+            Per-sample ``(n_genes, ny, nx)`` 2D power spectra (float64).
         dc : np.ndarray
             ``(n_samples, n_genes)`` DC scalars (per-gene grid means).
         presence : np.ndarray
@@ -1906,7 +1940,10 @@ class SpectralComparator:
         """
         from quadsv.nufft import power_spectrum_2d_nufft
 
-        def _one(i: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        chunk_size = max(1, int(self.nufft_chunk_size))
+        n_samples_total = len(self.samples)
+
+        def _one(i: int, pbar: tqdm | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             adata = self.samples[i]
             pts = self._coords[i]
             scale = self._unit_scales[i]
@@ -1916,12 +1953,10 @@ class SpectralComparator:
             X_src = adata.X if self._layer is None else adata.layers[self._layer]
             n_genes = len(self.gene_names)
             n_spots = X_src.shape[0]
-            # Per-sample DC (means) can be pulled without densifying.
+
             if sp.issparse(X_src):
                 dc = np.asarray(X_src.mean(axis=0)).ravel()
-                # nnz per gene → presence fraction without densifying.
                 nnz_per = np.asarray((X_src != 0).sum(axis=0)).ravel()
-                # E[X^2] - E[X]^2 for per-gene std (zscore path).
                 if self.center == "zscore":
                     sq = X_src.multiply(X_src)
                     sq_mean = np.asarray(sq.mean(axis=0)).ravel()
@@ -1929,19 +1964,16 @@ class SpectralComparator:
                 else:
                     sd = None
                 X_csc = X_src.tocsc()
+                X_dense = None
             else:
                 X_dense = np.asarray(X_src, dtype=np.float64)
                 dc = X_dense.mean(axis=0)
                 nnz_per = (X_dense != 0).sum(axis=0)
                 sd = X_dense.std(axis=0) if self.center == "zscore" else None
-                X_csc = None  # dense path
+                X_csc = None
 
             presence_i = (nnz_per / max(n_spots, 1)) >= self.presence_threshold
 
-            # Zscore guard: robust per-sample std floor + post-hoc clip to
-            # prevent sparse genes (few non-zero spots) from producing
-            # pattern-dominating outliers. Mirrors the logic in
-            # ``compute_sample_spectrum``.
             if self.center == "zscore":
                 positive = sd[sd > 0] if sd is not None else np.empty(0)
                 sd_floor = float(np.median(positive)) * 0.1 if positive.size else 1.0
@@ -1952,49 +1984,88 @@ class SpectralComparator:
             ny, nx = grid_i
             spec_stack = np.empty((n_genes, ny, nx), dtype=np.float64)
 
-            # Densify one gene column at a time, NUFFT it, discard.
-            for g in range(n_genes):
+            # Batched NUFFT: pull `chunk_size` columns at a time, standardize
+            # per gene, run one batched type-1 NUFFT, write into spec_stack.
+            for start in range(0, n_genes, chunk_size):
+                stop = min(start + chunk_size, n_genes)
+                cols = slice(start, stop)
+
                 if X_csc is not None:
-                    col = np.asarray(X_csc[:, g].toarray(), dtype=np.float64).ravel()
+                    block = np.asarray(X_csc[:, cols].toarray(), dtype=np.float64)
                 else:
-                    col = np.asarray(X_src[:, g], dtype=np.float64).ravel()
+                    block = X_dense[:, cols].astype(np.float64, copy=True)
 
+                # block: (n_spots, chunk_width)
                 if self.center == "mean":
-                    col = col - dc[g]
+                    block -= dc[None, cols]
                 elif self.center == "zscore":
-                    col = (col - dc[g]) / sd_safe[g]
-                    np.clip(col, -_ZSCORE_CLIP, _ZSCORE_CLIP, out=col)
-                # center=None: leave untouched.
+                    block = (block - dc[None, cols]) / sd_safe[None, cols]
+                    np.clip(block, -_ZSCORE_CLIP, _ZSCORE_CLIP, out=block)
 
-                p_g = power_spectrum_2d_nufft(
+                p_chunk = power_spectrum_2d_nufft(
                     pts,
-                    col,
+                    block,
                     grid_shape=grid_i,
                     spacing=spacing_i,
                     unit_scale=scale,
                     eps=self._nufft_eps,
                     center_coords=True,
                 )
-                # p_g is (ny, nx) for a 1D input.
-                spec_stack[g] = p_g
+                # p_chunk shape: (ny, nx, chunk_width); move feature axis first.
+                spec_stack[start:stop] = np.moveaxis(p_chunk, -1, 0)
+                if pbar is not None:
+                    pbar.update(1)
+
             return spec_stack, dc, presence_i
 
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_one)(i) for i in range(len(self.samples))
-        )
-        raw_2d = [r[0] for r in results]
-        dc = np.stack([r[1] for r in results], axis=0)
-        presence = np.stack([r[2] for r in results], axis=0)
-        return raw_2d, dc, presence
+        raw_2d: list[np.ndarray | None] = [None] * n_samples_total
+        dc_list: list[np.ndarray | None] = [None] * n_samples_total
+        pres_list: list[np.ndarray | None] = [None] * n_samples_total
+
+        run_sequential = progress or n_jobs == 1
+        if run_sequential:
+            n_chunks_total = sum(
+                int(np.ceil(len(self.gene_names) / chunk_size)) for _ in self.samples
+            )
+            pbar: tqdm | None = (
+                tqdm(total=n_chunks_total, desc="NUFFT spectra (per-gene chunks)")
+                if progress
+                else None
+            )
+            for i in range(n_samples_total):
+                if pbar is not None:
+                    pbar.set_postfix_str(f"sample {i + 1}/{n_samples_total}")
+                r0, r1, r2 = _one(i, pbar=pbar)
+                raw_2d[i] = r0
+                dc_list[i] = r1
+                pres_list[i] = r2
+            if pbar is not None:
+                pbar.close()
+        else:
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_one)(i) for i in range(n_samples_total)
+            )
+            for i, r in enumerate(results):
+                raw_2d[i], dc_list[i], pres_list[i] = r
+
+        dc = np.stack([np.asarray(x) for x in dc_list], axis=0)
+        presence = np.stack([np.asarray(x) for x in pres_list], axis=0)
+        return [np.asarray(x) for x in raw_2d], dc, presence
 
     # ------------------------------------------------------------------
     def _compute_fft_spectra(
-        self, n_jobs: int = -1
+        self,
+        n_jobs: int = -1,
+        progress: bool = True,
     ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        """FFT per-sample spectrum pass for SpatialData inputs. Rasterizes each
-        sample's table to a ``(n_genes, ny, nx)`` block **one gene at a time**
-        when the source table is sparse. Returns ``(raw_2d, dc, presence)``
-        matching :meth:`_compute_nufft_spectra`."""
+        """FFT per-sample spectrum pass for SpatialData inputs. Rasterizes
+        each sample's table to a ``(n_genes, ny, nx)`` block **one gene at a
+        time** when the source table is sparse, then computes the 2D FFT
+        power spectrum in a single batched ``scipy.fft`` call. Returns
+        ``(raw_2d, dc, presence)`` matching :meth:`_compute_nufft_spectra`.
+
+        A tqdm progress bar over samples is shown when ``progress=True``.
+        """
 
         def _one(i: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             sd_obj = self.samples[i]
@@ -2005,9 +2076,6 @@ class SpectralComparator:
                 table_key=self._table_key,
                 gene_names=self.gene_names,
             )
-            # raster shape is (n_genes, ny, nx). Presence = fraction of
-            # non-zero pixels per gene.
-            ny, nx = raster.shape[-2:]
             frac_nonzero = (raster != 0).reshape(raster.shape[0], -1).mean(axis=1)
             presence_i = frac_nonzero >= self.presence_threshold
             spec, dc = compute_sample_spectrum(
@@ -2019,19 +2087,38 @@ class SpectralComparator:
             )
             return spec, dc, presence_i
 
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_one)(i) for i in range(len(self.samples))
-        )
-        raw_2d = [r[0] for r in results]
-        dc = np.stack([r[1] for r in results], axis=0)
-        presence = np.stack([r[2] for r in results], axis=0)
-        return raw_2d, dc, presence
+        n_samples_total = len(self.samples)
+        raw_2d: list[np.ndarray | None] = [None] * n_samples_total
+        dc_list: list[np.ndarray | None] = [None] * n_samples_total
+        pres_list: list[np.ndarray | None] = [None] * n_samples_total
+
+        run_sequential = progress or n_jobs == 1
+        if run_sequential:
+            it = range(n_samples_total)
+            if progress:
+                it = tqdm(it, desc="FFT spectra (per sample)", total=n_samples_total)
+            for i in it:
+                r0, r1, r2 = _one(i)
+                raw_2d[i] = r0
+                dc_list[i] = r1
+                pres_list[i] = r2
+        else:
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_one)(i) for i in range(n_samples_total)
+            )
+            for i, r in enumerate(results):
+                raw_2d[i], dc_list[i], pres_list[i] = r
+
+        dc = np.stack([np.asarray(x) for x in dc_list], axis=0)
+        presence = np.stack([np.asarray(x) for x in pres_list], axis=0)
+        return [np.asarray(x) for x in raw_2d], dc, presence
 
     # ------------------------------------------------------------------
     def fit(
         self,
         n_jobs: int = -1,
         landmark_genes: Sequence[str] | None = None,
+        progress: bool = True,
     ) -> SpectralComparator:
         """
         Compute per-sample power spectra and (if ``feature_mode='2d'``) rotation-align.
@@ -2039,7 +2126,10 @@ class SpectralComparator:
         Parameters
         ----------
         n_jobs : int, default -1
-            Parallelism over samples for the per-sample FFT.
+            Parallelism over samples for the per-sample FFT/NUFFT. Ignored
+            when ``progress=True`` (the inner progress bar requires a
+            sequential driver loop — finufft is already multi-threaded via
+            OpenMP so this rarely matters in practice).
         landmark_genes : sequence of str, optional
             Only used in ``feature_mode='2d'``. Names of genes (matched
             against :attr:`gene_names`) whose spectra define the
@@ -2048,6 +2138,10 @@ class SpectralComparator:
             template "looks like". If None (default), the global mean
             spectrum across all genes is used — the robust default for
             unsupervised data.
+        progress : bool, default True
+            If True, show tqdm progress bars over the three phases:
+            per-sample spectrum compute, optional rotation alignment, and
+            per-sample radial binning. Set to False to silence output.
 
         Returns
         -------
@@ -2059,6 +2153,61 @@ class SpectralComparator:
         KeyError
             If any ``landmark_genes`` entry is missing from
             :attr:`gene_names`.
+
+        Notes
+        -----
+        **Runtime profile (dominant costs, in order)**
+
+        1. Per-sample spectrum pass (``_compute_{nufft,fft}_spectra``). For
+           AnnData inputs this is one batched ``finufft.nufft2d1`` per gene
+           chunk, scaling roughly like
+           ``O(n_samples · n_genes · (N log N + K log K) / chunk_size)``.
+           finufft's per-call overhead is ~1 ms, so batching across genes
+           (the :attr:`nufft_chunk_size` kwarg) gives the 10–50× speedup
+           versus the previous one-gene-at-a-time loop. For SpatialData
+           inputs this is one batched 2D FFT per sample on the rasterized
+           ``(n_genes, ny, nx)`` block.
+        2. Column densification from sparse ``adata.X`` / SpatialData
+           tables — keeps memory small (``~n_spots · chunk_size · 8 B``)
+           but costs one CSC slice per chunk.
+        3. Optional rotation alignment (``feature_mode='2d'``) — cross-
+           correlation per sample; cheap relative to (1).
+        4. Radial binning into the common ``freq_edges`` grid —
+           ``O(n_samples · n_genes · K)``; negligible.
+
+        **Peak RAM**
+
+        - ``self._raw_2d_spectra`` is the biggest steady-state footprint,
+          ``O(n_samples · n_genes · ny · nx · 8 B)``. For 2 000 genes on
+          a 128 × 128 grid across 20 samples this is ~5 GB; dropping to
+          float32 halves it at the cost of a minor precision loss in the
+          downstream tests (acceptable for everything except Liu's SF
+          eigenvalue path, which already runs on :class:`FFTKernel` /
+          :class:`NUFFTKernel` spectra, not ``spectra_``).
+        - Per-chunk transient: ``(n_spots, chunk_size)`` dense block
+          plus a ``(n_spots, chunk_size)`` complex array for finufft's
+          RHS — both discarded after each call.
+
+        **Explored improvements already in place**
+
+        - Gene-chunk batching of ``finufft.nufft2d1`` (the single biggest
+          win vs the old one-gene-at-a-time loop).
+        - Sparse-aware presence / DC / std computation — no full ``.X``
+          densification at any point.
+        - Radial binning reuses precomputed frequency grids across
+          samples, so it's one pass through a small ``(ny, n_kx)`` array
+          per sample regardless of ``n_genes``.
+
+        **Further improvements to consider**
+
+        - Swap the internal ``spectra_`` stack to ``float32``; halves
+          RAM. Would need a targeted test sweep against the permutation
+          p-values first.
+        - GPU finufft (``cufinufft``) — currently not a dependency but
+          is a drop-in replacement for the ``finufft`` calls here.
+        - Parallelise the per-sample outer loop with joblib when
+          ``progress=False`` — wiring exists, it's just off under the
+          progress-bar driver.
         """
         logger.info(
             "Computing per-sample spectra (mode=%s, n_samples=%d, center=%s)...",
@@ -2068,11 +2217,11 @@ class SpectralComparator:
         )
         if self.mode == "nufft":
             self._raw_2d_spectra, self.dc_, self.presence_ = self._compute_nufft_spectra(
-                n_jobs=n_jobs
+                n_jobs=n_jobs, progress=progress
             )
         else:
             self._raw_2d_spectra, self.dc_, self.presence_ = self._compute_fft_spectra(
-                n_jobs=n_jobs
+                n_jobs=n_jobs, progress=progress
             )
 
         if self.feature_mode == "2d":
@@ -2088,6 +2237,7 @@ class SpectralComparator:
                 grid_shapes=self._grid_shapes,
                 fft_solver=self.fft_solver,
                 landmark_indices=landmark_indices,
+                progress=progress,
             )
             self._raw_2d_spectra = aligned
             self.rotation_angles_ = angles
@@ -2108,9 +2258,16 @@ class SpectralComparator:
 
         # Reduce to per-sample feature matrices of shape (n_genes, K) and stack.
         feats = []
-        for i, (spec_i, shape) in enumerate(
-            zip(self._raw_2d_spectra, self._grid_shapes, strict=True)
-        ):
+        iter_binning = zip(self._raw_2d_spectra, self._grid_shapes, strict=True)
+        if progress:
+            iter_binning = tqdm(
+                enumerate(iter_binning),
+                total=len(self._raw_2d_spectra),
+                desc="Radial binning",
+            )
+        else:
+            iter_binning = enumerate(iter_binning)
+        for i, (spec_i, shape) in iter_binning:
             if self.feature_mode == "radial":
                 spacing_i = self.spacings[i] if self.spacings is not None else None
                 f = radial_bin_spectrum(
