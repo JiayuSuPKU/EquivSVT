@@ -71,6 +71,8 @@ dev = [
     # Interactive / plotting
     "jupyter>=1.0",
     "matplotlib>=3.5",
+    # GO analysis
+    "gprofiler-official>=1.0",
 ]
 # `docs` builds the Sphinx HTML site. Napoleon ships with Sphinx so the
 # standalone `sphinxcontrib-napoleon` package is not needed.

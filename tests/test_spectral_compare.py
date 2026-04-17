@@ -11,11 +11,13 @@ from quadsv.fft import power_spectrum_2d
 from quadsv.spectral_compare import (
     SpectralComparator,
     align_spectra_by_rotation,
+    apply_rotations_to_spectra,
     benchmark_statistics,
     compare_two_groups,
     compare_two_groups_masked,
     compare_two_groups_scalar,
     compute_sample_spectrum,
+    estimate_rotations_from_landmarks,
     normalize_by_background,
     radial_bin_spectrum,
     residualize_against_covariates,
@@ -119,90 +121,288 @@ class TestRadialBinning:
 
 
 class TestRotationAlignment:
-    def _anisotropic_pattern(self, ny: int, nx: int) -> np.ndarray:
-        """Stripes oriented horizontally: power concentrates along a known axis."""
+    @staticmethod
+    def _stripes(ny: int, nx: int, period: float = 8.0) -> np.ndarray:
         y = np.arange(ny)[:, None]
-        return np.broadcast_to(np.sin(2 * np.pi * y / 8).astype(float), (ny, nx))
+        return np.broadcast_to(np.sin(2 * np.pi * y / period).astype(float), (ny, nx)).copy()
 
-    def test_recovers_known_rotation_within_bin_width(self):
+    @staticmethod
+    def _stripes_rotated(ny: int, nx: int, angle: float, period: float = 8.0) -> np.ndarray:
         import scipy.ndimage
 
+        base = TestRotationAlignment._stripes(ny, nx, period=period)
+        return scipy.ndimage.rotate(base, angle=angle, reshape=False, order=1, mode="reflect")
+
+    def test_single_landmark_recovers_known_rotation(self):
+        """One striped landmark per sample → recovered angle ≈ true angle."""
         ny = nx = 48
-        ref = self._anisotropic_pattern(ny, nx)
         true_angle = 25.0
-        rotated = scipy.ndimage.rotate(
-            ref, angle=true_angle, reshape=False, order=1, mode="reflect"
-        )
-        # Wrap as (n_genes=1, ny, nx).
+        ref = self._stripes(ny, nx)
+        rot = self._stripes_rotated(ny, nx, true_angle)
+
         sp_ref = compute_sample_spectrum(ref[None, :, :], fft_solver="fft2")
-        sp_rot = compute_sample_spectrum(rotated[None, :, :], fft_solver="fft2")
-        n_theta = 360
+        sp_rot = compute_sample_spectrum(rot[None, :, :], fft_solver="fft2")
         _, angles = align_spectra_by_rotation(
             [sp_ref, sp_rot],
             grid_shapes=[(ny, nx), (ny, nx)],
+            target_spectra=[sp_ref, sp_rot],
             fft_solver="fft2",
             reference_index=0,
-            n_theta=n_theta,
+            n_theta=360,
         )
-        # Reference angle is 0; recovered angle should be ~true_angle (mod 180).
         recovered = angles[1] % 180.0
         true_mod = true_angle % 180.0
         diff = min(abs(recovered - true_mod), 180.0 - abs(recovered - true_mod))
-        # Tolerance: 2 angular bins (180 / n_theta = 0.5°) plus interpolation slack.
         assert diff < 5.0, f"recovered={recovered}, true={true_mod}, diff={diff}"
 
-    def test_landmark_indices_drive_alignment(self):
-        """Landmarks decide the rotation; non-landmark genes don't need to be
-        anisotropic for alignment to succeed."""
-        import scipy.ndimage
+    def test_per_landmark_beats_mean_template(self):
+        """With landmarks on perpendicular anisotropy axes, a mean-template
+        would be near-isotropic and alignment would break down. Per-landmark
+        alignment still locks onto the shared rotation because each landmark
+        cross-correlates against its own same-index counterpart.
+        """
+        ny = nx = 96
+        true_angle = 30.0
 
-        ny = nx = 48
-        stripes = self._anisotropic_pattern(ny, nx)
-        rng = np.random.default_rng(0)
-        noise = rng.standard_normal((ny, nx))
-        true_angle = 25.0
-
-        # Sample A (reference): gene 0 = stripes, gene 1 = noise.
-        a = np.stack([stripes, noise], axis=0)
-        # Sample B: gene 0 = rotated stripes, gene 1 = independent noise.
-        b = np.stack(
+        # Two analytic landmarks with wave vectors on perpendicular axes.
+        lm_h = TestRotationSimulation._sine_at_angle(ny, nx, 12.0, 0.0, 0.0)  # along +y
+        lm_v = TestRotationSimulation._sine_at_angle(ny, nx, 0.0, 12.0, 0.0)  # along +x
+        ref_stack = np.stack([lm_h, lm_v], axis=0)
+        rot_stack = np.stack(
             [
-                scipy.ndimage.rotate(
-                    stripes, angle=true_angle, reshape=False, order=1, mode="reflect"
-                ),
-                rng.standard_normal((ny, nx)),
+                TestRotationSimulation._sine_at_angle(ny, nx, 12.0, 0.0, true_angle),
+                TestRotationSimulation._sine_at_angle(ny, nx, 0.0, 12.0, true_angle),
             ],
             axis=0,
         )
-        sp_a = compute_sample_spectrum(a, fft_solver="fft2")
-        sp_b = compute_sample_spectrum(b, fft_solver="fft2")
+        sp_ref = compute_sample_spectrum(ref_stack, fft_solver="fft2")
+        sp_rot = compute_sample_spectrum(rot_stack, fft_solver="fft2")
 
-        # Without landmarks: global mean mixes stripes with pure noise; angle
-        # recovery could be noisy. With landmark_indices=[0]: only the
-        # striped gene is used, so recovery locks onto the true angle.
-        _, angles = align_spectra_by_rotation(
-            [sp_a, sp_b],
+        angles = estimate_rotations_from_landmarks(
+            [sp_ref, sp_rot],
             grid_shapes=[(ny, nx), (ny, nx)],
             fft_solver="fft2",
-            n_theta=360,
-            landmark_indices=[0],
+            n_theta=720,
         )
-        recovered = angles[1] % 180.0
-        true_mod = true_angle % 180.0
-        diff = min(abs(recovered - true_mod), 180.0 - abs(recovered - true_mod))
-        assert diff < 5.0, f"landmark rotation mis-aligned: diff={diff}"
+        diff = TestRotationSimulation._canon_err(angles[1], true_angle)
+        assert diff < 3.0, f"per-landmark recovered={angles[1]}, expected {true_angle}"
 
-    def test_landmark_indices_validation(self):
+    def test_shape_validation(self):
         sp = compute_sample_spectrum(
             np.random.default_rng(0).standard_normal((3, 16, 16)), fft_solver="fft2"
         )
-        with pytest.raises(ValueError, match="non-empty"):
+        sp_bad = compute_sample_spectrum(
+            np.random.default_rng(0).standard_normal((2, 16, 16)), fft_solver="fft2"
+        )
+        with pytest.raises(ValueError, match="must match across samples"):
             align_spectra_by_rotation(
-                [sp, sp], grid_shapes=[(16, 16), (16, 16)], landmark_indices=[]
+                [sp, sp_bad], grid_shapes=[(16, 16), (16, 16)], fft_solver="fft2"
             )
-        with pytest.raises(ValueError, match="out of range"):
+        with pytest.raises(ValueError, match="reference_index"):
             align_spectra_by_rotation(
-                [sp, sp], grid_shapes=[(16, 16), (16, 16)], landmark_indices=[99]
+                [sp, sp],
+                grid_shapes=[(16, 16), (16, 16)],
+                reference_index=9,
+                fft_solver="fft2",
+            )
+
+    def test_apply_rotations_to_different_target(self):
+        """Estimate rotation from one landmark, apply to an independent panel."""
+        import scipy.ndimage
+
+        ny = nx = 48
+        true_angle = 18.0
+        ref_landmark = self._stripes(ny, nx)
+        cur_landmark = self._stripes_rotated(ny, nx, true_angle)
+
+        # Target panel: three arbitrary genes per sample (distinct from the landmark).
+        rng = np.random.default_rng(0)
+        ref_target = rng.standard_normal((3, ny, nx))
+        cur_target = np.stack(
+            [
+                scipy.ndimage.rotate(
+                    ref_target[j], true_angle, reshape=False, order=1, mode="reflect"
+                )
+                for j in range(3)
+            ],
+            axis=0,
+        )
+        sp_ref_lm = compute_sample_spectrum(ref_landmark[None, :, :], fft_solver="fft2")
+        sp_cur_lm = compute_sample_spectrum(cur_landmark[None, :, :], fft_solver="fft2")
+        sp_ref_tgt = compute_sample_spectrum(ref_target, fft_solver="fft2")
+        sp_cur_tgt = compute_sample_spectrum(cur_target, fft_solver="fft2")
+
+        angles = estimate_rotations_from_landmarks(
+            [sp_ref_lm, sp_cur_lm],
+            grid_shapes=[(ny, nx), (ny, nx)],
+            fft_solver="fft2",
+            n_theta=360,
+        )
+        rotated = apply_rotations_to_spectra(
+            [sp_ref_tgt, sp_cur_tgt],
+            grid_shapes=[(ny, nx), (ny, nx)],
+            angles_deg=angles,
+            fft_solver="fft2",
+        )
+        # After applying the recovered rotation to the target spectra, the
+        # L2 distance between sample 1 and the reference should drop.
+        # Tolerance is loose because scipy.ndimage.rotate is itself lossy
+        # on discrete grids (interpolation ringing around high-amplitude
+        # FFT peaks) — even a perfectly recovered angle leaves substantial
+        # residual mismatch; we only require a clear improvement.
+        unrot_dist = np.linalg.norm(sp_cur_tgt - sp_ref_tgt)
+        rot_dist = np.linalg.norm(rotated[1] - sp_ref_tgt)
+        assert rot_dist < 0.95 * unrot_dist, (
+            f"rotation failed to reduce distance: unrot={unrot_dist:.2g} " f"rot={rot_dist:.2g}"
+        )
+
+
+class TestRotationSimulation:
+    """Simulation-based validation with **analytic** rotations (we rotate the
+    wave vector of a sinusoidal landmark directly, so no pixel-interpolation
+    bias is introduced by the simulator).
+
+    The estimator's accuracy is fundamentally limited by the FFT grid: a
+    sinusoid whose rotated wave vector lands between integer bins has a
+    spectrum peak that is off the nearest bin by up to ~one angular bin
+    (~180/n_theta degrees at the lowest landmark radius). Larger grids and
+    multiple landmarks at different radii push this down.
+    """
+
+    @staticmethod
+    def _sine_at_angle(ny, nx, ky0, kx0, phi_deg):
+        """Generate ``sin(2π (ky·y + kx·x) / N)`` with ``(ky, kx)`` rotated
+        by ``phi_deg``. No interpolation."""
+        phi = np.deg2rad(phi_deg)
+        c, s = np.cos(phi), np.sin(phi)
+        ky = ky0 * c - kx0 * s
+        kx = ky0 * s + kx0 * c
+        yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
+        return np.sin(2 * np.pi * (ky * yy / ny + kx * xx / nx))
+
+    @staticmethod
+    def _canon_err(a, b):
+        """Angular error modulo 180°."""
+        d = np.abs(np.mod(a, 180.0) - np.mod(b, 180.0))
+        return np.minimum(d, 180.0 - d)
+
+    def test_multi_sample_recovery_with_multiple_landmarks(self):
+        """Per-sample rotations drawn from U(-80, 80). Using 4 sinusoidal
+        landmarks at different frequencies — the per-landmark alignment
+        (sum of per-gene cross-correlations) averages out the per-landmark
+        aliasing, so every sample's angle is recovered to within a few
+        angular bins."""
+        ny = nx = 96
+        rng = np.random.default_rng(42)
+        n_samples = 8
+        # Distinct k0 — higher radius → finer angular resolution.
+        k0s = [10.0, 16.0, 22.0, 30.0]
+
+        ref_landmarks = np.stack([self._sine_at_angle(ny, nx, k0, 0.0, 0.0) for k0 in k0s], axis=0)
+        true_angles = np.concatenate([[0.0], rng.uniform(-80.0, 80.0, size=n_samples - 1)])
+        samples = [ref_landmarks]
+        for ang in true_angles[1:]:
+            samples.append(
+                np.stack(
+                    [self._sine_at_angle(ny, nx, k0, 0.0, ang) for k0 in k0s],
+                    axis=0,
+                )
+            )
+        spectra = [compute_sample_spectrum(s, fft_solver="fft2") for s in samples]
+        recovered = estimate_rotations_from_landmarks(
+            spectra,
+            grid_shapes=[(ny, nx)] * n_samples,
+            fft_solver="fft2",
+            n_theta=720,
+        )
+        errs = self._canon_err(recovered, true_angles)
+        assert errs[0] == 0, "reference angle must be exactly 0"
+        # With 4 landmarks on a 96×96 grid the recovered angle is within ~3°
+        # of truth in every sample (aliasing-limited).
+        assert errs[1:].max() < 4.0, (
+            f"per-sample errors (deg): {errs[1:].round(2).tolist()}; "
+            f"true angles: {true_angles[1:].round(2).tolist()}; "
+            f"recovered: {recovered[1:].round(2).tolist()}"
+        )
+        # Mean error should be well under 2° — most of the budget is max-bin.
+        assert errs[1:].mean() < 2.0
+
+    def test_more_landmarks_reduces_bias(self):
+        """Adding more landmarks (at distinct frequencies) should reduce the
+        mean rotation-recovery error. This is a key property of the
+        landmarks-first API — the previous mean-template design averaged the
+        landmarks first and then cross-correlated, which did not have this
+        property."""
+        ny = nx = 96
+        rng = np.random.default_rng(0)
+        true_angles = np.concatenate([[0.0], rng.uniform(-70.0, 70.0, size=6)])
+
+        def errs_for_k0s(k0s):
+            samples = [
+                np.stack([self._sine_at_angle(ny, nx, k, 0.0, a) for k in k0s], axis=0)
+                for a in true_angles
+            ]
+            spectra = [compute_sample_spectrum(s, fft_solver="fft2") for s in samples]
+            rec = estimate_rotations_from_landmarks(
+                spectra,
+                grid_shapes=[(ny, nx)] * len(samples),
+                fft_solver="fft2",
+                n_theta=720,
+            )
+            return self._canon_err(rec, true_angles)[1:]
+
+        one = errs_for_k0s([12.0]).mean()
+        many = errs_for_k0s([10.0, 14.0, 20.0, 26.0, 34.0]).mean()
+        assert many <= one + 0.1, (
+            f"multi-landmark bias ({many:.2f}°) did not improve over "
+            f"single-landmark ({one:.2f}°)"
+        )
+
+    def test_apply_rotations_matches_raw_reference(self):
+        """End-to-end: after rotation-correction, every sample's spectrum
+        lands much closer to the reference than the un-corrected version.
+        """
+        ny = nx = 96
+        rng = np.random.default_rng(7)
+        n_samples = 5
+        k0s = [10.0, 16.0, 24.0]
+
+        ref_landmarks = np.stack([self._sine_at_angle(ny, nx, k0, 0.0, 0.0) for k0 in k0s], axis=0)
+        true_angles = np.concatenate([[0.0], rng.uniform(-60.0, 60.0, size=n_samples - 1)])
+        samples = [ref_landmarks]
+        for ang in true_angles[1:]:
+            samples.append(
+                np.stack(
+                    [self._sine_at_angle(ny, nx, k0, 0.0, ang) for k0 in k0s],
+                    axis=0,
+                )
+            )
+        spectra = [compute_sample_spectrum(s, fft_solver="fft2") for s in samples]
+        angles = estimate_rotations_from_landmarks(
+            spectra,
+            grid_shapes=[(ny, nx)] * n_samples,
+            fft_solver="fft2",
+            n_theta=720,
+        )
+        corrected = apply_rotations_to_spectra(
+            spectra,
+            grid_shapes=[(ny, nx)] * n_samples,
+            angles_deg=angles,
+            fft_solver="fft2",
+        )
+        for i in range(1, n_samples):
+            d_before = np.linalg.norm(spectra[i] - spectra[0])
+            d_after = np.linalg.norm(corrected[i] - spectra[0])
+            # Tolerance is loose because (a) scipy.ndimage.rotate on a
+            # discrete spectrum is lossy — every applied angle ringing-blurs
+            # high-amplitude FFT peaks — and (b) delta-like spectra of
+            # sinusoids are the worst-case for bilinear rotation, so a
+            # "perfect" recovery still leaves ~20-40% residual L2. The
+            # recovery accuracy of ``angles`` itself is tested elsewhere;
+            # here we only require a visible improvement.
+            assert d_after < 0.95 * d_before, (
+                f"sample {i}: rotation-correction did not tighten distance "
+                f"(before={d_before:.2g}, after={d_after:.2g})"
             )
 
 
@@ -251,10 +451,50 @@ class TestTwoGroupNullCalibration:
         n_samples, n_genes, K = 8, 200, 12
         spectra = rng.uniform(0.5, 5.0, size=(n_samples, n_genes, K))
         groups = np.array([0, 0, 0, 0, 1, 1, 1, 1])
-        df = compare_two_groups(spectra, groups, statistic="log_l2", n_perm=300, random_state=0)
-        # KS test against U(0, 1).
+        # Force the sampling path (n_perm_max=0) so the KS test can check
+        # continuous uniformity. Exact enumeration with only C(8,4)=70
+        # distinct relabellings produces a discrete distribution on 71
+        # values, which KS rejects by construction even under perfect
+        # calibration; its own calibration is covered by
+        # ``test_exact_permutation_on_small_samples`` below.
+        df = compare_two_groups(
+            spectra,
+            groups,
+            statistic="log_l2",
+            n_perm=300,
+            random_state=0,
+            n_perm_max=0,
+        )
         ks_stat, ks_p = kstest(df["P_value"].to_numpy(), "uniform")
         assert ks_p > 0.01, f"p-values not uniform under H0: KS p={ks_p:.4f}"
+
+    def test_exact_permutation_on_small_samples(self):
+        """With ``n_perm_max`` above ``C(n, n_a)`` the test enumerates every
+        distinct relabelling. The resulting p-values are **discrete** with
+        values in ``{1/(M+1), ..., (M+1)/(M+1)}`` where ``M = C(n, n_a)``,
+        but remain calibrated: repeated runs are deterministic (no RNG
+        sampling), and under H0 the rank of the observed statistic is
+        Uniform on ``{1, ..., M+1}``.
+        """
+        rng = np.random.default_rng(0)
+        n_genes, K = 50, 10
+        # 4 vs 4: only C(8, 4) = 70 distinct relabellings → exact path.
+        spectra = rng.uniform(0.5, 5.0, size=(8, n_genes, K))
+        groups = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+        df_a = compare_two_groups(spectra, groups, statistic="log_l2", n_perm=5000, random_state=0)
+        # Re-run with a different seed → same p-values (exact → RNG-free).
+        df_b = compare_two_groups(
+            spectra, groups, statistic="log_l2", n_perm=5000, random_state=999
+        )
+        np.testing.assert_allclose(
+            df_a.set_index("Feature").loc[df_b["Feature"], "P_value"].to_numpy(),
+            df_b["P_value"].to_numpy(),
+        )
+        # The p-value alphabet is 71 = C(8,4) + 1 values.
+        unique_pvals = set(df_a["P_value"].round(8).tolist())
+        assert len(unique_pvals) <= 71
+        # Mean p-value under H0 should still be ≈ 0.5 (up to finite-gene noise).
+        assert 0.4 < df_a["P_value"].mean() < 0.6
 
 
 class TestTwoGroupPower:

@@ -40,7 +40,9 @@ approximations on multivariate statistics unreliable.
 
 from __future__ import annotations
 
+import itertools
 import logging
+import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -50,6 +52,7 @@ import scipy.ndimage
 import scipy.sparse as sp
 from joblib import Parallel, delayed
 from scipy.stats import ks_2samp  # noqa: F401  (exposed for downstream calibration tests)
+from scipy.stats import t as _t_dist
 from tqdm.auto import tqdm
 
 from quadsv.fft import power_spectrum_2d
@@ -59,6 +62,8 @@ __all__ = [
     "compute_sample_spectrum",
     "radial_bin_spectrum",
     "align_spectra_by_rotation",
+    "estimate_rotations_from_landmarks",
+    "apply_rotations_to_spectra",
     "normalize_by_background",
     "residualize_against_covariates",
     "shape_normalize",
@@ -517,137 +522,186 @@ def _polar_resample(
     return sampled.reshape(n_radius, n_theta).T  # (n_theta, n_radius)
 
 
-def align_spectra_by_rotation(
-    spectra: Sequence[np.ndarray],
+def _build_landmark_polar_stack(
+    spectra: np.ndarray,
+    grid_shape: tuple[int, int],
+    fft_solver: str,
+    n_theta: int,
+    n_radius: int,
+) -> np.ndarray:
+    """Build a ``(n_landmarks, n_theta, n_radius)`` polar stack for one sample.
+
+    Each landmark's 2D spectrum is fftshifted (DC at centre), resampled onto
+    the polar grid, and zero-meaned along theta so the DC angular component
+    doesn't dominate the cross-correlation.
+    """
+    full = _to_full_2d(spectra, grid_shape, fft_solver)  # (n_landmarks, ny, nx)
+    shifted = np.fft.fftshift(full, axes=(-2, -1))
+    out = np.empty((shifted.shape[0], n_theta, n_radius), dtype=float)
+    for j in range(shifted.shape[0]):
+        polar = _polar_resample(shifted[j], n_theta, n_radius)
+        out[j] = polar - polar.mean(axis=0, keepdims=True)
+    return out
+
+
+def estimate_rotations_from_landmarks(
+    landmark_spectra: Sequence[np.ndarray],
     grid_shapes: Sequence[tuple[int, int]],
+    *,
     fft_solver: str = "fft2",
     reference_index: int = 0,
     n_theta: int = 180,
     n_radius: int = 64,
-    landmark_indices: Sequence[int] | None = None,
     progress: bool = False,
-) -> tuple[list[np.ndarray], np.ndarray]:
+) -> np.ndarray:
     """
-    Rotate each non-reference sample's 2D spectrum to maximize similarity with a
-    per-sample **template** spectrum (either a user-supplied set of landmark
-    genes, or — by default — the global mean spectrum across every gene).
+    Estimate the per-sample rotation that best aligns every landmark
+    spectrum to the reference sample's corresponding landmark.
 
-    Implementation
-    --------------
-    For each sample we:
-
-    1. Reduce to a single 2D template by averaging the spectra of the
-       landmark genes (``landmark_indices``). If no landmarks are supplied,
-       the template is the global mean across all genes (the "background"
-       spectrum) — a robust default that mirrors the intuition behind
-       :func:`normalize_by_background`.
-    2. fftshift so DC is at the image center.
-    3. Resample onto a polar grid with ``n_theta`` angles in :math:`[0,\\pi)` (the 180°
-       symmetry of :math:`|\\hat{x}|^2` for real ``x``).
-    4. Cross-correlate the reference and sample polar templates along the angular
-       axis to find the best rotation (peak of the circular cross-correlation).
-    5. Apply that single rotation to **every** gene's 2D spectrum in the
-       sample — landmarks only decide the rotation, never which genes get
-       aligned.
+    For each non-reference sample the routine picks a single rotation angle
+    that maximises the **sum over landmarks** of the per-landmark circular
+    cross-correlation along the polar-angle axis — i.e. each landmark
+    aligns to its same-index counterpart in the reference (not to a mean
+    template). This is strictly stronger than mean-template alignment
+    because it ignores cross-landmark noise (the off-diagonal ``i ≠ j``
+    terms that mean-of-means picks up) and picks up anisotropy shared
+    across every landmark at a common orientation.
 
     Parameters
     ----------
-    spectra : sequence of np.ndarray
-        Per-sample power spectra of shape ``(n_genes, ny, n_kx)`` (rfft2) or
-        ``(n_genes, ny, nx)`` (fft2). All samples must share the same ``n_genes``,
-        but ``(ny, nx)`` may vary across samples.
-    grid_shapes : sequence of tuple
+    landmark_spectra : sequence of np.ndarray
+        Per-sample landmark spectra. Shape ``(n_landmarks, ny, n_kx)`` with
+        ``(ny, n_kx)`` following ``fft_solver``. The first dimension
+        (``n_landmarks``) must match across samples — landmark ``j`` in
+        sample A is compared to landmark ``j`` in sample B.
+    grid_shapes : sequence of tuple[int, int]
         Per-sample ``(ny, nx)`` of the original rasterized image.
     fft_solver : {'fft2', 'rfft2'}, default 'fft2'
-        FFT routine that produced ``spectra``. ``fft2`` is recommended for rotation
-        alignment because it preserves full angular content.
+        FFT layout of ``landmark_spectra`` — rfft2 spectra are expanded
+        to full 2D before resampling to preserve angular content.
     reference_index : int, default 0
-        Index of the sample held fixed; all others are aligned to it.
+        Which sample's landmarks act as the rotation reference (its angle
+        is fixed at 0).
     n_theta : int, default 180
-        Angular resolution of the polar resampling. The recovered rotation is
-        accurate to ``180/n_theta`` degrees.
+        Angular resolution of the polar resampling. Recovered angles are
+        accurate to ``180 / n_theta`` degrees.
     n_radius : int, default 64
         Radial resolution of the polar resampling.
-    landmark_indices : sequence of int, optional
-        Indices (into the gene axis) of a small set of "landmark" genes whose
-        spectra define the alignment template. Useful when a few genes have
-        strong, biologically conserved anisotropy (cortical layer markers,
-        spatial domain priors) and the global gene-mean is isotropic or
-        dominated by housekeeping noise. If None (default), the template is
-        the global mean spectrum — equivalent to using every gene as a
-        landmark.
+    progress : bool, default False
+        If True, show a tqdm bar over non-reference samples.
 
     Returns
     -------
-    rotated : list of np.ndarray
-        Aligned spectra, same shapes as the input.
     angles_deg : np.ndarray
-        Recovered rotation angles in degrees, length ``len(spectra)``. Reference
-        sample's angle is 0.
+        ``(n_samples,)`` recovered rotation angles in degrees. Reference
+        angle is exactly 0.
 
     Raises
     ------
     ValueError
-        If ``reference_index`` is out of range, or ``landmark_indices`` is
-        empty / contains indices outside ``[0, n_genes)``.
-
-    Notes
-    -----
-    The rotation is applied to the **2D power spectrum**, not back to the original
-    spatial image. This is enough for any downstream analysis that operates on the
-    aligned spectra (radial / 2D-binned tests).
+        If ``reference_index`` is out of range or any two samples have
+        inconsistent ``n_landmarks``.
     """
-    n_samples = len(spectra)
+    n_samples = len(landmark_spectra)
     if reference_index < 0 or reference_index >= n_samples:
         raise ValueError(f"reference_index {reference_index} out of range [0, {n_samples})")
 
-    if landmark_indices is not None:
-        n_genes = spectra[reference_index].shape[0]
-        lm = np.asarray(list(landmark_indices), dtype=int)
-        if lm.size == 0:
-            raise ValueError("landmark_indices must be a non-empty sequence when supplied.")
-        if lm.min() < 0 or lm.max() >= n_genes:
+    n_landmarks = landmark_spectra[reference_index].shape[0]
+    for i, s in enumerate(landmark_spectra):
+        if s.shape[0] != n_landmarks:
             raise ValueError(
-                f"landmark_indices out of range [0, {n_genes}); got [{lm.min()}, {lm.max()}]."
+                f"landmark_spectra[{i}] has n_landmarks={s.shape[0]}, "
+                f"expected {n_landmarks} (must match across samples)."
             )
-        lm_set: np.ndarray | None = lm
-    else:
-        lm_set = None  # fall back to global mean (all genes)
 
-    def _prep(sp: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-        full = _to_full_2d(sp, shape, fft_solver)  # (n_genes, ny, nx)
-        picked = full if lm_set is None else full[lm_set]
-        mean_2d = picked.mean(axis=0)
-        return np.fft.fftshift(mean_2d)
-
-    ref_polar = _polar_resample(
-        _prep(spectra[reference_index], grid_shapes[reference_index]), n_theta, n_radius
+    ref_polar = _build_landmark_polar_stack(
+        landmark_spectra[reference_index],
+        grid_shapes[reference_index],
+        fft_solver,
+        n_theta,
+        n_radius,
     )
-    ref_polar -= ref_polar.mean(axis=0, keepdims=True)
+    ref_hat = np.fft.fft(ref_polar, axis=1)  # (n_landmarks, n_theta, n_radius)
 
-    rotated: list[np.ndarray] = []
     angles = np.zeros(n_samples)
-    iter_samples = enumerate(zip(spectra, grid_shapes, strict=True))
+    iter_samples: Any = range(n_samples)
     if progress:
-        iter_samples = tqdm(iter_samples, total=n_samples, desc="Rotation alignment")
-    for i, (spec_i, shape) in iter_samples:
+        iter_samples = tqdm(iter_samples, total=n_samples, desc="Rotation estimation")
+    for i in iter_samples:
         if i == reference_index:
-            rotated.append(spec_i.copy())
             continue
-        cur_polar = _polar_resample(_prep(spec_i, shape), n_theta, n_radius)
-        cur_polar -= cur_polar.mean(axis=0, keepdims=True)
-        # Circular cross-correlation along axis 0 (theta), summed across radii.
-        # corr[k] = sum_r sum_t ref[t, r] * cur[(t-k) mod n_theta, r]
-        # via FFT trick on the theta axis.
-        ref_hat = np.fft.fft(ref_polar, axis=0)
-        cur_hat = np.fft.fft(cur_polar, axis=0)
-        corr = np.real(np.fft.ifft(ref_hat * np.conj(cur_hat), axis=0)).sum(axis=1)
-        k_best = int(np.argmax(corr))
-        angle_deg = k_best * 180.0 / n_theta
-        angles[i] = angle_deg
+        cur_polar = _build_landmark_polar_stack(
+            landmark_spectra[i], grid_shapes[i], fft_solver, n_theta, n_radius
+        )
+        cur_hat = np.fft.fft(cur_polar, axis=1)
+        # Per-landmark circular cross-correlation along theta; sum across
+        # landmarks AND radii → best rotation common to every landmark.
+        corr = np.real(np.fft.ifft(ref_hat * np.conj(cur_hat), axis=1))
+        total = corr.sum(axis=(0, 2))  # (n_theta,)
+        k_best = int(np.argmax(total))
+        angles[i] = k_best * 180.0 / n_theta
+    return angles
 
-        # Rotate every gene's full 2D spectrum by the recovered angle.
-        full = _to_full_2d(spec_i, shape, fft_solver)  # (n_genes, ny, nx)
+
+def apply_rotations_to_spectra(
+    spectra: Sequence[np.ndarray],
+    grid_shapes: Sequence[tuple[int, int]],
+    angles_deg: np.ndarray,
+    *,
+    fft_solver: str = "fft2",
+    progress: bool = False,
+) -> list[np.ndarray]:
+    """
+    Rotate each sample's 2D power spectra by a per-sample angle.
+
+    Parameters
+    ----------
+    spectra : sequence of np.ndarray
+        Per-sample 2D power spectra — any first-axis dimension (e.g. full
+        ``n_genes``). Shape ``(n, ny, n_kx)`` with ``(ny, n_kx)`` matching
+        ``fft_solver``.
+    grid_shapes : sequence of tuple[int, int]
+        Per-sample ``(ny, nx)`` of the original rasterized image.
+    angles_deg : np.ndarray
+        Per-sample rotation angles in degrees (e.g. produced by
+        :func:`estimate_rotations_from_landmarks`). Length must equal
+        ``len(spectra)``.
+    fft_solver : {'fft2', 'rfft2'}, default 'fft2'
+        FFT layout of ``spectra``.
+    progress : bool, default False
+        Show a tqdm bar across samples.
+
+    Returns
+    -------
+    rotated : list of np.ndarray
+        Per-sample rotated spectra with the same shape as the input.
+
+    Notes
+    -----
+    Rotation is done on the **2D power spectrum** (fftshifted so DC sits at
+    the centre), not back on the spatial image. That is enough for any
+    downstream analysis that operates on aligned spectra (radial or 2D-bin
+    tests). Samples whose angle is exactly 0 are passed through as-is.
+    """
+    if len(angles_deg) != len(spectra):
+        raise ValueError(
+            f"angles_deg length {len(angles_deg)} does not match spectra length {len(spectra)}."
+        )
+    if len(grid_shapes) != len(spectra):
+        raise ValueError(
+            f"grid_shapes length {len(grid_shapes)} does not match spectra length {len(spectra)}."
+        )
+    out: list[np.ndarray] = []
+    # strict=False: lengths are already verified above.
+    iter_samples: Any = enumerate(zip(spectra, grid_shapes, strict=False))
+    if progress:
+        iter_samples = tqdm(iter_samples, total=len(spectra), desc="Rotation application")
+    for i, (spec_i, shape) in iter_samples:
+        angle_deg = float(angles_deg[i])
+        if angle_deg == 0.0:
+            out.append(np.asarray(spec_i).copy())
+            continue
+        full = _to_full_2d(spec_i, shape, fft_solver)  # (n, ny, nx)
         full_shift = np.fft.fftshift(full, axes=(-2, -1))
         rot = scipy.ndimage.rotate(
             full_shift, angle=-angle_deg, axes=(-2, -1), reshape=False, order=1, mode="reflect"
@@ -657,8 +711,110 @@ def align_spectra_by_rotation(
             ny, nx = shape
             half = nx // 2 + 1
             rot = rot[..., :half]
-        rotated.append(rot)
+        out.append(rot)
+    return out
 
+
+def align_spectra_by_rotation(
+    landmark_spectra: Sequence[np.ndarray],
+    grid_shapes: Sequence[tuple[int, int]],
+    *,
+    target_spectra: Sequence[np.ndarray] | None = None,
+    fft_solver: str = "fft2",
+    reference_index: int = 0,
+    n_theta: int = 180,
+    n_radius: int = 64,
+    progress: bool = False,
+) -> tuple[list[np.ndarray] | None, np.ndarray]:
+    """
+    Two-step rotation alignment: estimate per-sample rotations from
+    **landmark** spectra (whose first dimension must match across samples),
+    then apply those rotations to a separate set of **target** spectra (the
+    full gene panel for each sample, typically a superset of the
+    landmarks).
+
+    This is a convenience wrapper around
+    :func:`estimate_rotations_from_landmarks` and
+    :func:`apply_rotations_to_spectra`. Calling those directly is the
+    right pattern when you want to inspect / cache the per-sample angles
+    before applying them.
+
+    Implementation
+    --------------
+    For every non-reference sample:
+
+    1. Expand each landmark's 2D power spectrum to full-fft2 layout,
+       fftshift so DC sits at the centre, and resample onto a polar
+       ``(n_theta, n_radius)`` grid.
+    2. Compute per-landmark circular cross-correlation along the
+       polar-angle axis against the reference sample's same-index
+       landmark. **Every landmark contributes its own cross-correlation**
+       and the per-sample rotation is the angle that maximises the sum
+       across landmarks (and across radii). Mean-template alignment —
+       what the previous implementation did — was strictly weaker
+       because the off-diagonal ``i ≠ j`` pair terms in
+       ``corr(mean(a), mean(b))`` are pure noise.
+    3. Rotate every entry of ``target_spectra[i]`` (if supplied) by the
+       recovered angle.
+
+    Parameters
+    ----------
+    landmark_spectra : sequence of np.ndarray
+        Per-sample landmark spectra, shape ``(n_landmarks, ny, n_kx)``
+        per sample. ``n_landmarks`` must match across samples.
+    grid_shapes : sequence of tuple[int, int]
+        Per-sample ``(ny, nx)`` of the original rasterized image.
+    target_spectra : sequence of np.ndarray, optional
+        Per-sample spectra to which the recovered rotations are applied.
+        Any first-axis dimension (e.g. full gene panel). If ``None``, only
+        the angles are returned.
+    fft_solver : {'fft2', 'rfft2'}, default 'fft2'
+        FFT layout of both inputs. ``fft2`` is recommended so the full
+        angular content is present.
+    reference_index : int, default 0
+    n_theta : int, default 180
+    n_radius : int, default 64
+    progress : bool, default False
+
+    Returns
+    -------
+    rotated : list of np.ndarray or None
+        Per-sample rotated target spectra (or ``None`` when
+        ``target_spectra`` is omitted).
+    angles_deg : np.ndarray
+        ``(n_samples,)`` recovered rotation angles in degrees. Reference
+        angle is 0.
+
+    Raises
+    ------
+    ValueError
+        If ``reference_index`` is out of range, if ``landmark_spectra``
+        samples disagree on ``n_landmarks``, or if
+        ``target_spectra`` length does not match.
+    """
+    angles = estimate_rotations_from_landmarks(
+        landmark_spectra,
+        grid_shapes,
+        fft_solver=fft_solver,
+        reference_index=reference_index,
+        n_theta=n_theta,
+        n_radius=n_radius,
+        progress=progress,
+    )
+    if target_spectra is None:
+        return None, angles
+    if len(target_spectra) != len(landmark_spectra):
+        raise ValueError(
+            f"target_spectra length {len(target_spectra)} does not match "
+            f"landmark_spectra length {len(landmark_spectra)}."
+        )
+    rotated = apply_rotations_to_spectra(
+        target_spectra,
+        grid_shapes,
+        angles,
+        fft_solver=fft_solver,
+        progress=progress,
+    )
     return rotated, angles
 
 
@@ -888,6 +1044,46 @@ def _stat_welch_abs_per_bin(group_a: np.ndarray, group_b: np.ndarray) -> np.ndar
     return np.abs(_welch_t_per_bin(group_a, group_b))
 
 
+def _stat_welch_p_per_bin(
+    group_a: np.ndarray, group_b: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Analytic two-sided Welch t-test per bin. Returns ``(|t|, p)`` each
+    of shape ``(n_genes, K)``.
+
+    Using the t-distribution instead of a permutation null is what makes the
+    Cauchy-combined pattern test actually powerful — permutation p-values
+    are floored at ``1/(n_perm + 1)`` per bin, which would also floor the
+    Cauchy-combined gene-level p-value (e.g. ``n_perm=500`` caps it at
+    ~1e-3, so no gene can survive BH correction across thousands of tests).
+    The t-distribution tail delivers arbitrarily small p-values for strong
+    per-bin signal, which is exactly what the Cauchy combination was
+    designed for.
+    """
+    n_a = group_a.shape[0]
+    n_b = group_b.shape[0]
+    mean_a = group_a.mean(axis=0)
+    mean_b = group_b.mean(axis=0)
+    var_a = group_a.var(axis=0, ddof=1) if n_a > 1 else np.zeros_like(mean_a)
+    var_b = group_b.var(axis=0, ddof=1) if n_b > 1 else np.zeros_like(mean_b)
+    se2_a = var_a / max(n_a, 1)
+    se2_b = var_b / max(n_b, 1)
+    se2 = se2_a + se2_b + 1e-30
+    t_stat = (mean_a - mean_b) / np.sqrt(se2)
+    # Welch-Satterthwaite degrees of freedom. Fall back to equal-variance df
+    # only when one group has n<2 (so the Welch formula is undefined).
+    if n_a > 1 and n_b > 1:
+        df_num = se2**2
+        df_den = (se2_a**2) / max(n_a - 1, 1) + (se2_b**2) / max(n_b - 1, 1) + 1e-30
+        df = df_num / df_den
+    else:
+        df = np.full_like(mean_a, float(max(n_a + n_b - 2, 1)))
+    df = np.maximum(df, 1.0)
+    pvals = 2.0 * _t_dist.sf(np.abs(t_stat), df)
+    # Clip the absolute floor to the smallest representable positive float so
+    # Cauchy's tan(pi(0.5 - p)) stays finite.
+    return np.abs(t_stat), np.clip(pvals, np.finfo(float).tiny, 1.0)
+
+
 def _cauchy_combine(pvals: np.ndarray, axis: int = -1) -> np.ndarray:
     """
     Cauchy combination test (Liu & Xie 2020).
@@ -1003,11 +1199,80 @@ def _permutation_indices(
     n_perm: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Return ``(n_perm, n_samples)`` index arrays — random permutations of 0..n-1."""
+    """Return ``(n_perm, n_samples)`` index arrays — random permutations of 0..n-1.
+
+    Retained for back-compatibility; new code should prefer
+    :func:`_exchangeable_group_labels`, which returns group-label matrices
+    directly and supports the exact-enumeration path for small samples.
+    """
     out = np.tile(np.arange(n_samples), (n_perm, 1))
     for i in range(n_perm):
         rng.shuffle(out[i])
     return out
+
+
+def _exchangeable_group_labels(
+    groups: np.ndarray,
+    n_perm: int,
+    rng: np.random.Generator,
+    *,
+    n_perm_max: int = 10000,
+) -> tuple[np.ndarray, bool]:
+    """Build a null-distribution set of group relabellings.
+
+    For small samples the total number of distinct two-group label
+    assignments (``C(n, n_a)``) can be tiny compared to the user's
+    requested ``n_perm``, which means the permutation p-value is floored
+    at ``1/(C(n, n_a) + 1)``. In that regime an **exact** enumeration
+    of every possible relabelling is both cheaper and strictly more
+    accurate (zero Monte-Carlo noise, sharp p-values).
+
+    Parameters
+    ----------
+    groups : np.ndarray
+        Observed group labels, length ``n_samples`` with exactly two
+        unique values.
+    n_perm : int
+        Number of random shuffles to produce when exact enumeration is
+        infeasible. Ignored on the exact path.
+    rng : np.random.Generator
+        RNG for the sampling fallback.
+    n_perm_max : int, default 10000
+        If ``C(n_samples, n_a)`` is at most this, every distinct relabelling
+        is enumerated (``is_exact=True``) and ``n_perm`` is overridden to
+        the enumeration count. Otherwise ``n_perm`` random shuffles of
+        ``groups`` are returned (``is_exact=False``).
+
+    Returns
+    -------
+    perm_labels : np.ndarray
+        ``(n_used, n_samples)`` int array; each row is a valid relabelling
+        (same ``n_a`` / ``n_b`` marginals as ``groups``).
+    is_exact : bool
+        True if every row is a distinct relabelling and together they
+        span every possible partition; False if the rows are independent
+        random shuffles.
+    """
+    groups = np.asarray(groups)
+    n = len(groups)
+    uniq, counts = np.unique(groups, return_counts=True)
+    if uniq.size != 2:
+        raise ValueError(f"groups must have exactly two unique values, got {uniq}.")
+    n_a = int(counts[0])
+    total = int(math.comb(n, n_a))
+    if total <= n_perm_max:
+        perm_labels = np.empty((total, n), dtype=groups.dtype)
+        a_val, b_val = uniq[0], uniq[1]
+        for i, subset in enumerate(itertools.combinations(range(n), n_a)):
+            perm_labels[i] = b_val
+            perm_labels[i, list(subset)] = a_val
+        return perm_labels, True
+    perm_labels = np.empty((n_perm, n), dtype=groups.dtype)
+    base = groups.copy()
+    for i in range(n_perm):
+        rng.shuffle(base)
+        perm_labels[i] = base
+    return perm_labels, False
 
 
 def _permutation_pvalue(
@@ -1024,17 +1289,22 @@ def _run_statistic_with_perm(
     stat_name: str,
     spectra: np.ndarray,
     groups: np.ndarray,
-    perm_indices: np.ndarray,
+    perm_labels: np.ndarray,
     *,
     freq_weights: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute observed statistic + null distribution for one statistic. Internal.
 
+    ``perm_labels`` is a ``(n_perm_used, n_samples)`` matrix of group
+    relabellings (as produced by :func:`_exchangeable_group_labels`).
+
     ``freq_weights`` is forwarded only to statistics that accept it (currently
     ``log_l2``); other statistics ignore it.
     """
     fn = _STAT_FNS[stat_name]
-    a_mask = groups == 0
+    uniq = np.unique(groups)
+    a_val = uniq[0]
+    a_mask = groups == a_val
 
     def _call(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         if stat_name == "log_l2":
@@ -1042,51 +1312,47 @@ def _run_statistic_with_perm(
         return fn(a, b)
 
     observed = _call(spectra[a_mask], spectra[~a_mask])
-    n_perm = perm_indices.shape[0]
+    n_perm = perm_labels.shape[0]
     null = np.empty((n_perm, spectra.shape[1]))
     for p in range(n_perm):
-        perm_groups = groups[perm_indices[p]]
-        a = perm_groups == 0
+        a = perm_labels[p] == a_val
         null[p] = _call(spectra[a], spectra[~a])
     return observed, null
 
 
-def _run_cauchy_welch_with_perm(
+def _run_cauchy_welch_analytic(
     spectra: np.ndarray,
     groups: np.ndarray,
-    perm_indices: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-bin ``|Welch t|`` with Cauchy-combined final p-value.
+    """Per-bin Welch t test + Cauchy-combined gene-level p-value.
+
+    Both the per-bin significance and the gene-level combination are
+    **analytic**: per-bin p-values come from the Welch t-distribution (not
+    a permutation null) and the gene-level p comes from the Cauchy
+    combination (Liu & Xie 2020), which is valid under arbitrary
+    dependence between bins. This is what gives the Cauchy-Welch test
+    real power versus the other (permutation-based) statistics in this
+    module — permutation p-values are floored at ``1/(n_perm + 1)`` per
+    bin, which would cap the combined gene-level p at ~1e-3 for typical
+    ``n_perm=500`` and wipe out BH-FDR significance across thousands of
+    genes.
 
     Returns
     -------
-    observed : np.ndarray
+    observed_abs_t : np.ndarray
         ``(n_genes, K)`` observed per-bin ``|t|`` — used as the reported
-        statistic summary (max across bins, by convention, so it sorts the
-        output table sensibly).
+        statistic summary (the max across bins sorts the output table
+        sensibly, same convention as before).
     combined_pvals : np.ndarray
         ``(n_genes,)`` Cauchy-combined gene-level p-values built from per-bin
-        permutation p-values.
+        analytic Welch p-values.
     per_bin_pvals : np.ndarray
-        ``(n_genes, K)`` per-bin permutation p-values (one-sided, with the
-        standard ``+1`` correction).
+        ``(n_genes, K)`` per-bin analytic Welch two-sided p-values.
     """
     a_mask = groups == 0
-    observed = _stat_welch_abs_per_bin(spectra[a_mask], spectra[~a_mask])  # (n_genes, K)
-    n_perm = perm_indices.shape[0]
-    n_genes, K = observed.shape
-    # null[p, g, k] = |t|_(g, k) under label permutation p.
-    # Accumulate a per-bin exceedance count instead of storing the full
-    # (n_perm, n_genes, K) tensor — it would blow up RAM for large K.
-    ge = np.zeros((n_genes, K), dtype=np.int64)
-    for p in range(n_perm):
-        perm_groups = groups[perm_indices[p]]
-        a = perm_groups == 0
-        null_stat = _stat_welch_abs_per_bin(spectra[a], spectra[~a])
-        ge += (null_stat >= observed).astype(np.int64)
-    per_bin_pvals = (ge + 1.0) / (n_perm + 1.0)
+    abs_t, per_bin_pvals = _stat_welch_p_per_bin(spectra[a_mask], spectra[~a_mask])
     combined = _cauchy_combine(per_bin_pvals, axis=-1)
-    return observed, combined, per_bin_pvals
+    return abs_t, combined, per_bin_pvals
 
 
 # ---------------------------------------------------------------------------
@@ -1103,6 +1369,7 @@ def compare_two_groups(  # noqa: C901
     random_state: int | None = None,
     n_jobs: int = 1,
     freq_weights: np.ndarray | None = None,
+    n_perm_max: int = 10000,
 ) -> pd.DataFrame:
     """
     Test, for every gene, whether its spatial-pattern spectrum differs between two groups.
@@ -1123,12 +1390,18 @@ def compare_two_groups(  # noqa: C901
           log-spectra. Global / summary statistic.
         - ``'hotelling_lw'`` — regularized Hotelling :math:`T^2`.
         - ``'mmd_rbf'`` — RBF-kernel maximum mean discrepancy.
-        - ``'cauchy_welch'`` — per-bin Welch :math:`|t|` with a Cauchy
-          combination across bins. Also yields a ``P_value_per_bin`` column.
+        - ``'cauchy_welch'`` — per-bin Welch two-sided t-test with
+          **analytic** (t-distribution) p-values combined across bins via
+          Cauchy's combination (Liu & Xie 2020). Analytic is the whole
+          point: permutation p-values would floor at ``1/(n_perm + 1)``
+          per bin, which would also floor the gene-level combined
+          p-value and destroy BH-FDR power across thousands of genes.
+          Yields an extra ``P_value_per_bin`` column.
     n_perm : int, default 1000
-        Number of label permutations for the null distribution.
+        Number of label permutations for the null distribution. **Ignored**
+        when ``statistic='cauchy_welch'`` (that path is fully analytic).
     random_state : int, optional
-        Seed for the permutation RNG.
+        Seed for the permutation RNG (ignored for ``'cauchy_welch'``).
     n_jobs : int, default 1
         Reserved for future parallelism over genes; currently unused (the per-stat
         implementations are already vectorized over genes).
@@ -1139,6 +1412,14 @@ def compare_two_groups(  # noqa: C901
         polynomial low-pass shape to mirror a CAR kernel, or an exponential
         high-pass shape to mirror a Gaussian kernel. ``None`` (default)
         means uniform weights.
+    n_perm_max : int, default 10000
+        If the total number of distinct two-group relabellings
+        ``C(n_samples, n_a)`` is at most this, every possible relabelling
+        is enumerated (**exact permutation test**) and ``n_perm`` is
+        overridden to the enumeration count. This is both faster and
+        strictly more accurate than sampling in the small-sample regime
+        (e.g. 6-vs-6 → 924 partitions, 5-vs-5 → 252). Above the threshold
+        the test falls back to ``n_perm`` random shuffles.
 
     Returns
     -------
@@ -1170,12 +1451,11 @@ def compare_two_groups(  # noqa: C901
     g_int = (groups == uniq[1]).astype(int)  # 0 = first label sorted, 1 = second
 
     rng = np.random.default_rng(random_state)
-    perm_idx = _permutation_indices(n_samples, n_perm, rng)
 
     if statistic == "cauchy_welch":
         if freq_weights is not None:
             logger.debug("freq_weights is ignored by statistic='cauchy_welch'.")
-        observed, combined_p, per_bin_p = _run_cauchy_welch_with_perm(spectra, g_int, perm_idx)
+        observed, combined_p, per_bin_p = _run_cauchy_welch_analytic(spectra, g_int)
         summary_stat = observed.max(axis=-1)  # reportable scalar per gene
         if gene_names is None:
             gene_names = [str(i) for i in range(n_genes)]
@@ -1193,8 +1473,16 @@ def compare_two_groups(  # noqa: C901
             logger.debug("n_jobs ignored: per-statistic implementations are already vectorized.")
         return df
 
+    perm_labels, is_exact = _exchangeable_group_labels(g_int, n_perm, rng, n_perm_max=n_perm_max)
+    if is_exact:
+        logger.info(
+            "Exact permutation test: enumerated %d distinct relabellings " "(C(%d, %d)).",
+            perm_labels.shape[0],
+            n_samples,
+            int((g_int == 0).sum()),
+        )
     observed, null = _run_statistic_with_perm(
-        statistic, spectra, g_int, perm_idx, freq_weights=freq_weights
+        statistic, spectra, g_int, perm_labels, freq_weights=freq_weights
     )
     pvals = _permutation_pvalue(observed, null)
 
@@ -1215,6 +1503,7 @@ def benchmark_statistics(
     statistics: Sequence[str] = _AVAILABLE_STATISTICS,
     n_perm: int = 1000,
     random_state: int | None = None,
+    n_perm_max: int = 10000,
 ) -> dict[str, pd.DataFrame]:
     """
     Run several statistics on the same data with a **shared** permutation null.
@@ -1256,14 +1545,19 @@ def benchmark_statistics(
     g_int = (groups == uniq[1]).astype(int)
 
     rng = np.random.default_rng(random_state)
-    perm_idx = _permutation_indices(n_samples, n_perm, rng)
+    perm_labels, is_exact = _exchangeable_group_labels(g_int, n_perm, rng, n_perm_max=n_perm_max)
+    if is_exact:
+        logger.info(
+            "Exact permutation test: enumerated %d distinct relabellings.",
+            perm_labels.shape[0],
+        )
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]
 
     out: dict[str, pd.DataFrame] = {}
     for s in statistics:
         if s == "cauchy_welch":
-            observed, combined_p, per_bin_p = _run_cauchy_welch_with_perm(spectra, g_int, perm_idx)
+            observed, combined_p, per_bin_p = _run_cauchy_welch_analytic(spectra, g_int)
             summary = observed.max(axis=-1)
             df = pd.DataFrame(
                 {
@@ -1274,7 +1568,7 @@ def benchmark_statistics(
                 }
             )
         else:
-            observed, null = _run_statistic_with_perm(s, spectra, g_int, perm_idx)
+            observed, null = _run_statistic_with_perm(s, spectra, g_int, perm_labels)
             pvals = _permutation_pvalue(observed, null)
             df = pd.DataFrame(
                 {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
@@ -1300,6 +1594,7 @@ def compare_two_groups_masked(  # noqa: C901
     random_state: int | None = None,
     min_samples_per_group: int = 2,
     freq_weights: np.ndarray | None = None,
+    n_perm_max: int = 10000,
 ) -> pd.DataFrame:
     """
     Per-gene two-group pattern test with **incomplete data** across samples.
@@ -1380,17 +1675,21 @@ def compare_two_groups_masked(  # noqa: C901
 
         sub = spectra[mask, g : g + 1, :]  # (n_obs, 1, K)
         sub_groups = g_int[mask]
-        # One-shot permutation matrix for this gene.
-        perm_idx = _permutation_indices(mask.sum(), n_perm, rng)
 
         if statistic == "cauchy_welch":
-            observed, combined_p, per_bin_p = _run_cauchy_welch_with_perm(sub, sub_groups, perm_idx)
+            observed, combined_p, per_bin_p = _run_cauchy_welch_analytic(sub, sub_groups)
             row["Statistic"] = float(observed.max())
             row["P_value"] = float(combined_p[0])
             row["P_value_per_bin"] = per_bin_p[0]
         else:
+            # Per-gene exchange set — enumerate exactly when C(n_obs, n_a_obs)
+            # is small, otherwise sample. Subsets are typically smaller than
+            # the global one so the exact path kicks in more often here.
+            perm_labels, _ = _exchangeable_group_labels(
+                sub_groups, n_perm, rng, n_perm_max=n_perm_max
+            )
             observed, null = _run_statistic_with_perm(
-                statistic, sub, sub_groups, perm_idx, freq_weights=freq_weights
+                statistic, sub, sub_groups, perm_labels, freq_weights=freq_weights
             )
             pval = _permutation_pvalue(observed, null)
             row["Statistic"] = float(observed[0])
@@ -1425,6 +1724,7 @@ def compare_two_groups_scalar(
     gene_names: Sequence[str] | None = None,
     n_perm: int = 1000,
     random_state: int | None = None,
+    n_perm_max: int = 10000,
 ) -> pd.DataFrame:
     """
     Per-gene two-sample test on scalar per-sample values (classical DE).
@@ -1473,14 +1773,18 @@ def compare_two_groups_scalar(
     g_int = (groups == uniq[1]).astype(int)
 
     rng = np.random.default_rng(random_state)
-    perm_idx = _permutation_indices(n_samples, n_perm, rng)
+    perm_labels, is_exact = _exchangeable_group_labels(g_int, n_perm, rng, n_perm_max=n_perm_max)
+    if is_exact:
+        logger.info(
+            "Exact permutation test (DE): enumerated %d distinct relabellings.",
+            perm_labels.shape[0],
+        )
     observed = _welch_abs_t(values[g_int == 0], values[g_int == 1])
     mean_diff = values[g_int == 0].mean(axis=0) - values[g_int == 1].mean(axis=0)
 
-    null = np.empty((n_perm, n_genes))
-    for p in range(n_perm):
-        perm_groups = g_int[perm_idx[p]]
-        a = perm_groups == 0
+    null = np.empty((perm_labels.shape[0], n_genes))
+    for p in range(perm_labels.shape[0]):
+        a = perm_labels[p] == 0
         null[p] = _welch_abs_t(values[a], values[~a])
     pvals = _permutation_pvalue(observed, null)
 
@@ -2232,18 +2536,25 @@ class SpectralComparator:
             )
 
         if self.feature_mode == "2d":
-            landmark_indices: list[int] | None = None
+            # Slice out the landmark subset from each sample's spectra.
+            # When landmark_genes is None we use every gene as a landmark,
+            # which gives the strongest signal-to-noise for rotation
+            # estimation (cross-gene noise cancels because each gene is
+            # cross-correlated against its own same-index counterpart).
             if landmark_genes is not None:
                 name_to_idx = {g: i for i, g in enumerate(self.gene_names)}
                 missing = [g for g in landmark_genes if g not in name_to_idx]
                 if missing:
                     raise KeyError(f"landmark_genes not in gene_names: {missing}")
-                landmark_indices = [name_to_idx[g] for g in landmark_genes]
+                landmark_idx_arr = np.asarray([name_to_idx[g] for g in landmark_genes], dtype=int)
+                landmark_spectra = [s[landmark_idx_arr] for s in self._raw_2d_spectra]
+            else:
+                landmark_spectra = self._raw_2d_spectra
             aligned, angles = align_spectra_by_rotation(
-                self._raw_2d_spectra,
+                landmark_spectra,
                 grid_shapes=self._grid_shapes,
+                target_spectra=self._raw_2d_spectra,
                 fft_solver=self._spectrum_fft_solver,
-                landmark_indices=landmark_indices,
                 progress=progress,
             )
             self._raw_2d_spectra = aligned
@@ -2386,6 +2697,7 @@ class SpectralComparator:
         n_perm: int = 1000,
         random_state: int | None = None,
         freq_weights: np.ndarray | None = None,
+        n_perm_max: int = 10000,
     ) -> pd.DataFrame:
         """
         Two-group spectral-pattern test on the cached :attr:`spectra_`.
@@ -2423,6 +2735,7 @@ class SpectralComparator:
                 random_state=random_state,
                 min_samples_per_group=self.min_samples_per_group,
                 freq_weights=freq_weights,
+                n_perm_max=n_perm_max,
             )
         return compare_two_groups(
             self.spectra_,
@@ -2432,6 +2745,7 @@ class SpectralComparator:
             n_perm=n_perm,
             random_state=random_state,
             freq_weights=freq_weights,
+            n_perm_max=n_perm_max,
         )
 
     # Back-compat alias — `test()` still runs the pattern test.
@@ -2442,6 +2756,7 @@ class SpectralComparator:
         self,
         n_perm: int = 1000,
         random_state: int | None = None,
+        n_perm_max: int = 10000,
     ) -> pd.DataFrame:
         """
         Classical DE test on the DC component (per-sample per-gene grid mean).
@@ -2477,6 +2792,7 @@ class SpectralComparator:
             gene_names=self.gene_names,
             n_perm=n_perm,
             random_state=random_state,
+            n_perm_max=n_perm_max,
         )
 
     # ------------------------------------------------------------------
@@ -2485,6 +2801,7 @@ class SpectralComparator:
         statistics: Sequence[str] = _AVAILABLE_STATISTICS,
         n_perm: int = 1000,
         random_state: int | None = None,
+        n_perm_max: int = 10000,
     ) -> dict[str, pd.DataFrame]:
         """Run :func:`benchmark_statistics` on the cached :attr:`spectra_`."""
         if self.spectra_ is None:
@@ -2496,4 +2813,5 @@ class SpectralComparator:
             statistics=statistics,
             n_perm=n_perm,
             random_state=random_state,
+            n_perm_max=n_perm_max,
         )
