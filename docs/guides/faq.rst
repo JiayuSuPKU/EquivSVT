@@ -38,39 +38,59 @@ See :doc:`/guides/theory` for mathematical details (Theorem 2).
 Use Q-test for identifying spatially variable genes (SVGs). Use R-test for finding spatially co-expressed gene pairs.
 
 
-**Q: What's the difference between matrix and FFT versions?**
+**Q: Which backend should I pick?**
 
-**Matrix-based** (``SpatialKernel``, ``PatternDetector``):
+``quadsv`` has three kernel representations and one test layer built on top
+of them. You almost always pick via the detector's ``backend`` argument
+rather than hand-building a kernel:
 
-- Works on any spatial coordinates or graphs (irregular layouts)
-- Uses implicit sparse solvers for scalability (CAR kernel stores precision matrix only)
-- Null distribution via Welch approximation (no eigendecomposition needed)
-- Example: Visium, single-cell segmented spatial data, single-cell lineage trees
+**``backend="matrix"`` (default,** :class:`~quadsv.SpatialKernel`\ **)**
 
-**FFT-based** (``FFTKernel``, ``PatternDetectorFFT``):
+- Works on any spatial coordinates or graphs (irregular layouts).
+- The kernel class auto-decides internally whether to materialize the dense
+  ``(N, N)`` matrix or keep just the sparse precision matrix and solve with
+  an LU factorization on demand — **you never see the dense-vs-sparse
+  switch**, it is memory-driven.
+- Example: standard Visium, MERFISH, single-cell lineage trees.
 
-- Specialized for regular grids with even spacing
-- O(N log N) complexity via FFT spectral decomposition
-- Requires periodic boundary conditions
-- Example: VisiumHD, SpatialData rasterized to a fixed resolution (e.g., 1000x1000 grid)
+**``backend="nufft"`` (**\ :class:`~quadsv.NUFFTKernel`\ **)**
+
+- Also handles irregular spots but never forms an ``(N, N)`` matrix —
+  kernel action is evaluated via type-1/type-2 non-uniform FFTs in
+  ``O(N log N)`` per feature.
+- Ideal for ≥ 10⁴ spots where even the sparse-precision matrix becomes
+  prohibitive.
+- Grid resolution and spacing are auto-inferred from the coordinates.
+
+**``PatternDetectorFFT`` (**\ :class:`~quadsv.FFTKernel`\ **)**
+
+- Specialized for regular rasterized grids with periodic boundary
+  conditions. Consumes :class:`spatialdata.SpatialData` directly.
+- O(N log N) via FFT spectral decomposition with no k-NN graph needed.
+- Example: Visium HD at millions of spots on a fixed grid.
 
 .. code-block:: python
 
-   # Matrix version (general)
-   from quadsv.kernels import SpatialKernel
-   kernel = SpatialKernel.from_coordinates(coords, method='car')
-   
-   # FFT version (grids)
-   from quadsv.fft import FFTKernel
-   kernel_fft = FFTKernel(shape=(1000, 1000), method='car')
+   from quadsv import PatternDetector, PatternDetectorFFT
 
-For irregular data → use matrix version. For large regular grids → use FFT version.
+   # Irregular layout, small-to-moderate N
+   det = PatternDetector(adata).build_kernel(backend="matrix", method="car")
+
+   # Irregular layout, large N
+   det = PatternDetector(adata).build_kernel(backend="nufft", method="matern")
+
+   # Regular grid, SpatialData
+   det = PatternDetectorFFT(sdata, kernel_method="car", rho=0.9, topology="square")
 
 **Q: Can I use quadsv with single-cell data (not spatially resolved)?**
 
-Yes, if you can define spatial relationships (e.g., k-NN graph in PCA space, pseudotime ordering, lineage trees). 
-Pass the coordinates to :meth:`quadsv.kernels.SpatialKernel.from_coordinates` or a precomputed kernel matrix directly to :meth:`quadsv.kernels.SpatialKernel.from_matrix`.
-If using Anndata and ``PatternDetector``, try :meth:`quadsv.detector.PatternDetector.build_kernel_from_coordinates` and :meth:`quadsv.detector.PatternDetector.build_kernel_from_obsp` for matrix input.
+Yes, if you can define spatial relationships (e.g., k-NN graph in PCA
+space, pseudotime ordering, lineage trees). Pass the coordinates to
+:meth:`quadsv.SpatialKernel.from_coordinates`, or a precomputed kernel /
+precision matrix directly to :meth:`quadsv.SpatialKernel.from_matrix`. If
+you have an :class:`~anndata.AnnData` and want to build the kernel from
+``.obsp``, reach for
+:meth:`quadsv.PatternDetector.build_kernel_from_obsp`.
 
 **Q: Does quadsv support 3D spatial coordinates?**
 

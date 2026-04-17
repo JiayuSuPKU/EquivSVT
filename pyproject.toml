@@ -76,10 +76,12 @@ dev = [
 # standalone `sphinxcontrib-napoleon` package is not needed.
 docs = [
     "sphinx>=5.0",
-    "pydata-sphinx-theme>=0.13",
+    "sphinx-book-theme>=1.1",
+    "sphinx-autoapi>=3.0",
     "sphinx-autodoc-typehints>=1.19",
     "myst-parser>=0.18",
     "sphinx-autobuild>=2021.3.14",
+    "tomli>=2.0;python_version<'3.11'",   # tomllib fallback in docs/conf.py
 ]
 
 [project.urls]

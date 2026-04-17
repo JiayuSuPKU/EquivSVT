@@ -70,15 +70,32 @@ are directly comparable:
 
 Use :func:`~quadsv.benchmark_statistics` to evaluate all four on the same data.
 
-Toy walkthrough
----------------
+Input types
+-----------
 
-The minimal end-to-end example below builds eight synthetic samples (4 per group)
-of 10 genes on a 32x32 grid; gene ``g0`` carries a low-frequency stripe pattern
-in group 1 only.
+:class:`~quadsv.SpectralComparator` accepts two — and only two — kinds of
+per-sample container:
+
+- a list of :class:`anndata.AnnData` → **NUFFT backend** (irregular spots,
+  common across Visium, Slide-seq, Stereo-seq, MERFISH). Each sample keeps
+  its **own** ``(grid_shape, spacing)``; cross-sample comparability is
+  obtained in physical-frequency space via radial binning.
+- a list of :class:`spatialdata.SpatialData` → **FFT backend** (regular
+  rasterized grids, e.g., Visium HD).
+
+Sparse ``adata.X`` / layer matrices are **not densified up front** — the
+spectrum loop converts exactly one gene column at a time to dense.
+
+Toy walkthrough (AnnData / NUFFT)
+---------------------------------
+
+The minimal end-to-end example below builds eight synthetic samples (4 per
+group) of 10 genes. Gene ``g0`` carries a low-frequency stripe pattern in
+group 1 only.
 
 .. code-block:: python
 
+   import anndata as ad
    import numpy as np
    from quadsv import SpectralComparator
 
@@ -87,15 +104,23 @@ in group 1 only.
    n_genes = 10
    gene_names = [f"g{i}" for i in range(n_genes)]
 
-   def make_sample(group: int) -> np.ndarray:
-       x = rng.standard_normal((n_genes, ny, nx)) * 0.1
-       if group == 1:
-           y = np.arange(ny)[:, None]
-           stripes = np.broadcast_to(np.sin(2 * np.pi * y / 16.0), (ny, nx))
-           x[0] += stripes * 1.5
-       return x
+   def make_adata(group: int) -> ad.AnnData:
+       # Spot layout: regular 32x32 grid; the NUFFT backend does not care,
+       # it auto-infers grid_shape and spacing from the coords.
+       yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
+       coords = np.stack([yy.ravel(), xx.ravel()], axis=1).astype(float)
 
-   samples = [make_sample(0) for _ in range(4)] + [make_sample(1) for _ in range(4)]
+       X = rng.standard_normal((ny * nx, n_genes)) * 0.1
+       if group == 1:
+           stripes = np.sin(2 * np.pi * yy / 16.0).ravel()
+           X[:, 0] += 1.5 * stripes
+
+       a = ad.AnnData(X=X)
+       a.var_names = gene_names
+       a.obsm["spatial"] = coords
+       return a
+
+   samples = [make_adata(0) for _ in range(4)] + [make_adata(1) for _ in range(4)]
    groups = np.array([0, 0, 0, 0, 1, 1, 1, 1])
 
    cmp = (
@@ -107,6 +132,26 @@ in group 1 only.
    print(results.head())
 
 The implanted gene ``g0`` ranks first in the resulting table.
+
+FFT walkthrough (SpatialData)
+-----------------------------
+
+Swap the per-sample containers for :class:`spatialdata.SpatialData` and the
+same API picks the FFT path — no other code changes:
+
+.. code-block:: python
+
+   import spatialdata as sd
+   from quadsv import SpectralComparator
+
+   samples_sd = [sd.read_zarr(p) for p in paths_by_group]
+   cmp = SpectralComparator(
+       samples_sd,
+       groups,
+       gene_names=None,           # inferred from the first sample's table
+       table_key="squidpy",        # or None if only one table
+   ).fit().normalize_background()
+   cmp.test(statistic="log_l2", n_perm=300)
 
 Magnitude-robust gene clustering via ``shape_normalize``
 --------------------------------------------------------
@@ -127,7 +172,7 @@ curve survives. Chain it after background normalization:
 .. code-block:: python
 
    cmp = (
-       SpectralComparator(samples, groups, gene_names, spacings=spacings)
+       SpectralComparator(samples, groups, gene_names)
        .fit()
        .normalize_background()   # cancels per-sample gain across genes
        .shape_normalize()        # cancels per-(sample, gene) magnitude across freq
@@ -138,66 +183,51 @@ curve survives. Chain it after background normalization:
 The per-gene DE test via :meth:`SpectralComparator.test_expression` is
 unaffected — it reads from ``cmp.dc_`` directly.
 
-Non-uniform spatial grids: NUFFT path
--------------------------------------
+Cross-sample unit conversion (NUFFT path)
+-----------------------------------------
 
-When spot coordinates are **not** already on a regular grid — e.g., Slide-seq
-puck beads, Stereo-seq nanowells, or a Visium slide read straight from
-``adata.obsm['spatial']`` without rasterization — you can skip the
-rasterize-then-FFT detour entirely and compute the power spectrum directly on
-the irregular points with a type-1 non-uniform FFT
-(`finufft <https://finufft.readthedocs.io>`_). Install the optional extra::
-
-   pip install 'quadsv[nufft]'
-
-Then build a comparator from per-sample ``(coords, values)`` pairs via the
-:meth:`SpectralComparator.from_coords` classmethod:
+When different samples ship coordinates in different physical units — e.g.,
+one slide in μm and another in Visium full-resolution pixels at
+0.35 μm/pixel — pass a per-sample ``unit_scales`` list that converts each
+sample's raw coords into the common unit. Radial bins then come out in
+cycles per that unit on all samples:
 
 .. code-block:: python
 
-   cmp = SpectralComparator.from_coords(
-       coords=list_of_Nx2_arrays,         # per-sample (y, x) in each sample's unit
-       values=list_of_NxG_arrays,         # per-spot, per-gene expression
-       groups=groups,
+   cmp = SpectralComparator(
+       samples,                 # list[AnnData]
+       groups,
        gene_names=gene_names,
-       grid_shape=(ny, nx),               # common k-space target
-       spacing=(dy_um, dx_um),            # common physical spacing (μm)
-       unit_scales=[1.0, 0.35, ...],      # per-sample multiplier onto the common unit
+       unit_scales=[1.0, 0.35, 1.0, 0.35],   # per-sample multiplier
+       spacing=(50.0, 50.0),                  # common physical spacing, μm
+       n_radial_bins=30,
    ).fit().normalize_background()
 
-The ``unit_scales`` list converts each sample's coordinate units into the
-common physical unit chosen for ``spacing``, so slides measured in μm can be
-mixed with slides measured in 0.35 μm/pixel Visium full-res pixels. Every
-sample lands on the same k-space grid, so radial bins, pattern tests, and
-DE tests behave exactly as for rasterized samples.
+If ``grid_shape`` / ``spacing`` are left unset, each sample's k-grid is
+auto-inferred from its coords via
+:func:`quadsv.nufft._infer_grid_from_coords`.
 
-:func:`quadsv.power_spectrum_2d_nufft` is the lower-level primitive (one
-sample at a time). Correctness is validated against the rasterized FFT on
-real Visium data: ``FFT(zero-filled raster)`` equals ``NUFFT(raw coords)``
-to ~10⁻⁶ relative tolerance (see ``tests/test_nufft.py``).
+:func:`quadsv.nufft.power_spectrum_2d_nufft` is the lower-level primitive
+(one sample at a time). Correctness is validated against the rasterized FFT
+on real Visium data: ``FFT(zero-filled raster)`` equals
+``NUFFT(raw coords)`` to ~10⁻⁶ relative tolerance (see
+``tests/test_nufft.py``).
 
-Visium hex grids → physical frequency
--------------------------------------
+Visium hex grids
+----------------
 
-For 10x Visium slides, :func:`quadsv.load_visium_sample` reads a Space Ranger
-output directory into an :class:`anndata.AnnData`, and
-:func:`quadsv.visium_to_grid` rasterizes the hex-arranged spots onto a regular
-``(78, 128)`` grid (``'dense'`` mode) with the hex offset preserved and empty
-cells filled from their two nearest in-row hex neighbours. The function returns
-both the ``(n_genes, 78, 128)`` array and the physical spacing
-``(dy, dx) = (100·√3/2, 50)`` μm per cell.
+For 10x Visium slides, :func:`quadsv.io_visium.load_visium_sample` (from the
+submodule) reads a Space Ranger output directory into an
+:class:`anndata.AnnData`. You can feed that :class:`~anndata.AnnData`
+directly to :class:`~quadsv.SpectralComparator` — the NUFFT backend handles
+the irregular hex layout without any manual rasterization step. If you do
+want the explicit hex-to-grid rasterization for other purposes,
+:func:`quadsv.io_visium.visium_to_grid` returns the ``(n_genes, 78, 128)``
+array and the physical spacing ``(dy, dx) = (100·√3/2, 50)`` μm per cell
+for v1 Visium.
 
-Pass that spacing (the same for every v1 Visium slide) to
-:class:`~quadsv.SpectralComparator` via ``spacings=`` so that radial bins are
-defined in **cycles per μm** (physical frequency) with a single common edge grid
-across samples — slides with slightly different in-tissue shapes become directly
-comparable. The Nyquist limit along the coarser axis is
-``1 / (2 · 86.6 μm) ≈ 5.77 cycles/mm`` (equivalent to a minimum resolvable
-pattern of ~170 μm).
-
-A complete DLPFC-vs-GBM example is in
-``scripts/dlpfc_vs_gbm_spectral_comparison.ipynb`` and
-``scripts/idhm_vs_gbm_spectral_comparison.ipynb``.
+The minimum resolvable pattern of a v1 Visium slide is roughly
+``2 · 86.6 μm ≈ 173 μm`` (Nyquist along the coarser axis).
 
 Choosing covariate maps for residualization
 -------------------------------------------
@@ -236,6 +266,11 @@ exposes a translation-invariance property that graph Fourier does not.
 API reference
 -------------
 
-See :class:`quadsv.SpectralComparator`, :func:`quadsv.compare_two_groups`,
-:func:`quadsv.benchmark_statistics`, and :func:`quadsv.power_spectrum_2d` for full
-parameter documentation.
+:class:`quadsv.SpectralComparator` is the main public entry point.
+Lower-level primitives live in the :mod:`quadsv.spectral_compare` and
+:mod:`quadsv.nufft` submodules:
+
+- :func:`quadsv.spectral_compare.compare_two_groups`
+- :func:`quadsv.spectral_compare.benchmark_statistics`
+- :func:`quadsv.fft.power_spectrum_2d`
+- :func:`quadsv.nufft.power_spectrum_2d_nufft`

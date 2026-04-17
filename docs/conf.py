@@ -2,9 +2,15 @@
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
-import tomllib
+
+try:
+    # Python 3.11+
+    import tomllib  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    import tomli as tomllib  # type: ignore[no-redef]
 
 # -- Project information -----------------------------------------------------
+
 
 def _load_project_info() -> tuple[str, str, str]:
     """Load (name, author, version) from installed metadata or pyproject.toml."""
@@ -19,11 +25,7 @@ def _load_project_info() -> tuple[str, str, str]:
         name = project_cfg.get("name", "quadsv")
         version = project_cfg.get("version", "0.0.0")
         authors = project_cfg.get("authors", [])
-        author = (
-            authors[0].get("name", "")
-            if authors and isinstance(authors[0], dict)
-            else ""
-        )
+        author = authors[0].get("name", "") if authors and isinstance(authors[0], dict) else ""
         return name, author, version
 
 
@@ -35,15 +37,15 @@ release = version
 # -- General configuration ---------------------------------------------------
 
 extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.autosummary',
-    'sphinx.ext.intersphinx',
-    'sphinx.ext.autosectionlabel',
-    'sphinx.ext.mathjax',
-    'sphinx.ext.viewcode',
-    'autoapi.extension',
-    'sphinx.ext.napoleon',
-    'myst_parser',
+    "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.intersphinx",
+    "sphinx.ext.autosectionlabel",
+    "sphinx.ext.mathjax",
+    "sphinx.ext.viewcode",
+    "autoapi.extension",
+    "sphinx.ext.napoleon",
+    "myst_parser",
 ]
 
 # MyST configuration
@@ -53,17 +55,17 @@ myst_enable_extensions = [
 ]
 
 # AutoAPI configuration
-autoapi_dirs = ['../quadsv']
+autoapi_dirs = ["../quadsv"]
 autoapi_add_toctree_entry = False
-autoapi_python_class_content = 'class'
-autoapi_ignore = ['**/.ipynb_checkpoints/*', '**/*-checkpoint.py']
+autoapi_python_class_content = "class"
+autoapi_ignore = ["**/.ipynb_checkpoints/*", "**/*-checkpoint.py"]
 autoapi_options = [
-    'members',
-    'undoc-members',
-    'show-inheritance',
-    'show-module-summary',
+    "members",
+    "undoc-members",
+    "show-inheritance",
+    "show-module-summary",
 ]
-autoapi_member_order = 'groupwise'
+autoapi_member_order = "groupwise"
 
 # Napoleon configuration
 napoleon_numpy_docstring = True
@@ -79,15 +81,15 @@ napoleon_use_ivar = True
 
 # Autodoc options
 autodoc_default_options = {
-    'members': True,
-    'member-order': 'bysource',
-    'special-members': '__init__',
-    'undoc-members': False,
-    'show-inheritance': True,
+    "members": True,
+    "member-order": "bysource",
+    "special-members": "__init__",
+    "undoc-members": False,
+    "show-inheritance": True,
 }
 # Treat single-backtick interpreted text as literal to avoid accidental
 # ambiguous cross-references from docstring tokens like `n` or `n_factors`.
-default_role = 'literal'
+default_role = "literal"
 autodoc_typehints = "description"
 autodoc_typehints_format = "short"
 python_use_unqualified_type_names = True
@@ -97,48 +99,50 @@ autosectionlabel_prefix_document = True
 
 # Source file patterns
 source_suffix = {
-    '.rst': 'restructuredtext',
-    '.md': 'markdown',
+    ".rst": "restructuredtext",
+    ".md": "markdown",
 }
 
-templates_path = ['_templates']
-exclude_patterns = ['_build', '_templates', 'Thumbs.db', '.DS_Store']
+templates_path = ["_templates"]
+exclude_patterns = ["_build", "_templates", "Thumbs.db", ".DS_Store"]
 
 # -- Intersphinx mapping -----------------------------------------------------
 
 intersphinx_mapping = {
-    'numpy': ('https://numpy.org/doc/stable/', None),
-    'scipy': ('https://docs.scipy.org/doc/scipy/', None),
-    'pandas': ('https://pandas.pydata.org/docs/', None),
-    'sphinx': ('https://www.sphinx-doc.org/en/master/', None),
-    'anndata': ('https://anndata.readthedocs.io/en/stable/', None),
+    "numpy": ("https://numpy.org/doc/stable/", None),
+    "scipy": ("https://docs.scipy.org/doc/scipy/", None),
+    "pandas": ("https://pandas.pydata.org/docs/", None),
+    "sphinx": ("https://www.sphinx-doc.org/en/master/", None),
+    "anndata": ("https://anndata.readthedocs.io/en/stable/", None),
+    "spatialdata": ("https://spatialdata.scverse.org/en/latest/", None),
+    "scanpy": ("https://scanpy.readthedocs.io/en/stable/", None),
 }
-intersphinx_disabled_domains = ['std']
+intersphinx_disabled_domains = ["std"]
 
 # LaTeX options for math rendering (MathJax 4)
 mathjax4_config = {
-    'tex': {
-        'inlinemath': [['$', '$'], ['\\(', '\\)']],
-        'displaymath': [['$$', '$$'], ['\\[', '\\]']],
+    "tex": {
+        "inlinemath": [["$", "$"], ["\\(", "\\)"]],
+        "displaymath": [["$$", "$$"], ["\\[", "\\]"]],
     }
 }
 
 # -- Options for HTML output --------------------------------------------------
 
-html_theme = 'sphinx_book_theme'
+html_theme = "sphinx_book_theme"
 html_theme_options = {
-    'logo': {
-        'text': 'quadsv',
+    "logo": {
+        "text": "quadsv",
     },
-    'search_bar_text': 'Search...',
-    'show_toc_level': 4,
-    'navigation_depth': 4,
-    'repository_url': 'https://github.com/JiayuSuPKU/EquivSVT',
-    'use_repository_button': True,
+    "search_bar_text": "Search...",
+    "show_toc_level": 4,
+    "navigation_depth": 4,
+    "repository_url": "https://github.com/JiayuSuPKU/EquivSVT",
+    "use_repository_button": True,
 }
 
-html_static_path = ['_static']
+html_static_path = ["_static"]
 
 # -- Suppress certain warnings ------------------------------------------------
 
-suppress_warnings = ['ref.citation', 'autosectionlabel.*', 'duplicate_object']
+suppress_warnings = ["ref.citation", "autosectionlabel.*", "duplicate_object"]

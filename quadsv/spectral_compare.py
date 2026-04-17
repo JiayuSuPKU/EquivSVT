@@ -1105,74 +1105,101 @@ class SpectralComparator:
     """
     High-level pipeline for cross-sample spectral pattern comparison.
 
-    Wraps :func:`compute_sample_spectrum`, :func:`radial_bin_spectrum`,
-    :func:`align_spectra_by_rotation`, :func:`normalize_by_background`,
-    :func:`residualize_against_covariates`, and :func:`compare_two_groups` /
-    :func:`benchmark_statistics` into a fluent, caching pipeline.
+    Accepts a list of :class:`anndata.AnnData` (→ NUFFT backend, irregular
+    spots) or a list of :class:`spatialdata.SpatialData` (→ FFT backend,
+    rasterized grids) and chains per-sample spectra, radial binning,
+    background normalization, optional residualization, and a
+    permutation-based two-group test. Both backends honor the same
+    public API — :meth:`fit`, :meth:`normalize_background`,
+    :meth:`shape_normalize`, :meth:`residualize`, :meth:`test_pattern`,
+    :meth:`test_expression`.
 
-    Typical use::
-
-        cmp = SpectralComparator(samples, groups, gene_names).fit()
-        cmp.normalize_background()
-        results = cmp.test(statistic="log_l2", n_perm=1000)
+    Sparse ``adata.X`` / SpatialData-table expression matrices are
+    **never fully densified**; the per-sample spectrum loop converts
+    one gene column at a time to dense.
 
     Parameters
     ----------
-    samples : list of np.ndarray
-        Per-sample rasterized arrays of shape ``(n_genes, ny_s, nx_s)``. ``n_genes``
-        must be the same across samples; ``(ny_s, nx_s)`` may differ.
+    samples : list of :class:`anndata.AnnData` or list of :class:`spatialdata.SpatialData`
+        All entries must be of the same concrete type (mixed lists raise
+        :class:`TypeError`).
     groups : np.ndarray
         Group labels of length ``len(samples)`` with exactly two distinct values.
-    gene_names : list of str
-        Gene names of length ``n_genes``.
+    gene_names : sequence of str, optional
+        If None, inferred from the first sample; every other sample must then
+        share the same ``var_names``.
     feature_mode : {'radial', '2d'}, default 'radial'
-        ``'radial'`` (default) reduces every spectrum to a 1D radial vector — both
-        translation- and rotation-invariant. ``'2d'`` keeps the full 2D spectrum and
-        rotation-aligns each sample to the first one before flattening.
+        Radial binning (rotation-invariant) vs flattened 2D spectrum with
+        rotation alignment.
     n_radial_bins : int, default 30
-        Number of radial bins when ``feature_mode='radial'``.
+        Number of radial bins in ``'radial'`` mode.
     fft_solver : {'fft2', 'rfft2'}, default 'rfft2'
-        FFT solver passed to :func:`compute_sample_spectrum`.
+        FFT solver used by the SpatialData / FFT backend.
     workers : int, optional
         FFT worker count.
-    center : {'mean', 'zscore', None}, default 'mean'
-        Per-gene spatial-signal centering applied before the FFT. ``'mean'``
-        (default) makes the spectrum exactly DC-free so the pattern test via
-        :meth:`test_pattern` is statistically orthogonal to the DE test via
-        :meth:`test_expression` — the two tests then provide complementary
-        information. See :func:`compute_sample_spectrum` for details.
-    spacings : sequence of tuple[float, float], optional
-        Per-sample physical cell spacing ``(dy, dx)`` (any unit — but all samples
-        must use the same unit). When supplied, radial bins are defined in
-        **physical frequency** (cycles per unit length) with common edges across
-        samples, so spectra from slides with different grid shapes and pixel sizes
-        become directly comparable. If None, normalized cycles/pixel bins are used.
+    coordinates_key : str, default 'spatial'
+        AnnData ``obsm`` key holding ``(n_obs, 2)`` coordinates (NUFFT backend).
+    layer : str, optional
+        AnnData layer to read instead of ``.X`` (NUFFT backend).
+    table_key : str, optional
+        Table name inside each :class:`~spatialdata.SpatialData` object.
+        Required when a sample has more than one table.
+    unit_scales : sequence of float, optional
+        Per-sample multiplier converting raw coords into the common unit used
+        by ``spacing`` (NUFFT backend). Default ``[1.0] * n_samples``.
+    grid_shape, spacing : optional
+        When supplied, used for every sample; otherwise each sample's grid is
+        auto-inferred. Per-sample grids are fine — cross-sample alignment
+        lives in physical-frequency space via radial binning.
     freq_edges : np.ndarray, optional
-        Explicit radial-frequency bin edges (length ``n_radial_bins + 1``) in the
-        same units as ``spacings``. When None and ``spacings`` is given, edges are
-        auto-generated from 0 to the minimum per-sample Nyquist frequency.
+        Explicit radial-frequency bin edges.
+    center : {'mean', 'zscore', None}, default 'mean'
+        Pre-FFT centering. ``'mean'`` makes DC exactly zero so the pattern
+        test and :meth:`test_expression` are orthogonal.
+    eps : float, default 1e-6
+        NUFFT tolerance (AnnData path only).
 
     Attributes
     ----------
-    samples : list of np.ndarray
-        The raw rasterized arrays passed in.
+    samples : list
+        The input list, stored by reference.
     groups : np.ndarray
         Group labels.
     gene_names : list of str
-        Gene names.
-    feature_mode : str
-        Feature mode in use.
+        Resolved gene names (either passed in or inferred from sample 0).
+    mode : {'nufft', 'fft'}
+        Which backend this comparator is using — set at construction time
+        based on the sample type.
     spectra_ : np.ndarray or None
-        Per-sample feature matrix of shape ``(n_samples, n_genes, K)``. Set by
-        :meth:`fit`. Subsequent calls to :meth:`normalize_background` /
-        :meth:`residualize` mutate this in place.
+        Per-sample feature matrix of shape ``(n_samples, n_genes, K)``. Set
+        by :meth:`fit`; mutated in place by :meth:`normalize_background` /
+        :meth:`residualize` / :meth:`shape_normalize`.
     dc_ : np.ndarray or None
         Per-sample per-gene DC scalars (grid means) of shape
-        ``(n_samples, n_genes)``. Set by :meth:`fit`. Unaffected by the
-        normalization / residualization steps (they only touch ``spectra_``).
+        ``(n_samples, n_genes)``. Unaffected by the post-fit transforms on
+        ``spectra_``.
     rotation_angles_ : np.ndarray or None
-        Recovered rotation angles (degrees), set when ``feature_mode='2d'`` and
-        :meth:`fit` has been called.
+        Recovered rotation angles (degrees), set when
+        ``feature_mode='2d'`` and :meth:`fit` has been called.
+
+    Examples
+    --------
+    Irregular spots → NUFFT backend:
+
+    >>> import anndata as ad
+    >>> import numpy as np
+    >>> from quadsv import SpectralComparator
+    >>> rng = np.random.default_rng(0)
+    >>> def mk(seed):
+    ...     a = ad.AnnData(X=rng.standard_normal((200, 4)))
+    ...     a.var_names = [f"g{i}" for i in range(4)]
+    ...     a.obsm["spatial"] = rng.uniform(0, 20, size=(200, 2))
+    ...     return a
+    >>> samples = [mk(i) for i in range(4)]
+    >>> groups = np.array([0, 0, 1, 1])
+    >>> cmp = SpectralComparator(samples, groups).fit().normalize_background()
+    >>> cmp.mode
+    'nufft'
     """
 
     def __init__(  # noqa: C901

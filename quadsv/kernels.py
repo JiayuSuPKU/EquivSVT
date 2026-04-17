@@ -210,6 +210,18 @@ class Kernel(ABC):
         np.ndarray
             ``K @ x`` with the same number of columns as ``x``; shape
             ``(N,)`` if ``x`` was 1D, otherwise ``(N, M)``.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> from quadsv import SpatialKernel
+        >>> rng = np.random.default_rng(0)
+        >>> coords = rng.standard_normal((40, 2))
+        >>> kernel = SpatialKernel.from_coordinates(coords, method="matern")
+        >>> z = rng.standard_normal(40)
+        >>> Kz = kernel.Kx(z)
+        >>> Kz.shape
+        (40,)
         """
         if sp.issparse(x):
             x_in = x.toarray()
@@ -259,6 +271,19 @@ class Kernel(ABC):
         -------
         float or np.ndarray
             Scalar if both inputs are 1D; shape ``(M,)`` when batched.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> from quadsv import SpatialKernel
+        >>> rng = np.random.default_rng(0)
+        >>> coords = rng.standard_normal((40, 2))
+        >>> kernel = SpatialKernel.from_coordinates(coords, method="matern")
+        >>> x = rng.standard_normal(40)
+        >>> y = rng.standard_normal(40)
+        >>> R = kernel.xtKy(x, y)
+        >>> isinstance(R, float)
+        True
         """
         if sp.issparse(x):
             x_dense = np.asarray(x.toarray())

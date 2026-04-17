@@ -577,6 +577,18 @@ def spatial_q_test_nufft(  # noqa: C901
     ------
     ValueError
         If ``Xn``'s first dimension does not match ``kernel.n``.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from quadsv import NUFFTKernel, spatial_q_test_nufft
+    >>> rng = np.random.default_rng(0)
+    >>> coords = rng.uniform(0, 20, size=(400, 2))
+    >>> kernel = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
+    >>> z = rng.standard_normal(400)
+    >>> Q, pval = spatial_q_test_nufft(z, kernel)
+    >>> 0.0 <= pval <= 1.0
+    True
     """
     Xn = np.asarray(Xn, dtype=float)
     if Xn.ndim == 1:
@@ -677,6 +689,19 @@ def spatial_r_test_nufft(
     ------
     ValueError
         If the leading dimensions of ``Xn`` or ``Yn`` don't match ``kernel.n``.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from quadsv import NUFFTKernel, spatial_r_test_nufft
+    >>> rng = np.random.default_rng(0)
+    >>> coords = rng.uniform(0, 20, size=(400, 2))
+    >>> kernel = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
+    >>> x = rng.standard_normal(400)
+    >>> y = rng.standard_normal(400)
+    >>> R, pval = spatial_r_test_nufft(x, y, kernel)
+    >>> 0.0 <= pval <= 1.0
+    True
     """
     Xn = np.asarray(Xn, dtype=float)
     Yn = np.asarray(Yn, dtype=float)

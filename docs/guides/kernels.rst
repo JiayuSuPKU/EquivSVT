@@ -44,29 +44,39 @@ The Q-test power for a spatial pattern :math:`f` is governed by the spectrum
 Quick Start examples
 --------------------
 
-**Spatial transcriptomics (Visium, MERFISH)**
+**Spatial transcriptomics, irregular layout (Visium, MERFISH)**
 
 .. code-block:: python
 
-   from quadsv.kernels import SpatialKernel
+   from quadsv import SpatialKernel
    kernel = SpatialKernel.from_coordinates(
-       coords, method='car', k_neighbors=4, rho=0.9
+       coords, method="car", k_neighbors=4, rho=0.9
    )
 
-**Large-scale grids (Visium HD)**
+**Large irregular layout (≥ 10⁴ spots)**
 
 .. code-block:: python
 
-   from quadsv.fft import FFTKernel
-   # the spatial data is presented as a 1000x1000 rasterized grid (e.g., via SpatialData)
-   kernel = FFTKernel(shape=(1000, 1000), method='car', rho=0.9, neighbor_degree=1)
+   from quadsv import NUFFTKernel
+   # grid_shape / spacing auto-inferred from coords when omitted
+   kernel = NUFFTKernel(coords, method="matern", bandwidth=25.0, nu=1.5)
+
+**Large-scale regular grids (Visium HD)**
+
+.. code-block:: python
+
+   from quadsv import FFTKernel
+   # 1000x1000 rasterized grid (e.g., from SpatialData)
+   kernel = FFTKernel(
+       shape=(1000, 1000), method="car", rho=0.9, neighbor_degree=1
+   )
 
 **Small datasets or distance-based**
 
 .. code-block:: python
 
    kernel = SpatialKernel.from_coordinates(
-       coords, method='matern', bandwidth=1.0, nu=1.5
+       coords, method="matern", bandwidth=1.0, nu=1.5
    )
 
 
@@ -139,45 +149,33 @@ Use ``SpatialKernel.from_matrix()``:
 
 **Option 2: Subclass ``Kernel`` for custom implementations**
 
-Implement required methods:
-
-- ``_build_kernel()``: Return kernel matrix (explicit) or precision (implicit)
-- ``realization()``: Return dense (N, N) kernel matrix
-- ``xtKx(x)``: Compute :math:`x^\top K x`
-- ``trace()``: Return trace of kernel
-- ``eigenvalues(k)``: Return top k eigenvalues
-- ``square_trace()``: Return :math:`\text{tr}(K^2)`
+The base :class:`quadsv.kernels.Kernel` provides default implementations of
+:meth:`~quadsv.kernels.Kernel.Kx`, :meth:`~quadsv.kernels.Kernel.xtKx`,
+:meth:`~quadsv.kernels.Kernel.xtKy`, :meth:`~quadsv.kernels.Kernel.trace`,
+:meth:`~quadsv.kernels.Kernel.square_trace`, and
+:meth:`~quadsv.kernels.Kernel.eigenvalues` that all work off the single
+``self._K`` buffer. In the vast majority of cases you only need to override
+:meth:`~quadsv.kernels.Kernel._build_kernel`:
 
 .. code-block:: python
 
-   from quadsv.kernels import Kernel
    import numpy as np
-   
+   from quadsv.kernels import Kernel
+
    class MyKernel(Kernel):
        def _build_kernel(self):
-           # Return your custom (N, N) SPD matrix
-           K = self.params["K"]
-           return K
-       
-       def realization(self):
-           return self._K
-       
-       def xtKx(self, x):
-           return x.T @ self._K @ x
-       
-       def trace(self):
-           return np.trace(self._K)
-       
-       def eigenvalues(self, k=None):
-           evals = np.linalg.eigvalsh(self._K)
-           return evals[-k:] if k else evals
-       
-       def square_trace(self):
-           return np.trace(self._K @ self._K)
-   
-   # Usage
-   K_custom = np.eye(100)  # Replace with your SPD kernel
+           # Return a custom (N, N) SPD kernel matrix (or its inverse if you
+           # want the implicit/sparse path — see SpatialKernel for the
+           # precision-matrix pattern).
+           return self.params["K"]
+
+   K_custom = np.eye(100)  # replace with your SPD kernel
    kernel = MyKernel(n=100, method="custom", K=K_custom)
+
+Override :meth:`~quadsv.kernels.Kernel.Kx` only if you have a faster
+operator than ``K.dot(x)`` — for instance, :class:`~quadsv.FFTKernel` and
+:class:`~quadsv.NUFFTKernel` both ship their own :meth:`Kx` that works in
+frequency space.
 
 **Option 3: Subclass ``FFTKernel`` for grid data**
 

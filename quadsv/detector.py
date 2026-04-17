@@ -436,11 +436,34 @@ class PatternDetector:
         Raises
         ------
         ValueError
-            If ``backend`` is not recognized, if ``method`` is not one of
-            the available kernels, or if the backend requires an optional
-            dependency that is not installed.
+            If ``backend`` or ``method`` is not recognized, or if
+            ``adata.obsm[coordinates_key]`` has the wrong shape.
         KeyError
             If ``coordinates_key`` is missing from ``adata.obsm``.
+
+        Examples
+        --------
+        Matrix backend (any irregular layout, dense-vs-sparse picked internally):
+
+        >>> import anndata as ad
+        >>> import numpy as np
+        >>> from quadsv import PatternDetector
+        >>> rng = np.random.default_rng(0)
+        >>> adata = ad.AnnData(X=rng.standard_normal((200, 5)))
+        >>> adata.obsm["spatial"] = rng.standard_normal((200, 2))
+        >>> det = PatternDetector(adata).build_kernel(
+        ...     backend="matrix", method="car", rho=0.9, k_neighbors=8
+        ... )
+        >>> det.backend_
+        'matrix'
+
+        NUFFT backend (large irregular layouts; grid auto-inferred from coords):
+
+        >>> det = PatternDetector(adata).build_kernel(
+        ...     backend="nufft", method="matern", bandwidth=1.0, nu=1.5
+        ... )
+        >>> det.backend_
+        'nufft'
         """
         if backend not in ("matrix", "nufft"):
             raise ValueError(f"backend must be 'matrix' or 'nufft', got '{backend}'.")

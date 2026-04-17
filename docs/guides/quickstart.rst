@@ -3,39 +3,61 @@ Quick Start
 
 Get started with ``quadsv`` in 5 minutes.
 
+The library exposes **four conceptual layers** and nothing else:
+
+1. **Kernels** — :class:`~quadsv.SpatialKernel` (dense/sparse),
+   :class:`~quadsv.FFTKernel` (regular grid), :class:`~quadsv.NUFFTKernel`
+   (irregular 2D coordinates).
+2. **Statistical tests** — :func:`~quadsv.spatial_q_test` /
+   :func:`~quadsv.spatial_r_test` plus their FFT and NUFFT variants. All six
+   share the same signature shape.
+3. **PatternDetector** — :class:`~quadsv.PatternDetector` for
+   :class:`anndata.AnnData` with a ``backend={'matrix', 'nufft'}`` switch;
+   :class:`~quadsv.PatternDetectorFFT` for :class:`spatialdata.SpatialData`.
+4. **SpectralComparator** — cross-sample pattern comparison across a list of
+   AnnData (→ NUFFT) or SpatialData (→ FFT) objects.
+
+
 Q-test basics for spatial variability
-------------------------------------------
+-------------------------------------
 
 Test whether a single gene exhibits significant spatial clustering.
 
 .. code-block:: python
 
    import numpy as np
-   from quadsv.kernels import SpatialKernel
-   from quadsv.statistics import spatial_q_test
+   from quadsv import SpatialKernel, spatial_q_test
 
-   # Load spatial coordinates (N x 2)
-   coords = np.random.randn(500, 2)
-   
-   # Load gene expression (N,)
-   gene_expression = np.random.randn(500)
+   rng = np.random.default_rng(0)
+   coords = rng.standard_normal((500, 2))
+   gene_expression = rng.standard_normal(500)
 
-   # Build CAR kernel (recommended)
+   # CAR kernel (recommended: strictly positive definite)
    kernel = SpatialKernel.from_coordinates(
-       coords, 
-       method='car',        # CAR kernel: strictly positive definite
-       k_neighbors=15,      # 15-NN graph
-       rho=0.9              # Spatial dependence parameter
+       coords,
+       method="car",
+       k_neighbors=15,
+       rho=0.9,
    )
 
-   # Compute Q-statistic and p-value
    Q, pval = spatial_q_test(gene_expression, kernel)
    print(f"Q = {Q:.4f}, p-value = {pval:.4e}")
 
 **Interpretation:**
 
-- High Q-statistic + low p-value → gene is spatially clustered/dispersed
-- Low Q-statistic + high p-value → gene is spatially random
+- High Q + low p-value → gene is spatially clustered/dispersed
+- Low Q + high p-value → gene is spatially random
+
+All six test variants share one signature — ``(x[, y], kernel,
+null_params=None, return_pval=True, is_standardized=False)`` — so you can swap
+backends without changing the call:
+
+.. code-block:: python
+
+   from quadsv import spatial_q_test_fft, spatial_q_test_nufft
+
+   # spatial_q_test_fft(img_2d, fft_kernel)
+   # spatial_q_test_nufft(values_1d, nufft_kernel)
 
 
 R-test basics for spatial co-expression
@@ -45,141 +67,137 @@ Test whether two genes are spatially co-expressed.
 
 .. code-block:: python
 
-   from quadsv.statistics import spatial_r_test
+   from quadsv import spatial_r_test
 
-   gene1 = np.random.randn(500)
-   gene2 = np.random.randn(500)
+   gene1 = rng.standard_normal(500)
+   gene2 = rng.standard_normal(500)
 
    R, pval = spatial_r_test(gene1, gene2, kernel)
    print(f"R = {R:.4f}, p-value = {pval:.4e}")
 
 
 Testing SVG for all genes with AnnData
------------------------------------------------
+--------------------------------------
 
-Detect all spatially variable genes (SVGs) in a tissue sample using ``PatternDetector``, 
-a convenient wrapper class to run Q-tests and R-tests on ``AnnData`` objects.
+Detect all spatially variable genes (SVGs) in a tissue sample using
+:class:`~quadsv.PatternDetector`, the wrapper around :class:`anndata.AnnData`.
+The single :meth:`~quadsv.PatternDetector.build_kernel` entry point picks the
+right kernel representation via ``backend``:
+
+- ``backend="matrix"`` (default) — :class:`~quadsv.SpatialKernel`. The class
+  internally switches between a materialized dense kernel and a sparse
+  precision-matrix + LU-solve representation based on ``n_obs``; you never
+  choose the representation directly.
+- ``backend="nufft"`` — :class:`~quadsv.NUFFTKernel`. Ideal for ≥ 10⁴
+  irregular spots; O(N log N) per feature via finufft.
 
 .. code-block:: python
 
    import anndata as ad
-   from quadsv.detector import PatternDetector
+   from quadsv import PatternDetector
 
-   # Load data
    adata = ad.read_h5ad("spatial_tissue.h5ad")
    print(f"Data: {adata.n_obs} spots x {adata.n_vars} genes")
 
-   # Initialize detector
-   detector = PatternDetector(adata, min_cells_frac=0.05)
-
-   # Build kernel from spatial coordinates in adata.obsm
-   detector.build_kernel_from_coordinates(
-       adata.obsm['spatial'],
-       method='car',
-       rho=0.9,
-       k_neighbors=15
+   detector = (
+       PatternDetector(adata, min_cells_frac=0.05)
+       .build_kernel(
+           backend="matrix",
+           method="car",
+           coordinates_key="spatial",
+           rho=0.9,
+           k_neighbors=15,
+       )
    )
 
-   # Test all genes in parallel
-   results = detector.compute_qstat(
-       source='var',           # Test genes (not observations)
-       n_jobs=4,               # Use 4 CPU cores
-       return_pval=True        # Include p-values
-   )
+   q_results = detector.compute_qstat(source="var", n_jobs=4, return_pval=True)
 
-   # Filter results
-   svg_genes = results[results['P_adj'] < 0.05]
-   print(f"Found {len(svg_genes)} SVGs at FDR < 5%")
-   print(results.head())
+   svgs = q_results[q_results["P_adj"] < 0.05]
+   print(f"Found {len(svgs)} SVGs at FDR < 5%")
+   print(q_results.head())
 
-Pairwise spatial co-expression with AnnData
------------------------------------------------
 
-After identifying SVGs, test for spatial co-expression among top genes.
+Scaling to ≥ 10⁴ irregular spots via NUFFT
+------------------------------------------
+
+Switching to the NUFFT backend needs one argument change. The k-grid and
+per-axis spacing are auto-inferred from the coordinates:
 
 .. code-block:: python
 
-   # Select top 100 SVGs by Q-statistic
-   top_genes = results.nlargest(100, 'Q').index.tolist()
+   detector = PatternDetector(adata).build_kernel(
+       backend="nufft",
+       method="matern",
+       coordinates_key="spatial",
+       bandwidth=25.0,   # in the same units as adata.obsm["spatial"]
+       nu=1.5,
+   )
+   q_results = detector.compute_qstat(n_jobs=4)
 
-   # Test all pairwise combinations
+
+Pairwise spatial co-expression
+------------------------------
+
+After identifying SVGs, test top genes for spatial co-expression. The API is
+identical for both backends:
+
+.. code-block:: python
+
+   top_genes = q_results.nlargest(100, "Q").index.tolist()
+
    r_results = detector.compute_rstat(
-       source='var',
+       source="var",
        features_x=top_genes,
-       features_y=None,           # None = all pairs within features_x
+       features_y=None,    # None = all pairs within features_x
        n_jobs=4,
-       return_pval=True
+       return_pval=True,
    )
 
-   # Filter co-expressed pairs
-   coexp_pairs = r_results[r_results['P_adj'] < 0.05]
-   print(f"Found {len(coexp_pairs)} spatially co-expressed pairs")
+   coexp_pairs = r_results[r_results["P_adj"] < 0.05]
+   print(f"{len(coexp_pairs)} spatially co-expressed pairs")
 
 
+Large regular grids via FFT + SpatialData
+-----------------------------------------
 
-Large-scale analysis using FFT with SpatialData
------------------------------------------------
-
-For regular grids (e.g., Visium HD with 1M+ spots), use FFT acceleration. 
-The ``PatternDetectorFFT`` class works with ``spatialdata.SpatialData`` objects and implicitly
-calls ``sdata.rasterize_bins()`` to create dense inputs on a fixed-resolution grid.
+For regular grids (e.g., Visium HD with 1M+ spots), use FFT acceleration
+through :class:`~quadsv.PatternDetectorFFT`, which consumes
+:class:`spatialdata.SpatialData`:
 
 .. code-block:: python
 
    import spatialdata as sd
-   from quadsv.detector_fft import PatternDetectorFFT
+   from quadsv import PatternDetectorFFT
 
-   # Load SpatialData object
    sdata = sd.read_zarr("visium_hd.zarr")
 
-   # Initialize FFT detector
    detector_fft = PatternDetectorFFT(
        sdata,
-       min_count=10,              # Minimum gene counts
-       kernel_method='car',       # CAR kernel
+       min_count=10,
+       kernel_method="car",
        rho=0.9,
-       neighbor_degree=1,         # 1-hop neighborhood
-       topology='square',         # Square grid
-       fft_solver='rfft2'         # Real FFT for memory efficiency
+       neighbor_degree=1,
+       topology="square",
+       fft_solver="rfft2",
    )
 
-   # Compute Q-statistics (O(N log N) complexity!)
    results = detector_fft.compute_qstat(
-       bins=['Visium_HD_bin_name'],
-       table_name=['table_name'],
-       col_key='array_col',
-       row_key='array_row',
-       n_jobs=4,
-       workers=2,                 # Parallel FFT workers
-       chunk_size=256,            # Process 256 genes at a time
-       return_pval=True
-   )
-
-   svg_genes = results[results['P_adj'] < 0.05]
-   print(f"Analyzed 1M+ spots in minutes: {len(svg_genes)} SVGs")
-
-  # Compute R-statistics for top genes
-   top_genes_fft = results.nlargest(100, 'Q').index.tolist()
-   r_results_fft = detector_fft.compute_rstat(
-       bins=['Visium_HD_bin_name'],
-       table_name=['table_name'],
-       col_key='array_col',
-       row_key='array_row',
-       features_x=top_genes_fft,
-       features_y=None,
+       bins=["Visium_HD_bin_name"],
+       table_name=["table_name"],
+       col_key="array_col",
+       row_key="array_row",
        n_jobs=4,
        workers=2,
-       chunk_size=128,
-       return_pval=True
+       chunk_size=256,
+       return_pval=True,
    )
-
-   coexp_pairs_fft = r_results_fft[r_results_fft['P_adj'] < 0.05]
-   print(f"Found {len(coexp_pairs_fft)} spatially co-expressed pairs in large grid")
+   svgs_fft = results[results["P_adj"] < 0.05]
 
 
-Next Steps
+Next steps
 ----------
 
-- **Theory**: Read :doc:`/guides/theory` for mathematical background
-- **Kernel design**: See :doc:`/guides/kernels` for practical tips on kernel design
-- **API Reference**: Browse :doc:`/autoapi/quadsv/index`
+- **Theory**: :doc:`/guides/theory`
+- **Kernel design**: :doc:`/guides/kernels`
+- **Cross-sample comparison**: :doc:`/guides/spectral_compare`
+- **API reference**: :doc:`/autoapi/quadsv/index`
