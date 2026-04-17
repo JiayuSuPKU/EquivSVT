@@ -76,6 +76,9 @@ spatial = [
     "anndata>=0.8.0",
     "spatialdata>=0.1.0",
 ]
+nufft = [
+    "finufft>=2.2.0",
+]
 test = [
     "pytest>=7.0.0",
     "pytest-cov>=3.0.0",

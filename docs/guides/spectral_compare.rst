@@ -138,6 +138,44 @@ curve survives. Chain it after background normalization:
 The per-gene DE test via :meth:`SpectralComparator.test_expression` is
 unaffected — it reads from ``cmp.dc_`` directly.
 
+Non-uniform spatial grids: NUFFT path
+-------------------------------------
+
+When spot coordinates are **not** already on a regular grid — e.g., Slide-seq
+puck beads, Stereo-seq nanowells, or a Visium slide read straight from
+``adata.obsm['spatial']`` without rasterization — you can skip the
+rasterize-then-FFT detour entirely and compute the power spectrum directly on
+the irregular points with a type-1 non-uniform FFT
+(`finufft <https://finufft.readthedocs.io>`_). Install the optional extra::
+
+   pip install 'quadsv[nufft]'
+
+Then build a comparator from per-sample ``(coords, values)`` pairs via the
+:meth:`SpectralComparator.from_coords` classmethod:
+
+.. code-block:: python
+
+   cmp = SpectralComparator.from_coords(
+       coords=list_of_Nx2_arrays,         # per-sample (y, x) in each sample's unit
+       values=list_of_NxG_arrays,         # per-spot, per-gene expression
+       groups=groups,
+       gene_names=gene_names,
+       grid_shape=(ny, nx),               # common k-space target
+       spacing=(dy_um, dx_um),            # common physical spacing (μm)
+       unit_scales=[1.0, 0.35, ...],      # per-sample multiplier onto the common unit
+   ).fit().normalize_background()
+
+The ``unit_scales`` list converts each sample's coordinate units into the
+common physical unit chosen for ``spacing``, so slides measured in μm can be
+mixed with slides measured in 0.35 μm/pixel Visium full-res pixels. Every
+sample lands on the same k-space grid, so radial bins, pattern tests, and
+DE tests behave exactly as for rasterized samples.
+
+:func:`quadsv.power_spectrum_2d_nufft` is the lower-level primitive (one
+sample at a time). Correctness is validated against the rasterized FFT on
+real Visium data: ``FFT(zero-filled raster)`` equals ``NUFFT(raw coords)``
+to ~10⁻⁶ relative tolerance (see ``tests/test_nufft.py``).
+
 Visium hex grids → physical frequency
 -------------------------------------
 

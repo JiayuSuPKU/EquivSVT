@@ -1115,6 +1115,185 @@ class SpectralComparator:
         self._raw_2d_spectra: list[np.ndarray] | None = None
         self._grid_shapes: list[tuple[int, int]] = [(s.shape[1], s.shape[2]) for s in self.samples]
 
+        # Non-uniform FFT mode: set by :meth:`from_coords`, never here.
+        self.mode: str = "fft"
+        self._coords: list[np.ndarray] | None = None
+        self._values: list[np.ndarray] | None = None
+        self._unit_scales: list[float] | None = None
+        self._nufft_grid_shape: tuple[int, int] | None = None
+        self._nufft_spacing: tuple[float, float] | None = None
+        self._nufft_eps: float = 1e-6
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_coords(  # noqa: C901
+        cls,
+        coords: Sequence[np.ndarray],
+        values: Sequence[np.ndarray],
+        groups: np.ndarray,
+        gene_names: Sequence[str],
+        grid_shape: tuple[int, int],
+        spacing: tuple[float, float],
+        unit_scales: Sequence[float] | None = None,
+        feature_mode: str = "radial",
+        n_radial_bins: int = 30,
+        center: str | None = "mean",
+        freq_edges: np.ndarray | None = None,
+        eps: float = 1e-6,
+    ) -> SpectralComparator:
+        """
+        Build a comparator over **non-uniform** spatial samples via NUFFT.
+
+        Unlike the default constructor — which expects per-sample *rasterized*
+        arrays — this alternative entry point takes the raw per-spot
+        coordinates and expression matrices and uses a 2D type-1 non-uniform
+        FFT (:func:`quadsv.nufft.power_spectrum_2d_nufft`) to evaluate
+        :math:`|\\hat c(k)|^2` on a *common* uniform k-space grid. All
+        downstream steps (radial binning, background normalization,
+        :meth:`test_pattern`, :meth:`test_expression`) work identically.
+
+        Parameters
+        ----------
+        coords : sequence of np.ndarray
+            Per-sample spot coordinates of shape ``(N_s, 2)`` in order
+            ``(y, x)``. Units are per-sample (see ``unit_scales``).
+        values : sequence of np.ndarray
+            Per-sample expression matrices of shape ``(N_s, n_genes)``. The
+            gene axis must be aligned across samples (second axis, length
+            equal to ``len(gene_names)``).
+        groups : np.ndarray
+            Group labels of length ``n_samples`` with exactly two distinct values.
+        gene_names : sequence of str
+            Gene names; must match the second axis of every entry of ``values``.
+        grid_shape : tuple[int, int]
+            ``(ny, nx)`` of the common k-space grid.
+        spacing : tuple[float, float]
+            ``(dy, dx)`` per-cell spacing of the common grid, in whatever
+            **common** physical unit all samples should be compared in
+            (typically μm). This is the same ``spacing`` used by
+            :func:`radial_bin_spectrum` so radial bins come out in cycles per
+            that unit.
+        unit_scales : sequence of float, optional
+            Per-sample multiplier that converts each sample's raw ``coords``
+            into the common unit of ``spacing``. For example, if sample A's
+            coords are already in μm and sample B's coords are in Visium
+            full-res pixels at 0.35 μm/pixel, pass ``unit_scales=[1.0, 0.35]``
+            with ``spacing`` in μm. Default: ``[1.0] * n_samples``.
+        feature_mode, n_radial_bins, center, freq_edges
+            Same meaning as in the default constructor.
+        eps : float, default 1e-6
+            NUFFT tolerance.
+
+        Returns
+        -------
+        SpectralComparator
+            A fresh instance in ``mode='nufft'``. Call :meth:`fit` as usual
+            to populate :attr:`spectra_` / :attr:`dc_`.
+
+        Raises
+        ------
+        ValueError
+            If inputs have inconsistent shapes, or ``unit_scales`` has a
+            wrong length.
+        """
+        if len(coords) != len(values):
+            raise ValueError(
+                f"coords and values must have the same length; got {len(coords)} vs {len(values)}."
+            )
+        n_samples = len(coords)
+        groups = np.asarray(groups)
+        if groups.shape != (n_samples,):
+            raise ValueError(f"groups length {groups.shape} does not match n_samples={n_samples}.")
+        if np.unique(groups).size != 2:
+            raise ValueError("groups must contain exactly two distinct labels.")
+        n_genes = len(gene_names)
+        for i, (c_i, v_i) in enumerate(zip(coords, values, strict=True)):
+            if c_i.ndim != 2 or c_i.shape[1] != 2:
+                raise ValueError(f"coords[{i}] must be shape (N, 2), got {c_i.shape}.")
+            if v_i.ndim != 2 or v_i.shape != (c_i.shape[0], n_genes):
+                raise ValueError(
+                    f"values[{i}] must be shape (N={c_i.shape[0]}, n_genes={n_genes}), "
+                    f"got {v_i.shape}."
+                )
+        if unit_scales is None:
+            unit_scales = [1.0] * n_samples
+        if len(unit_scales) != n_samples:
+            raise ValueError(
+                f"unit_scales length {len(unit_scales)} does not match n_samples={n_samples}."
+            )
+
+        # Construct the instance WITHOUT running __init__'s sample-shape checks.
+        # We need the same attribute layout, populated with NUFFT metadata.
+        self = cls.__new__(cls)
+        if feature_mode not in ("radial", "2d"):
+            raise ValueError(f"feature_mode must be 'radial' or '2d', got '{feature_mode}'.")
+        if center not in ("mean", "zscore", None):
+            raise ValueError(f"center must be 'mean', 'zscore', or None, got {center!r}.")
+
+        self.samples: list[np.ndarray] = []  # not used in nufft mode
+        self.groups = groups
+        self.gene_names = list(gene_names)
+        self.feature_mode = feature_mode
+        self.n_radial_bins = int(n_radial_bins)
+        self.fft_solver = "fft2"  # NUFFT output is full-spectrum; match that layout
+        self.workers = None
+        self.center = center
+        self.spacings = [tuple(float(v) for v in spacing)] * n_samples
+        self.freq_edges = None if freq_edges is None else np.asarray(freq_edges, dtype=float)
+        self.spectra_ = None
+        self.dc_ = None
+        self.rotation_angles_ = None
+        self._raw_2d_spectra = None
+        self._grid_shapes = [tuple(int(v) for v in grid_shape)] * n_samples
+
+        self.mode = "nufft"
+        self._coords = [np.asarray(c, dtype=np.float64) for c in coords]
+        self._values = [np.asarray(v, dtype=np.float64) for v in values]
+        self._unit_scales = [float(s) for s in unit_scales]
+        self._nufft_grid_shape = (int(grid_shape[0]), int(grid_shape[1]))
+        self._nufft_spacing = (float(spacing[0]), float(spacing[1]))
+        self._nufft_eps = float(eps)
+        return self
+
+    # ------------------------------------------------------------------
+    def _compute_nufft_spectra(self, n_jobs: int = -1) -> tuple[list[np.ndarray], np.ndarray]:
+        """NUFFT equivalent of the FFT-mode per-sample spectrum pass. Returns
+        ``(raw_2d_spectra, dc)`` with the same layout as the FFT path."""
+        from quadsv.nufft import power_spectrum_2d_nufft
+
+        def _one(i: int) -> tuple[np.ndarray, np.ndarray]:
+            pts = self._coords[i]
+            vals = self._values[i]  # (N, n_genes)
+            scale = self._unit_scales[i]
+
+            # DC = mean expression per gene at the real (non-uniform) spots.
+            dc = vals.mean(axis=0)
+
+            centered = vals - dc if self.center == "mean" else vals
+            if self.center == "zscore":
+                sd = vals.std(axis=0)
+                sd = np.clip(sd, 1e-12, None)
+                centered = (vals - dc) / sd
+
+            spec = power_spectrum_2d_nufft(
+                pts,
+                centered,
+                grid_shape=self._nufft_grid_shape,
+                spacing=self._nufft_spacing,
+                unit_scale=scale,
+                eps=self._nufft_eps,
+                center_coords=True,
+            )  # shape (ny, nx, n_genes)
+            # Conform to (n_genes, ny, nx) like compute_sample_spectrum.
+            return np.moveaxis(spec, -1, 0), dc
+
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_one)(i) for i in range(len(self._coords))
+        )
+        raw_2d = [r[0] for r in results]
+        dc = np.stack([r[1] for r in results], axis=0)
+        return raw_2d, dc
+
     # ------------------------------------------------------------------
     def fit(self, n_jobs: int = -1) -> SpectralComparator:
         """
@@ -1131,23 +1310,26 @@ class SpectralComparator:
             ``self``, for chaining.
         """
         logger.info(
-            "Computing per-sample spectra (n_samples=%d, fft_solver=%s, center=%s)...",
-            len(self.samples),
-            self.fft_solver,
+            "Computing per-sample spectra (mode=%s, n_samples=%d, center=%s)...",
+            self.mode,
+            len(self._grid_shapes),
             self.center,
         )
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(compute_sample_spectrum)(
-                s,
-                fft_solver=self.fft_solver,
-                workers=self.workers,
-                center=self.center,
-                return_dc=True,
+        if self.mode == "nufft":
+            self._raw_2d_spectra, self.dc_ = self._compute_nufft_spectra(n_jobs=n_jobs)
+        else:
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(compute_sample_spectrum)(
+                    s,
+                    fft_solver=self.fft_solver,
+                    workers=self.workers,
+                    center=self.center,
+                    return_dc=True,
+                )
+                for s in self.samples
             )
-            for s in self.samples
-        )
-        self._raw_2d_spectra = [r[0] for r in results]
-        self.dc_ = np.stack([r[1] for r in results], axis=0)  # (n_samples, n_genes)
+            self._raw_2d_spectra = [r[0] for r in results]
+            self.dc_ = np.stack([r[1] for r in results], axis=0)  # (n_samples, n_genes)
 
         if self.feature_mode == "2d":
             aligned, angles = align_spectra_by_rotation(

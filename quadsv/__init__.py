@@ -42,6 +42,15 @@ from quadsv.spectral_compare import (
 )
 from quadsv.statistics import spatial_q_test, spatial_r_test
 
+# NUFFT is an optional extra; only surface it at the top level when finufft is
+# actually installed, so `import quadsv` stays light for rasterized workflows.
+try:
+    from quadsv.nufft import power_spectrum_2d_nufft  # noqa: F401
+
+    _HAS_NUFFT = True
+except ImportError:  # pragma: no cover
+    _HAS_NUFFT = False
+
 # Define public API
 __all__ = [
     # Core classes
@@ -75,3 +84,7 @@ try:
     __all__.append("PatternDetectorFFT")
 except ImportError:
     pass
+
+# Append NUFFT symbol only if the optional finufft dep is present.
+if _HAS_NUFFT:
+    __all__.append("power_spectrum_2d_nufft")
