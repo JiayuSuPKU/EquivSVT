@@ -80,7 +80,7 @@ def power_spectrum_2d(
     return power
 
 
-class FFTKernel:
+class FFTKernel(Kernel):
     """
     FFT-accelerated spatial kernel for dense grid data.
 
@@ -942,8 +942,3 @@ def _r_test_fft(
         pval = np.ones_like(R) if isinstance(R, np.ndarray) else 1.0
 
     return R, pval
-
-
-# Register FFTKernel as a virtual subclass of the Kernel ABC so that
-# isinstance(kernel, Kernel) dispatch in quadsv.statistics picks it up.
-Kernel.register(FFTKernel)

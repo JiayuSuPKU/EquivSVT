@@ -14,12 +14,90 @@ from scipy.special import gamma, kv
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
-__all__ = ["Kernel", "MatrixKernel"]
+__all__ = ["Kernel", "MatrixKernelBase", "MatrixKernel"]
 
 
 class Kernel(ABC):
     """
-    Abstract base class for spatial kernels.
+    Abstract base class shared by all spatial kernels in :mod:`quadsv`.
+
+    Concrete backends:
+
+    - :class:`MatrixKernel` — explicit n×n kernel or its sparse precision matrix.
+    - :class:`quadsv.FFTKernel` — grid kernel via its eigenvalue spectrum.
+    - :class:`quadsv.NUFFTKernel` — irregular-point kernel evaluated through a
+      type-1 / type-2 NUFFT round-trip.
+
+    Required interface
+    ------------------
+    Every concrete kernel exposes:
+
+    - ``n``, ``method``, ``params`` — integer / string / dict attributes.
+    - :meth:`xtKx`, :meth:`xtKy`, :meth:`Kx` — quadratic / bilinear / apply
+      primitives.
+    - :meth:`trace`, :meth:`square_trace` — moments used by the null
+      distribution in :func:`quadsv.spatial_q_test` / :func:`quadsv.spatial_r_test`.
+    - :meth:`eigenvalues` — spectrum used by Liu's chi-squared mixture.
+
+    Backend-specific extras live on the subclasses. Notably
+    :class:`MatrixKernel` owns the ``_K`` buffer + LU cache, the
+    ``stores_precision`` flag, :meth:`realization`, and the
+    sparsity-preserving :meth:`MatrixKernel.xtKx_standardized`;
+    :class:`FFTKernel` / :class:`NUFFTKernel` carry grid-specific primitives
+    (FFT spectrum, `Kx_grid`, two-path compute methods, Hutchinson trace
+    estimation, …).
+    """
+
+    n: int
+    method: str
+    params: dict
+
+    @abstractmethod
+    def xtKx(self, x):
+        """Quadratic form ``xᵀ K x``."""
+
+    @abstractmethod
+    def xtKy(self, x, y):
+        """Bilinear form ``xᵀ K y``."""
+
+    @abstractmethod
+    def Kx(self, x):
+        """Matrix–vector product ``K x``."""
+
+    @abstractmethod
+    def trace(self) -> float:
+        """``trace(K)``."""
+
+    @abstractmethod
+    def square_trace(self) -> float:
+        """``trace(K²)``."""
+
+    @abstractmethod
+    def eigenvalues(self, k: int | None = None) -> np.ndarray:
+        """Eigenvalues of ``K`` (descending) or top-``k`` if specified."""
+
+
+class MatrixKernelBase(Kernel):
+    """
+    Concrete base for kernels backed by an explicit or implicit ``n × n`` matrix.
+
+    Subclass this when you want a custom way to **construct** ``K`` (e.g. a bespoke
+    function of coordinates, a learnt kernel, or an ad-hoc adjacency matrix) while
+    inheriting every downstream primitive ready-to-use.
+
+    **What a subclass must provide.** Just one thing: an implementation of
+    :meth:`_build_kernel` that returns either the ``(n, n)`` kernel matrix
+    (dense ``np.ndarray`` or ``scipy.sparse``) or its precision matrix
+    ``M = K^{-1}``. If it returns a precision matrix, set
+    ``self.stores_precision = True`` *before* calling ``super().__init__``,
+    or flip it inside ``_build_kernel`` while the buffer is being built; the
+    :class:`MatrixKernel` CAR / precomputed-inverse path shows a worked example.
+
+    Everything else — cached sparse LU for implicit solves, Hutchinson
+    trace estimation when ``stores_precision=True``, automatic sparse-vs-dense
+    dispatch in ``xtKx`` / ``Kx``, standardized-quadratic-form cache
+    (``_K_column_sums`` / :meth:`xtKx_standardized`), pickle safety for the
+    non-picklable LU factor — is already implemented here.
 
     Handles dense, sparse, and implicit (operator-based) kernels. Switches between
     an explicit representation (the kernel matrix ``K`` is stored and used directly)
@@ -29,24 +107,22 @@ class Kernel(ABC):
     Attributes
     ----------
     n : int
-        Number of observations (samples).
+        Number of observations.
     method : str
-        Kernel method (``'gaussian'``, ``'matern'``, ``'moran'``, ``'graph_laplacian'``,
-        ``'car'``).
+        Kernel method name (free-form; used only for diagnostics / provenance).
     params : dict
-        Resolved kernel parameters after defaults have been merged with user overrides
-        (e.g., ``bandwidth``, ``nu``, ``rho``, ``k_neighbors``).
+        Resolved kernel parameters — subclasses decide what goes here.
     stores_precision : bool
-        If ``True``, the kernel is represented implicitly via its precision matrix and
-        linear solves are used for :meth:`xtKx` and trace estimation. If ``False``,
-        the realized kernel matrix is stored and used directly.
+        If ``True``, ``_K`` holds the precision matrix ``M = K^{-1}`` and linear
+        solves (via a cached LU) are used for :meth:`xtKx` and trace estimation.
+        If ``False``, ``_K`` is the realized kernel matrix (dense or sparse).
 
     Notes
     -----
-    The internal buffer ``_K`` stores the kernel matrix when ``stores_precision=False`` and
-    the precision matrix ``K^{-1}`` when ``stores_precision=True``. Public methods
-    (:meth:`xtKx`, :meth:`trace`, :meth:`square_trace`, :meth:`eigenvalues`) transparently
-    handle both cases; callers should not access ``_K`` directly.
+    The internal buffer ``_K`` stores the kernel matrix when ``stores_precision=False``
+    and the precision matrix ``K^{-1}`` when ``stores_precision=True``. Public methods
+    (:meth:`xtKx`, :meth:`trace`, :meth:`square_trace`, :meth:`eigenvalues`)
+    transparently handle both cases; callers should not access ``_K`` directly.
     """
 
     def __init__(self, n: int, method: str = "gaussian", **kwargs) -> None:
@@ -289,9 +365,7 @@ class Kernel(ABC):
             return float(result.item())
         return result
 
-    def xtKy(
-        self, x: np.ndarray | sp.spmatrix, y: np.ndarray | sp.spmatrix
-    ) -> float | np.ndarray:
+    def xtKy(self, x: np.ndarray | sp.spmatrix, y: np.ndarray | sp.spmatrix) -> float | np.ndarray:
         """
         Bilinear form ``x^T K y`` (paired diagonal for batched inputs).
 
@@ -443,8 +517,11 @@ class Kernel(ABC):
                     stacklevel=2,
                 )
 
-        # Hutchinson's trick random vectors
-        rvs = np.random.choice([-1, 1], size=(self.n, n_vectors))
+        # Hutchinson's trick random vectors. Use a dedicated, seeded RNG so
+        # the estimator is deterministic per-instance (matches NUFFTKernel's
+        # convention) and does not perturb numpy's global RNG state — which
+        # previously caused flaky order-dependent failures under pytest.
+        rvs = np.random.default_rng(0).choice([-1.0, 1.0], size=(self.n, n_vectors)).astype(float)
         # Batched Solve: Solve M * Y = rvs
         # spsolve can handle multiple RHS if passed as dense 2D array
         if sp.issparse(self._K):
@@ -626,13 +703,16 @@ class Kernel(ABC):
         self._lu_lock = threading.Lock()
 
 
-class MatrixKernel(Kernel):
+class MatrixKernel(MatrixKernelBase):
     """
-    Concrete spatial kernel built from coordinates or a precomputed matrix.
+    Built-in matrix kernel constructed from coordinates or a precomputed matrix.
 
-    Inherits all public attributes and methods from :class:`Kernel`
-    (``n``, ``method``, ``params``, ``stores_precision``, :meth:`realization`,
-    :meth:`eigenvalues`, :meth:`xtKx`, :meth:`trace`, :meth:`square_trace`).
+    Carries only the **construction** logic on converting coordinates ``S`` or a
+    user-supplied matrix into ``_K`` on top of :class:`MatrixKernelBase`.
+
+    If you want a bespoke kernel builder (e.g. a custom distance decay, a
+    cross-modality covariance, a learnt operator) subclass
+    :class:`MatrixKernelBase` directly and implement :meth:`_build_kernel`.
 
     See Also
     --------
@@ -641,6 +721,8 @@ class MatrixKernel(Kernel):
     MatrixKernel.from_matrix
         Recommended entry point when a kernel or precision matrix is already
         available.
+    MatrixKernelBase
+        Base class to inherit from for custom kernel constructions.
     """
 
     _available_kernels = ["gaussian", "matern", "moran", "graph_laplacian", "car"]
