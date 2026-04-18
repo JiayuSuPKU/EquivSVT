@@ -9,9 +9,10 @@ import scipy.sparse as sp
 from scipy.special import gamma, kv
 from scipy.stats import chi2, norm
 
+from quadsv.kernels import Kernel
 from quadsv.statistics import liu_sf
 
-__all__ = ["FFTKernel", "power_spectrum_2d", "spatial_q_test_fft", "spatial_r_test_fft"]
+__all__ = ["FFTKernel", "power_spectrum_2d"]
 
 
 def power_spectrum_2d(
@@ -24,7 +25,7 @@ def power_spectrum_2d(
 
     The result is *translation-invariant*: shifting the input image leaves the power
     spectrum unchanged. This makes the spectrum a natural alignment-free representation
-    of a spatial pattern. Use :func:`quadsv.spectral_compare.radial_bin_spectrum` to
+    of a spatial pattern. Use :func:`quadsv.multisample.radial_bin_spectrum` to
     further reduce the 2D spectrum to a 1D radial-binned vector that is also
     rotation-invariant.
 
@@ -566,7 +567,7 @@ class FFTKernel:
             return float(R.item()) if R.size == 1 else R.ravel()
         return R.ravel()
 
-    def eigenvalues(self, k: int | None = None, return_full: bool = False) -> np.ndarray:
+    def eigenvalues(self, k: int | None = None, return_full_layout: bool = False) -> np.ndarray:
         """
         Get the eigenvalues of the kernel matrix.
 
@@ -574,33 +575,33 @@ class FFTKernel:
         ----------
         k : int, optional
             Number of largest eigenvalues to return. If None, returns all.
-        return_full : bool, default False
+        return_full_layout : bool, default False
             Only for fft_solver='rfft2'.
             If True, returns eigenvalues in full FFT layout (ny, nx) flattened.
 
         Returns
         -------
         np.ndarray
-            Eigenvalues. If return_full=True, shape is (ny * nx,).
+            Eigenvalues. If return_full_layout=True, shape is (ny * nx,).
                 If k specified, returns top-k in descending order.
 
         Notes
         -----
         If fft_solver='rfft2', spectrum is stored in rfft2 format, not full FFT format.
-        To convert to full FFT format, use return_full=True.
+        To convert to full FFT format, use return_full_layout=True.
         """
         if self.spectrum is None:
             self.spectrum = self._compute_eigenvalues()
 
         # Simple logic for fft2 or no full return
-        if (self.fft_solver == "fft2") or (not return_full):
+        if (self.fft_solver == "fft2") or (not return_full_layout):
             if k is None:
                 return self.spectrum
             else:
                 idx = np.argsort(-self.spectrum)[:k]
                 return self.spectrum[idx]
 
-        else:  # fft_solver == 'rfft2' and return_full=True
+        else:  # fft_solver == 'rfft2' and return_full_layout=True
             # Convert rfft2 layout to full FFT layout
             full_fft = np.zeros((self.ny, self.nx), dtype=self.spectrum.dtype)
             rfft_size = self.nx // 2 + 1
@@ -626,7 +627,7 @@ class FFTKernel:
         float
             Trace of K (sum of eigenvalues).
         """
-        return np.sum(self.eigenvalues(return_full=True))
+        return np.sum(self.eigenvalues(return_full_layout=True))
 
     def square_trace(self) -> float:
         """
@@ -637,10 +638,10 @@ class FFTKernel:
         float
             Trace of K² (sum of squared eigenvalues).
         """
-        return np.sum(self.eigenvalues(return_full=True) ** 2)
+        return np.sum(self.eigenvalues(return_full_layout=True) ** 2)
 
 
-def spatial_q_test_fft(  # noqa: C901
+def _q_test_fft(  # noqa: C901
     Xn: np.ndarray,
     kernel: FFTKernel,
     null_params: dict | None = None,
@@ -667,7 +668,7 @@ def spatial_q_test_fft(  # noqa: C901
         cached ``eigenvalues`` / ``mean_Q`` / ``var_Q`` entries are reused
         in the p-value stage to avoid recomputing the spectrum on every
         call — useful when running the same kernel against many features
-        (e.g., in :class:`quadsv.PatternDetectorFFT`). If None, the
+        (e.g., in :class:`quadsv.DetectorGrid`). If None, the
         spectrum and moments are computed on the fly.
     return_pval : bool, default True
         If True, returns (Q, pval) tuple; if False, returns Q only.
@@ -705,7 +706,7 @@ def spatial_q_test_fft(  # noqa: C901
     >>> ny, nx = 32, 32
     >>> kernel = FFTKernel((ny, nx), method='gaussian', bandwidth=1.0)
     >>> data = np.random.randn(ny, nx)
-    >>> Q, pval = spatial_q_test_fft(data, kernel)
+    >>> Q, pval = spatial_q_test(data, kernel)
     """
     Xn = np.asarray(Xn).astype(float)
     if Xn.ndim == 2:
@@ -773,7 +774,7 @@ def spatial_q_test_fft(  # noqa: C901
     if null_params is not None and "eigenvalues" in null_params:
         sig_evals = np.asarray(null_params["eigenvalues"], dtype=float)
     else:
-        evals = kernel.eigenvalues(return_full=True)
+        evals = kernel.eigenvalues(return_full_layout=True)
         if evals.min() < -0.1:
             raise ValueError(
                 "Kernel has significant negative eigenvalues; Liu's method may be invalid."
@@ -821,7 +822,7 @@ def _spectral_cross_product(
     return R_sum
 
 
-def spatial_r_test_fft(
+def _r_test_fft(
     Xn: np.ndarray,
     Yn: np.ndarray,
     kernel: FFTKernel,
@@ -886,7 +887,7 @@ def spatial_r_test_fft(
     >>> kernel = FFTKernel((ny, nx), method='gaussian', bandwidth=1.0)
     >>> x_data = np.random.randn(ny, nx)
     >>> y_data = np.random.randn(ny, nx)
-    >>> R, pval = spatial_r_test_fft(x_data, y_data, kernel)
+    >>> R, pval = spatial_r_test(x_data, y_data, kernel)
     """
     Xn = np.asarray(Xn).astype(float)
     Yn = np.asarray(Yn).astype(float)
@@ -941,3 +942,8 @@ def spatial_r_test_fft(
         pval = np.ones_like(R) if isinstance(R, np.ndarray) else 1.0
 
     return R, pval
+
+
+# Register FFTKernel as a virtual subclass of the Kernel ABC so that
+# isinstance(kernel, Kernel) dispatch in quadsv.statistics picks it up.
+Kernel.register(FFTKernel)

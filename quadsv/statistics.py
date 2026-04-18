@@ -118,7 +118,7 @@ def compute_null_params(
     Parameters
     ----------
     kernel : Kernel
-        The spatial kernel object (SpatialKernel, FFTKernel, NUFFTKernel, or compatible).
+        The spatial kernel object (MatrixKernel, FFTKernel, NUFFTKernel, or compatible).
     method : {'clt', 'welch', 'liu'}, default 'welch'
         Null approximation method for the **Q-test**. The R-test entry
         ``var_R = trace(K²)`` is always populated alongside, regardless of
@@ -150,7 +150,7 @@ def compute_null_params(
 
     Examples
     --------
-    >>> kernel = SpatialKernel.from_coordinates(coords, method='gaussian')
+    >>> kernel = MatrixKernel.from_coordinates(coords, method='gaussian')
     >>> params = compute_null_params(kernel, method='welch')
     >>> Q, pval = spatial_q_test(data, kernel, null_params=params)
     >>> R, r_pval = spatial_r_test(x, y, kernel, null_params=params)
@@ -212,7 +212,7 @@ def spatial_q_test(  # noqa: C901
         Can be dense numpy array or sparse matrix (CSC/CSR format recommended).
         Should be standardized before calling unless is_standardized=True.
     kernel : Kernel
-        Pre-constructed kernel object (Kernel, SpatialKernel, FFTKernel, or scipy.sparse matrix).
+        Pre-constructed kernel object (Kernel, MatrixKernel, FFTKernel, or scipy.sparse matrix).
     null_params : dict, optional
         Pre-computed null distribution parameters from compute_null_params().
         If None, computed on-the-fly using 'welch' method (only accurate when kernel is positive semi-definite).
@@ -261,7 +261,7 @@ def spatial_q_test(  # noqa: C901
     Examples
     --------
     >>> coords = np.random.randn(100, 2)
-    >>> kernel = SpatialKernel.from_coordinates(coords, method='gaussian')
+    >>> kernel = MatrixKernel.from_coordinates(coords, method='gaussian')
     >>> data = np.random.randn(100)
     >>> Q, pval = spatial_q_test(data, kernel)
     >>> # Sparse matrix example
@@ -269,7 +269,31 @@ def spatial_q_test(  # noqa: C901
     >>> sparse_data = csr_matrix(np.random.randn(100, 1000))
     >>> Q, pval = spatial_q_test(sparse_data, kernel, chunk_size=100, show_progress=True)
     """
-    # Handle sparse matrices
+    # Dispatch to FFT / NUFFT helpers when the kernel is one of those backends.
+    # Liu's approximation (or normal for Moran) is hard-coded there — FFT/NUFFT
+    # spectra are cheap, so there is no Welch option to select.
+    # Lazy imports avoid a circular import with ``quadsv.fft`` / ``quadsv.nufft``.
+    from quadsv.fft import FFTKernel, _q_test_fft
+    from quadsv.nufft import NUFFTKernel, _q_test_nufft
+
+    if isinstance(kernel, FFTKernel):
+        return _q_test_fft(
+            Xn,
+            kernel,
+            null_params=null_params,
+            return_pval=return_pval,
+            is_standardized=is_standardized,
+        )
+    if isinstance(kernel, NUFFTKernel):
+        return _q_test_nufft(
+            Xn,
+            kernel,
+            null_params=null_params,
+            return_pval=return_pval,
+            is_standardized=is_standardized,
+        )
+
+    # Matrix path (MatrixKernel or raw dense / sparse kernel matrix).
     is_sparse = sp.issparse(Xn)
 
     if is_sparse:
@@ -462,11 +486,35 @@ def spatial_r_test(  # noqa: C901
     Examples
     --------
     >>> coords = np.random.randn(100, 2)
-    >>> kernel = SpatialKernel.from_coordinates(coords, method='gaussian')
+    >>> kernel = MatrixKernel.from_coordinates(coords, method='gaussian')
     >>> x_data = np.random.randn(100)
     >>> y_data = np.random.randn(100)
     >>> R, pval = spatial_r_test(x_data, y_data, kernel)
     """
+    # Dispatch to FFT / NUFFT helpers when the kernel is one of those backends.
+    # Lazy imports avoid a circular import with ``quadsv.fft`` / ``quadsv.nufft``.
+    from quadsv.fft import FFTKernel, _r_test_fft
+    from quadsv.nufft import NUFFTKernel, _r_test_nufft
+
+    if isinstance(kernel, FFTKernel):
+        return _r_test_fft(
+            Xn,
+            Yn,
+            kernel,
+            null_params=null_params,
+            return_pval=return_pval,
+            is_standardized=is_standardized,
+        )
+    if isinstance(kernel, NUFFTKernel):
+        return _r_test_nufft(
+            Xn,
+            Yn,
+            kernel,
+            null_params=null_params,
+            return_pval=return_pval,
+            is_standardized=is_standardized,
+        )
+
     Xn = np.asarray(Xn)
     Yn = np.asarray(Yn)
     if Xn.ndim == 1:

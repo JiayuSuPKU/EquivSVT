@@ -9,11 +9,11 @@ import warnings
 import numpy as np
 import scipy.sparse as sp
 
-from quadsv.kernels import SpatialKernel
+from quadsv.kernels import MatrixKernel
 
 
-class TestSpatialKernel(unittest.TestCase):
-    """Test cases for SpatialKernel class."""
+class TestMatrixKernel(unittest.TestCase):
+    """Test cases for MatrixKernel class."""
 
     def setUp(self):
         """Set up test fixtures."""
@@ -29,7 +29,7 @@ class TestSpatialKernel(unittest.TestCase):
         """Test from_coordinates classmethod as shown in docstring."""
         # Example from docstring
         coords = np.random.randn(100, 2)
-        kernel = SpatialKernel.from_coordinates(coords, method="gaussian", bandwidth=1.5)
+        kernel = MatrixKernel.from_coordinates(coords, method="gaussian", bandwidth=1.5)
 
         self.assertEqual(kernel.n, 100)
         self.assertEqual(kernel.method, "gaussian")
@@ -37,7 +37,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_gaussian_kernel(self):
         """Test Gaussian RBF kernel construction."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
         self.assertEqual(kernel.n, self.n)
         self.assertFalse(kernel.is_implicit)
 
@@ -52,7 +52,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_matern_kernel(self):
         """Test Matérn kernel construction."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="matern", bandwidth=1.0, nu=1.5)
+        kernel = MatrixKernel(self.coords, mode="coords", method="matern", bandwidth=1.0, nu=1.5)
         self.assertEqual(kernel.n, self.n)
         self.assertFalse(kernel.is_implicit)
 
@@ -67,7 +67,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_moran_kernel(self):
         """Test Moran's I adjacency kernel construction."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="moran", k_neighbors=4)
+        kernel = MatrixKernel(self.coords, mode="coords", method="moran", k_neighbors=4)
         self.assertEqual(kernel.n, self.n)
         self.assertFalse(kernel.is_implicit)
 
@@ -81,7 +81,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_graph_laplacian_kernel(self):
         """Test Graph Laplacian kernel construction."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="graph_laplacian", k_neighbors=4)
+        kernel = MatrixKernel(self.coords, mode="coords", method="graph_laplacian", k_neighbors=4)
         self.assertEqual(kernel.n, self.n)
         self.assertFalse(kernel.is_implicit)
         K = kernel.realization()
@@ -89,7 +89,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_car_explicit(self):
         """Test CAR kernel in explicit mode (small N)."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="car", k_neighbors=4, rho=0.9)
+        kernel = MatrixKernel(self.coords, mode="coords", method="car", k_neighbors=4, rho=0.9)
         self.assertEqual(kernel.n, self.n)
         self.assertFalse(kernel.is_implicit)  # Small N, should be explicit
 
@@ -101,7 +101,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_xtKx_computation(self):
         """Test quadratic form computation x^T K x."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
         x = np.random.randn(self.n)
 
         # Compute via method
@@ -115,7 +115,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_xtKx_sparse_input(self):
         """Test quadratic form computation with sparse input."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
 
         # Create sparse and dense versions
         x_dense = np.random.randn(self.n)
@@ -130,7 +130,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_xtKx_sparse_batch(self):
         """Test quadratic form computation with sparse batch input."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
 
         # Create sparse and dense batches
         X_dense = np.random.randn(self.n, 10)
@@ -149,7 +149,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_trace_computation(self):
         """Test trace computation."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
 
         # Compute via method
         trace_result = kernel.trace()
@@ -162,7 +162,7 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_square_trace_computation(self):
         """Test trace(K^2) computation."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
 
         # Compute via method
         sq_trace = kernel.square_trace()
@@ -183,7 +183,7 @@ class TestSpatialKernel(unittest.TestCase):
         coords_large = np.column_stack((xx.ravel(), yy.ravel()))
 
         # Construct the kernel
-        kernel = SpatialKernel(coords_large, mode="coords", method="car", k_neighbors=4, rho=0.9)
+        kernel = MatrixKernel(coords_large, mode="coords", method="car", k_neighbors=4, rho=0.9)
         self.assertEqual(kernel.n, n_large)
         self.assertTrue(kernel.is_implicit)  # Should be implicit due to size
 
@@ -220,7 +220,7 @@ class TestCARStandardize(unittest.TestCase):
 
     def test_standardize_explicit_diagonal(self):
         """Diagonal of realized K should be ~1 when standardize is True."""
-        kernel = SpatialKernel.from_coordinates(
+        kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
@@ -235,7 +235,7 @@ class TestCARStandardize(unittest.TestCase):
 
     def test_no_standardize_diagonal_not_unity(self):
         """Without standardize, diagonal need not be exactly 1."""
-        kernel = SpatialKernel.from_coordinates(
+        kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
@@ -264,7 +264,7 @@ class TestImplicitTraceOperations(unittest.TestCase):
 
     def test_implicit_trace_accuracy(self):
         """Test trace() estimation for implicit CAR kernel."""
-        kernel = SpatialKernel.from_coordinates(
+        kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
@@ -289,7 +289,7 @@ class TestImplicitTraceOperations(unittest.TestCase):
 
     def test_implicit_square_trace_accuracy(self):
         """Test square_trace() estimation for implicit CAR kernel."""
-        kernel = SpatialKernel.from_coordinates(
+        kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
@@ -369,7 +369,7 @@ class TestStandardizationPerformance(unittest.TestCase):
             print("Testing sparse approach (converted to dense for small n)...")
 
         start_sparse = time.time()
-        kernel_sparse = SpatialKernel.from_matrix(
+        kernel_sparse = MatrixKernel.from_matrix(
             M_sparse,
             is_inverse=True,
             method="car",
@@ -390,7 +390,7 @@ class TestStandardizationPerformance(unittest.TestCase):
         # Ignore warnings during dense inversion to avoid recursion issues
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            kernel_dense = SpatialKernel.from_matrix(
+            kernel_dense = MatrixKernel.from_matrix(
                 M_dense,
                 is_inverse=True,
                 method="car",
@@ -436,7 +436,7 @@ class TestKernelUtilities(unittest.TestCase):
 
     def test_format_params_repr_str(self):
         """_format_params, __repr__, and __str__ should handle arrays and sparse matrices."""
-        kernel = SpatialKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.2)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.2)
         kernel.params["arr"] = np.ones((2, 2))
         kernel.params["sparse"] = sp.csr_matrix(np.eye(2))
 
@@ -446,22 +446,22 @@ class TestKernelUtilities(unittest.TestCase):
         self.assertIn("sparse(shape=(2, 2)", params_str)
 
         repr_str = repr(kernel)
-        self.assertIn("SpatialKernel", repr_str)
+        self.assertIn("MatrixKernel", repr_str)
         self.assertIn("method=gaussian", repr_str)
 
         str_out = str(kernel)
-        self.assertIn("SpatialKernel", str_out)
+        self.assertIn("MatrixKernel", str_out)
         self.assertIn("Method: gaussian", str_out)
 
     def test_from_matrix_precomputed_and_inverse(self):
         """from_matrix should support precomputed kernels and precision matrices."""
         K = np.array([[2.0, -1.0], [-1.0, 2.0]])
-        kernel_pre = SpatialKernel.from_matrix(K, is_inverse=False)
+        kernel_pre = MatrixKernel.from_matrix(K, is_inverse=False)
         np.testing.assert_allclose(kernel_pre.realization(), K, rtol=1e-12)
 
         # Singular precision triggers pseudo-inverse path
         M = np.array([[1.0, 0.0], [0.0, 0.0]])
-        kernel_inv = SpatialKernel.from_matrix(M, is_inverse=True, method="car", standardize=True)
+        kernel_inv = MatrixKernel.from_matrix(M, is_inverse=True, method="car", standardize=True)
         K_inv = kernel_inv.realization()
         self.assertEqual(K_inv.shape, (2, 2))
         self.assertTrue(np.allclose(K_inv, K_inv.T, rtol=1e-12))
@@ -469,11 +469,11 @@ class TestKernelUtilities(unittest.TestCase):
     def test_invalid_kernel_param_raises(self):
         """Unknown kernel parameter should raise ValueError."""
         with self.assertRaises(ValueError):
-            SpatialKernel.from_coordinates(self.coords, method="gaussian", bad_param=1)
+            MatrixKernel.from_coordinates(self.coords, method="gaussian", bad_param=1)
 
     def test_eigenvalues_cache(self):
         """eigenvalues should reuse cached spectrum for smaller k."""
-        kernel = SpatialKernel.from_coordinates(self.coords, method="moran", k_neighbors=2)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="moran", k_neighbors=2)
         vals_full = kernel.eigenvalues(k=4)
         vals_subset = kernel.eigenvalues(k=2)
         # Spectrum is sorted descending, so top-2 are the first 2 elements
@@ -481,12 +481,12 @@ class TestKernelUtilities(unittest.TestCase):
 
     def test_getstate_setstate_resets_lu(self):
         """__getstate__ and __setstate__ should reset cached LU factorization."""
-        kernel = SpatialKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
         kernel._lu = object()
         state = kernel.__getstate__()
         self.assertIsNone(state.get("_lu"))
 
-        kernel2 = SpatialKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
+        kernel2 = MatrixKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
         kernel2.__setstate__(state)
         self.assertIsNone(kernel2._lu)
 

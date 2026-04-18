@@ -14,7 +14,7 @@ from scipy.special import gamma, kv
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
-__all__ = ["Kernel", "SpatialKernel"]
+__all__ = ["Kernel", "MatrixKernel"]
 
 
 class Kernel(ABC):
@@ -214,10 +214,10 @@ class Kernel(ABC):
         Examples
         --------
         >>> import numpy as np
-        >>> from quadsv import SpatialKernel
+        >>> from quadsv import MatrixKernel
         >>> rng = np.random.default_rng(0)
         >>> coords = rng.standard_normal((40, 2))
-        >>> kernel = SpatialKernel.from_coordinates(coords, method="matern")
+        >>> kernel = MatrixKernel.from_coordinates(coords, method="matern")
         >>> z = rng.standard_normal(40)
         >>> Kz = kernel.Kx(z)
         >>> Kz.shape
@@ -275,10 +275,10 @@ class Kernel(ABC):
         Examples
         --------
         >>> import numpy as np
-        >>> from quadsv import SpatialKernel
+        >>> from quadsv import MatrixKernel
         >>> rng = np.random.default_rng(0)
         >>> coords = rng.standard_normal((40, 2))
-        >>> kernel = SpatialKernel.from_coordinates(coords, method="matern")
+        >>> kernel = MatrixKernel.from_coordinates(coords, method="matern")
         >>> x = rng.standard_normal(40)
         >>> y = rng.standard_normal(40)
         >>> R = kernel.xtKy(x, y)
@@ -589,7 +589,7 @@ class Kernel(ABC):
         self._lu_lock = threading.Lock()
 
 
-class SpatialKernel(Kernel):
+class MatrixKernel(Kernel):
     """
     Concrete spatial kernel built from coordinates or a precomputed matrix.
 
@@ -599,9 +599,9 @@ class SpatialKernel(Kernel):
 
     See Also
     --------
-    SpatialKernel.from_coordinates
+    MatrixKernel.from_coordinates
         Recommended entry point when working from raw sample coordinates.
-    SpatialKernel.from_matrix
+    MatrixKernel.from_matrix
         Recommended entry point when a kernel or precision matrix is already
         available.
     """
@@ -710,9 +710,7 @@ class SpatialKernel(Kernel):
         return method_defaults.get(method, {})
 
     @classmethod
-    def from_coordinates(
-        cls, coords: np.ndarray, method: str = "matern", **kwargs
-    ) -> SpatialKernel:
+    def from_coordinates(cls, coords: np.ndarray, method: str = "matern", **kwargs) -> MatrixKernel:
         """
         Build kernel from spatial coordinates.
 
@@ -727,7 +725,7 @@ class SpatialKernel(Kernel):
 
         Returns
         -------
-        SpatialKernel
+        MatrixKernel
             Initialized kernel object.
 
         Raises
@@ -738,7 +736,7 @@ class SpatialKernel(Kernel):
         Examples
         --------
         >>> coords = np.random.randn(100, 2)
-        >>> kernel = SpatialKernel.from_coordinates(coords, method='gaussian', bandwidth=1.0)
+        >>> kernel = MatrixKernel.from_coordinates(coords, method='gaussian', bandwidth=1.0)
         """
         if method not in cls._available_kernels:
             raise ValueError(f"Unknown kernel method for coordinates: {method}.")
@@ -752,7 +750,7 @@ class SpatialKernel(Kernel):
         is_inverse: bool = False,
         method: str = "precomputed",
         **kwargs,
-    ) -> SpatialKernel:
+    ) -> MatrixKernel:
         """
         Build kernel from a precomputed kernel matrix or its inverse.
 
@@ -769,13 +767,13 @@ class SpatialKernel(Kernel):
 
         Returns
         -------
-        SpatialKernel
+        MatrixKernel
             Initialized kernel object.
 
         Examples
         --------
         >>> K = np.array([[2, -1], [-1, 2]])  # kernel matrix
-        >>> kernel = SpatialKernel.from_matrix(K, is_inverse=False)
+        >>> kernel = MatrixKernel.from_matrix(K, is_inverse=False)
         """
         mode = "precomputed_inverse" if is_inverse else "precomputed"
         return cls(matrix, mode=mode, method=method, **kwargs)
@@ -972,14 +970,14 @@ class SpatialKernel(Kernel):
             data_desc = "data=?"
 
         return (
-            f"<SpatialKernel method={self.method} mode={self._mode} n={self.n} "
+            f"<MatrixKernel method={self.method} mode={self._mode} n={self.n} "
             f"implicit={self.is_implicit} data={data_desc} params={{ {self._format_params()} }}>"
         )
 
     def __str__(self):
         # Human-friendly multi-line summary
         lines = [
-            "SpatialKernel",
+            "MatrixKernel",
             f"- Method: {self.method}",
             f"- Mode: {self._mode}",
             f"- Samples: {self.n}",

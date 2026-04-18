@@ -1,14 +1,15 @@
 """
 Unit tests for FFT-based kernel and statistical tests.
-Compares FFTKernel results with SpatialKernel for grid data.
+Compares FFTKernel results with MatrixKernel for grid data.
 """
 
 import unittest
 
 import numpy as np
 
-from quadsv.fft import FFTKernel, spatial_q_test_fft, spatial_r_test_fft
-from quadsv.kernels import SpatialKernel
+from quadsv.fft import FFTKernel
+from quadsv.kernels import MatrixKernel
+from quadsv.statistics import spatial_q_test, spatial_r_test
 from quadsv.statistics import spatial_q_test as spatial_q_test_standard
 from quadsv.statistics import spatial_r_test as spatial_r_test_standard
 from quadsv.utils import compute_torus_distance_matrix
@@ -128,7 +129,7 @@ class TestFFTKernelBasics(unittest.TestCase):
         k1 = FFTKernel(shape, method="moran", neighbor_degree=1, fft_solver="rfft2")
         k2 = FFTKernel(shape, method="moran", neighbor_degree=1, fft_solver="fft2")
 
-        evals1 = k1.eigenvalues(return_full=True)
+        evals1 = k1.eigenvalues(return_full_layout=True)
         evals2 = k2.eigenvalues()
 
         # Spectra should be different
@@ -179,7 +180,7 @@ class TestSpatialQTest(unittest.TestCase):
         shape = (8, 8)
         kernel = FFTKernel(shape, method="gaussian", bandwidth=1.0)
         x = np.random.randn(8, 8)
-        Q = spatial_q_test_fft(x, kernel, return_pval=False)
+        Q = spatial_q_test(x, kernel, return_pval=False)
         assert np.isfinite(Q)
         assert np.isscalar(Q)
 
@@ -188,7 +189,7 @@ class TestSpatialQTest(unittest.TestCase):
         shape = (8, 8)
         kernel = FFTKernel(shape, method="gaussian", bandwidth=1.0)
         x = np.random.randn(8, 8, 5)
-        Q = spatial_q_test_fft(x, kernel, return_pval=False)
+        Q = spatial_q_test(x, kernel, return_pval=False)
         assert Q.shape == (5,)
 
     def test_spatial_q_test_with_pval(self):
@@ -196,7 +197,7 @@ class TestSpatialQTest(unittest.TestCase):
         shape = (8, 8)
         kernel = FFTKernel(shape, method="gaussian", bandwidth=1.0)
         x = np.random.randn(8, 8)
-        Q, pval = spatial_q_test_fft(x, kernel, return_pval=True)
+        Q, pval = spatial_q_test(x, kernel, return_pval=True)
         assert np.isfinite(Q)
         assert 0 <= pval <= 1.0
 
@@ -208,11 +209,11 @@ class TestSpatialQTest(unittest.TestCase):
         # Create data with non-zero mean and std != 1
         x = np.random.randn(8, 8) * 2.0 + 5.0
 
-        Q1 = spatial_q_test_fft(x, kernel, is_standardized=False, return_pval=False)
+        Q1 = spatial_q_test(x, kernel, is_standardized=False, return_pval=False)
 
         # Manually standardize
         x_std = (x - x.mean()) / x.std(ddof=1)
-        Q2 = spatial_q_test_fft(x_std, kernel, is_standardized=True, return_pval=False)
+        Q2 = spatial_q_test(x_std, kernel, is_standardized=True, return_pval=False)
 
         # Should be the same
         assert np.isclose(Q1, Q2, rtol=1e-9)
@@ -227,7 +228,7 @@ class TestSpatialRTest(unittest.TestCase):
         kernel = FFTKernel(shape, method="gaussian", bandwidth=1.0)
         x = np.random.randn(8, 8)
         y = np.random.randn(8, 8)
-        R = spatial_r_test_fft(x, y, kernel, return_pval=False)
+        R = spatial_r_test(x, y, kernel, return_pval=False)
         assert np.isfinite(R)
         assert np.isscalar(R)
 
@@ -237,7 +238,7 @@ class TestSpatialRTest(unittest.TestCase):
         kernel = FFTKernel(shape, method="gaussian", bandwidth=1.0)
         x = np.random.randn(8, 8, 3)
         y = np.random.randn(8, 8, 3)
-        R = spatial_r_test_fft(x, y, kernel, return_pval=False)
+        R = spatial_r_test(x, y, kernel, return_pval=False)
         assert R.shape == (3,)
 
     def test_spatial_r_test_with_pval(self):
@@ -246,7 +247,7 @@ class TestSpatialRTest(unittest.TestCase):
         kernel = FFTKernel(shape, method="gaussian", bandwidth=1.0)
         x = np.random.randn(8, 8)
         y = np.random.randn(8, 8)
-        R, pval = spatial_r_test_fft(x, y, kernel, return_pval=True)
+        R, pval = spatial_r_test(x, y, kernel, return_pval=True)
         assert np.isfinite(R)
         assert 0 <= pval <= 1.0
 
@@ -256,13 +257,13 @@ class TestSpatialRTest(unittest.TestCase):
         kernel = FFTKernel(shape, method="gaussian", bandwidth=1.0)
         x = np.random.randn(8, 8)
         y = np.random.randn(8, 8)
-        R_xy = spatial_r_test_fft(x, y, kernel, return_pval=False)
-        R_yx = spatial_r_test_fft(y, x, kernel, return_pval=False)
+        R_xy = spatial_r_test(x, y, kernel, return_pval=False)
+        R_yx = spatial_r_test(y, x, kernel, return_pval=False)
         assert np.isclose(R_xy, R_yx, rtol=1e-9)
 
 
-class TestFFTVsSpatialKernelComparison(unittest.TestCase):
-    """Compare FFT-based kernel with SpatialKernel on grid data."""
+class TestFFTVsMatrixKernelComparison(unittest.TestCase):
+    """Compare FFT-based kernel with MatrixKernel on grid data."""
 
     @staticmethod
     def create_grid_and_kernels(nx, ny, method="gaussian", **kwargs):
@@ -307,13 +308,13 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
             if method == "car":
                 rho = kwargs.get("rho", 0.9)
                 W = np.eye(n) - rho * W
-                spatial_kernel = SpatialKernel.from_matrix(W, method=method, is_inverse=True)
+                spatial_kernel = MatrixKernel.from_matrix(W, method=method, is_inverse=True)
             else:  # Moran
-                spatial_kernel = SpatialKernel.from_matrix(W, method=method)
+                spatial_kernel = MatrixKernel.from_matrix(W, method=method)
 
         elif method == "gaussian":
             k_torus = np.exp(-(d_torus**2) / (2 * kwargs.get("bandwidth", 1.0) ** 2))
-            spatial_kernel = SpatialKernel.from_matrix(k_torus, method=method)
+            spatial_kernel = MatrixKernel.from_matrix(k_torus, method=method)
         elif method == "matern":
             from scipy.special import gamma, kv
 
@@ -324,7 +325,7 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
             fac = (np.sqrt(2 * nu) * d_torus) / bw
             k_torus = (2 ** (1 - nu) / gamma(nu)) * (fac**nu) * kv(nu, fac)
             np.fill_diagonal(k_torus, 1.0)
-            spatial_kernel = SpatialKernel.from_matrix(k_torus, method=method)
+            spatial_kernel = MatrixKernel.from_matrix(k_torus, method=method)
 
         return coords, fft_kernel, spatial_kernel
 
@@ -334,7 +335,7 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
             30, 30, method="gaussian", bandwidth=1.0
         )
 
-        fft_evals = np.sort(fft_k.eigenvalues(return_full=True))[::-1]  # Descending
+        fft_evals = np.sort(fft_k.eigenvalues(return_full_layout=True))[::-1]  # Descending
         spatial_evals = np.sort(spatial_k.eigenvalues())[::-1]  # Descending
 
         # Should be extremely close
@@ -350,7 +351,7 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
             30, 30, method="matern", bandwidth=1.0, nu=1.5
         )
 
-        fft_evals = np.sort(fft_k.eigenvalues(return_full=True))[::-1]  # Descending
+        fft_evals = np.sort(fft_k.eigenvalues(return_full_layout=True))[::-1]  # Descending
         spatial_evals = np.sort(spatial_k.eigenvalues())[::-1]  # Descending
 
         # Should be extremely close
@@ -366,7 +367,7 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
             30, 30, method="moran", neighbor_degree=1, k_neighbors=4
         )
 
-        fft_evals = np.sort(fft_k.eigenvalues(return_full=True))[::-1]  # Descending
+        fft_evals = np.sort(fft_k.eigenvalues(return_full_layout=True))[::-1]  # Descending
         spatial_evals = np.sort(spatial_k.eigenvalues())[::-1]  # Descending
 
         # Should be extremely close
@@ -382,7 +383,7 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
             30, 30, method="car", neighbor_degree=1, k_neighbors=4, rho=0.9
         )
 
-        fft_evals = np.sort(fft_k.eigenvalues(return_full=True))[::-1]  # Descending
+        fft_evals = np.sort(fft_k.eigenvalues(return_full_layout=True))[::-1]  # Descending
         spatial_evals = np.sort(spatial_k.eigenvalues())[::-1]  # Descending
 
         # Should be extremely close
@@ -412,7 +413,7 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
             )
 
         # FFT test
-        Q_fft = spatial_q_test_fft(x_data, fft_k, return_pval=False)
+        Q_fft = spatial_q_test(x_data, fft_k, return_pval=False)
 
         # Standard test on original data
         Q_std = spatial_q_test_standard(x_data.ravel(), spatial_k, return_pval=False)
@@ -449,7 +450,7 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
         y_flat = y_data.ravel()
 
         # FFT test
-        R_fft = spatial_r_test_fft(x_data, y_data, fft_k, return_pval=False)
+        R_fft = spatial_r_test(x_data, y_data, fft_k, return_pval=False)
 
         # Standard test on original data
         R_std = spatial_r_test_standard(x_flat, y_flat, spatial_k, return_pval=False)
@@ -468,14 +469,11 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
         x_batch = np.random.randn(ny, nx, batch_size)
 
         # Batched
-        Q_batch = spatial_q_test_fft(x_batch, fft_k, return_pval=False)
+        Q_batch = spatial_q_test(x_batch, fft_k, return_pval=False)
 
         # Sequential
         Q_seq = np.array(
-            [
-                spatial_q_test_fft(x_batch[..., i], fft_k, return_pval=False)
-                for i in range(batch_size)
-            ]
+            [spatial_q_test(x_batch[..., i], fft_k, return_pval=False) for i in range(batch_size)]
         )
 
         assert np.allclose(Q_batch, Q_seq, rtol=1e-10)
@@ -491,12 +489,12 @@ class TestFFTVsSpatialKernelComparison(unittest.TestCase):
         y_batch = np.random.randn(ny, nx, batch_size)
 
         # Batched
-        R_batch = spatial_r_test_fft(x_batch, y_batch, fft_k, return_pval=False)
+        R_batch = spatial_r_test(x_batch, y_batch, fft_k, return_pval=False)
 
         # Sequential
         R_seq = np.array(
             [
-                spatial_r_test_fft(x_batch[..., i], y_batch[..., i], fft_k, return_pval=False)
+                spatial_r_test(x_batch[..., i], y_batch[..., i], fft_k, return_pval=False)
                 for i in range(batch_size)
             ]
         )
@@ -520,13 +518,13 @@ class TestPhaseBFFTUnification(unittest.TestCase):
         from quadsv.statistics import compute_null_params
 
         data = np.random.randn(self.ny, self.nx)
-        Q_auto, p_auto = spatial_q_test_fft(data, self.kernel)
+        Q_auto, p_auto = spatial_q_test(data, self.kernel)
         params = compute_null_params(self.kernel, method="liu")
-        Q_given, p_given = spatial_q_test_fft(data, self.kernel, null_params=params)
+        Q_given, p_given = spatial_q_test(data, self.kernel, null_params=params)
         self.assertAlmostEqual(Q_auto, Q_given, places=10)
         # p-values differ at O(1e-3) because `compute_null_params` uses the
         # (possibly subsetted) `eigenvalues()` path while the on-the-fly
-        # branch uses `eigenvalues(return_full=True)`. Both are valid Liu
+        # branch uses `eigenvalues(return_full_layout=True)`. Both are valid Liu
         # approximations; we only care the parametrized path returns a
         # finite probability in [0, 1].
         self.assertGreaterEqual(p_given, 0.0)
@@ -538,9 +536,9 @@ class TestPhaseBFFTUnification(unittest.TestCase):
 
         x = np.random.randn(self.ny, self.nx)
         y = np.random.randn(self.ny, self.nx)
-        R_auto, p_auto = spatial_r_test_fft(x, y, self.kernel)
+        R_auto, p_auto = spatial_r_test(x, y, self.kernel)
         params = compute_null_params(self.kernel, method="welch")
-        R_given, p_given = spatial_r_test_fft(x, y, self.kernel, null_params=params)
+        R_given, p_given = spatial_r_test(x, y, self.kernel, null_params=params)
         self.assertAlmostEqual(R_auto, R_given, places=10)
         self.assertAlmostEqual(p_auto, p_given, places=10)
 

@@ -2,22 +2,22 @@
 High-level wrapper classes for cross-sample spatial-pattern comparison.
 
 The array-level primitives (spectrum compute, radial binning, rotation
-alignment, statistical tests) live in :mod:`quadsv.spectral_compare`. This
+alignment, statistical tests) live in :mod:`quadsv.multisample`. This
 module only carries the two user-facing classes that wire those primitives
 onto concrete container types:
 
-- :class:`PatternComparatorNUFFT` — a sequence of :class:`anndata.AnnData`,
+- :class:`ComparatorIrregular` — a sequence of :class:`anndata.AnnData`,
   irregular spots. Spectra are computed with a batched type-1 NUFFT.
-- :class:`PatternComparatorFFT` — a sequence of
+- :class:`ComparatorGrid` — a sequence of
   :class:`spatialdata.SpatialData`, regular rasterized bins. Spectra are
   computed with a single batched 2D FFT per sample after calling
   :func:`spatialdata.rasterize_bins` on user-supplied bin / table /
   col-row / value keys (same rasterization recipe as
-  :class:`~quadsv.PatternDetectorFFT`).
+  :class:`~quadsv.DetectorGrid`).
 
 Both classes share the same post-fit surface (``normalize_background``,
 ``shape_normalize``, ``residualize``, ``test_pattern``, ``test_expression``,
-``benchmark``) via the private :class:`_PatternComparatorBase` mixin.
+``benchmark``) via the private :class:`_ComparatorBase` mixin.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 import anndata as _ad
 import spatialdata as sd
 
-from quadsv.spectral_compare import (
+from quadsv.multisample import (
     _AVAILABLE_STATISTICS,
     _ZSCORE_CLIP,
     align_spectra_by_rotation,
@@ -56,7 +56,7 @@ from quadsv.spectral_compare import (
     shape_normalize,
 )
 
-__all__ = ["PatternComparatorNUFFT", "PatternComparatorFFT"]
+__all__ = ["ComparatorIrregular", "ComparatorGrid"]
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-class _PatternComparatorBase:
+class _ComparatorBase:
     """Shared state + shared methods for NUFFT / FFT pattern comparators.
 
     Concrete subclasses must populate ``self.samples``, ``self.groups``,
@@ -129,7 +129,7 @@ class _PatternComparatorBase:
         n_jobs: int = -1,
         landmark_genes: Sequence[str] | None = None,
         progress: bool = True,
-    ) -> _PatternComparatorBase:
+    ) -> _ComparatorBase:
         """
         Compute per-sample power spectra and (if ``feature_mode='2d'``) rotation-align.
 
@@ -227,7 +227,7 @@ class _PatternComparatorBase:
     # ------------------------------------------------------------------
     # Post-fit transforms
     # ------------------------------------------------------------------
-    def normalize_background(self) -> _PatternComparatorBase:
+    def normalize_background(self) -> _ComparatorBase:
         """Apply per-sample geometric-mean background normalization in place."""
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .normalize_background().")
@@ -235,14 +235,14 @@ class _PatternComparatorBase:
             self.spectra_[i] = normalize_by_background(self.spectra_[i])
         return self
 
-    def shape_normalize(self) -> _PatternComparatorBase:
+    def shape_normalize(self) -> _ComparatorBase:
         """Rescale each ``(sample, gene)`` spectrum to sum-1 along frequency."""
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .shape_normalize().")
         self.spectra_ = shape_normalize(self.spectra_, axis=-1)
         return self
 
-    def residualize(self, covariates: Sequence[np.ndarray]) -> _PatternComparatorBase:
+    def residualize(self, covariates: Sequence[np.ndarray]) -> _ComparatorBase:
         """Regress out per-sample covariate spectra from :attr:`spectra_`.
 
         ``covariates[i]`` should be a ``(n_covariates, ny_i, nx_i)`` array
@@ -260,19 +260,24 @@ class _PatternComparatorBase:
             cov_2d = compute_sample_spectrum(
                 cov, fft_solver=self._spectrum_fft_solver, workers=self.workers
             )
-            shape = self._grid_shapes[i]
+            # Use the covariate's own raster shape — for the NUFFT path the
+            # sample's internal k-grid (self._grid_shapes[i]) is auto-inferred
+            # and may differ from the covariate raster. ``freq_edges`` (shared
+            # across samples when ``feature_mode='radial'``) is what aligns the
+            # bins, not grid_shape.
+            cov_shape = cov.shape[-2:]
             spacing = self.spacings[i] if self.spacings is not None else None
             if self.feature_mode == "radial":
                 cov_feat = radial_bin_spectrum(
                     cov_2d,
-                    grid_shape=shape,
+                    grid_shape=cov_shape,
                     n_bins=self.n_radial_bins,
                     fft_solver=self._spectrum_fft_solver,
                     spacing=spacing,
                     edges=self.freq_edges,
                 )
             else:
-                ny, nx = shape
+                ny, nx = cov_shape
                 k = min(self.n_radial_bins, ny // 2, nx // 2)
                 low = cov_2d[:, :k, :k] if cov_2d.shape[-1] > k else cov_2d[:, :k, :]
                 cov_feat = low.reshape(low.shape[0], -1)
@@ -293,10 +298,10 @@ class _PatternComparatorBase:
     ) -> Any:
         """Two-group spectral-pattern test on :attr:`spectra_`.
 
-        Dispatches to :func:`quadsv.spectral_compare.compare_two_groups_masked`
+        Dispatches to :func:`quadsv.multisample.compare_two_groups_masked`
         when any ``(sample, gene)`` pair is marked absent in :attr:`presence_`
         (e.g. when ``presence_threshold > 0``), otherwise to
-        :func:`~quadsv.spectral_compare.compare_two_groups`.
+        :func:`~quadsv.multisample.compare_two_groups`.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .test_pattern().")
@@ -402,11 +407,11 @@ def _validate_common(
 
 
 # ---------------------------------------------------------------------------
-# PatternComparatorNUFFT — AnnData / irregular spots
+# ComparatorIrregular — AnnData / irregular spots
 # ---------------------------------------------------------------------------
 
 
-class PatternComparatorNUFFT(_PatternComparatorBase):
+class ComparatorIrregular(_ComparatorBase):
     """
     Cross-sample pattern comparison on irregular spots via NUFFT.
 
@@ -633,11 +638,11 @@ class PatternComparatorNUFFT(_PatternComparatorBase):
 
 
 # ---------------------------------------------------------------------------
-# PatternComparatorFFT — SpatialData / regular bins via rasterize_bins
+# ComparatorGrid — SpatialData / regular bins via rasterize_bins
 # ---------------------------------------------------------------------------
 
 
-class PatternComparatorFFT(_PatternComparatorBase):
+class ComparatorGrid(_ComparatorBase):
     """
     Cross-sample pattern comparison on regular bins via FFT + SpatialData.
 
@@ -646,7 +651,7 @@ class PatternComparatorFFT(_PatternComparatorBase):
     shape + table into a dense ``(n_genes, ny, nx)`` image, which is then fed
     to the batched 2D FFT. All samples are expected to share the same
     rasterization schema (``bins`` / ``table_name`` / ``col_key`` / ``row_key``
-    / ``value_key``) — this mirrors :class:`~quadsv.PatternDetectorFFT`.
+    / ``value_key``) — this mirrors :class:`~quadsv.DetectorGrid`.
 
     Parameters
     ----------
@@ -745,11 +750,10 @@ class PatternComparatorFFT(_PatternComparatorBase):
         """Wrap :func:`spatialdata.rasterize_bins`. Returns a
         ``(n_genes, ny, nx)`` float array in :attr:`gene_names` order.
         """
+        from quadsv._rasterize import rasterize_table
+
         table = sdata.tables[self._table_name]
-        # rasterize_bins requires CSC if sparse.
-        if sp.issparse(table.X) and table.X.format != "csc":
-            table.X = table.X.tocsc()
-        img = sd.rasterize_bins(
+        img = rasterize_table(
             sdata,
             bins=self._bins,
             table_name=self._table_name,
@@ -872,7 +876,7 @@ def _run_per_sample(
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Invoke ``worker(i, pbar)`` for each sample with a shared tqdm bar.
 
-    Used by :class:`PatternComparatorNUFFT` where each sample is split into
+    Used by :class:`ComparatorIrregular` where each sample is split into
     multiple per-gene-chunk tqdm ticks.
     """
     raw_2d: list[np.ndarray | None] = [None] * n_samples_total

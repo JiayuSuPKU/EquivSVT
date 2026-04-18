@@ -1,7 +1,7 @@
 """Tests for quadsv.comparators.
 
-The NUFFT class is exercised heavily through ``tests/test_spectral_compare.py``
-(where the AnnData-backed ``PatternComparatorNUFFT`` powers the end-to-end,
+The NUFFT class is exercised heavily through ``tests/test_multisample.py``
+(where the AnnData-backed ``ComparatorIrregular`` powers the end-to-end,
 incomplete-data, and statistic-calibration checks). This file is focused on
 the FFT class, which needs a live :class:`spatialdata.SpatialData` fixture
 so :func:`spatialdata.rasterize_bins` has something to render.
@@ -24,7 +24,7 @@ import shapely.geometry as sg
 import spatialdata as sd
 from geopandas import GeoDataFrame
 
-from quadsv.comparators import PatternComparatorFFT, PatternComparatorNUFFT
+from quadsv.comparators import ComparatorGrid, ComparatorIrregular
 
 
 def _make_bin_sdata(
@@ -38,7 +38,7 @@ def _make_bin_sdata(
     The bins are a regular ``ny × nx`` square grid with unit pitch;
     ``col_key`` / ``row_key`` / ``value_key`` are populated on the table's
     ``.obs``. ``gene_values`` maps gene name → ``(ny, nx)`` pattern; when None
-    a pair of low-frequency sinusoids is used so :class:`PatternComparatorFFT`
+    a pair of low-frequency sinusoids is used so :class:`ComparatorGrid`
     has non-trivial spectra to compute.
     """
     rng = np.random.default_rng(rng_seed)
@@ -91,7 +91,7 @@ def _make_bin_sdata(
     return sdata
 
 
-class TestPatternComparatorFFT:
+class TestComparatorGrid:
     """Smoke tests for the SpatialData backend.
 
     These run only when the spatialdata rasterize_bins dependency chain is
@@ -122,7 +122,7 @@ class TestPatternComparatorFFT:
 
         groups = np.array([0, 0, 1, 1])
         try:
-            cmp = PatternComparatorFFT(
+            cmp = ComparatorGrid(
                 samples,
                 groups=groups,
                 bins="bins",
@@ -136,7 +136,7 @@ class TestPatternComparatorFFT:
         except TypeError:
             # Some spatialdata versions disallow our minimal fixture; that's fine —
             # this test acts as a signal, not a hard requirement.
-            pytest.skip("PatternComparatorFFT smoke test not runnable on this spatialdata version.")
+            pytest.skip("ComparatorGrid smoke test not runnable on this spatialdata version.")
         cmp.fit(progress=False)
         assert cmp.spectra_ is not None
         assert cmp.spectra_.shape[0] == len(samples)
@@ -149,14 +149,14 @@ class TestPatternComparatorFFT:
         assert df["P_value"].between(0, 1).all()
 
 
-class TestPatternComparatorNUFFTImport:
+class TestComparatorIrregularImport:
     """Smoke test: the AnnData-backed class is importable and rejects
     non-AnnData samples. Heavy paths are exercised in
-    ``tests/test_spectral_compare.py``."""
+    ``tests/test_multisample.py``."""
 
     def test_rejects_non_anndata(self):
         with pytest.raises(TypeError, match="anndata.AnnData"):
-            PatternComparatorNUFFT(
+            ComparatorIrregular(
                 [np.zeros((4, 3))],
                 groups=np.array([0]),
             )

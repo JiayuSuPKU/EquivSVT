@@ -1,4 +1,4 @@
-"""Tests for quadsv.nufft + PatternComparatorNUFFT."""
+"""Tests for quadsv.nufft + ComparatorIrregular."""
 
 from __future__ import annotations
 
@@ -106,11 +106,8 @@ class TestBatchedValues:
 # ---------------------------------------------------------------------------
 
 
-from quadsv.nufft import (  # noqa: E402
-    NUFFTKernel,
-    spatial_q_test_nufft,
-    spatial_r_test_nufft,
-)
+from quadsv.nufft import NUFFTKernel
+from quadsv.statistics import spatial_q_test, spatial_r_test
 
 
 class TestNUFFTKernelConstruction:
@@ -192,7 +189,7 @@ class TestNUFFTKernelConstruction:
 class TestNUFFTKernelxtKx:
     def test_matches_spatial_kernel_dense_on_irregular(self):
         """xtKx_nufft matches the dense Euclidean quadratic form to ~2% (torus-BC band)."""
-        from quadsv.kernels import SpatialKernel
+        from quadsv.kernels import MatrixKernel
 
         rng = np.random.default_rng(0)
         N = 400
@@ -205,7 +202,7 @@ class TestNUFFTKernelxtKx:
             bandwidth=2.0,
             nu=1.5,
         )
-        sk = SpatialKernel.from_coordinates(coords, method="matern", bandwidth=2.0, nu=1.5)
+        sk = MatrixKernel.from_coordinates(coords, method="matern", bandwidth=2.0, nu=1.5)
         # Average over several random x to smooth realization noise. The
         # relative bias is dominated by torus vs Euclidean boundary conditions
         # (~2-5% typical), which is the same approximation FFTKernel makes.
@@ -273,7 +270,7 @@ class TestSpatialQTestNUFFT:
         k = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
         y = coords[:, 0]
         x_sig = np.sin(2 * np.pi * y / 6.0) + 0.3 * rng.standard_normal(N)
-        _, p = spatial_q_test_nufft(x_sig, k)
+        _, p = spatial_q_test(x_sig, k)
         assert p < 0.05, f"structured signal should be significant; got p={p:.3f}"
 
     def test_batched_q_test(self):
@@ -282,12 +279,12 @@ class TestSpatialQTestNUFFT:
         coords = rng.uniform(0, 20, size=(N, 2))
         k = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
         X = rng.standard_normal((N, 5))
-        Q, p = spatial_q_test_nufft(X, k)
+        Q, p = spatial_q_test(X, k)
         assert Q.shape == (5,) and p.shape == (5,)
 
     def test_matches_fft_on_regular_grid(self):
-        """On a uniform N=ny*nx grid the NUFFT Q-test equals spatial_q_test_fft."""
-        from quadsv.fft import FFTKernel, spatial_q_test_fft
+        """On a uniform N=ny*nx grid the NUFFT Q-test equals spatial_q_test (FFT kernel)."""
+        from quadsv.fft import FFTKernel
 
         ny, nx = 16, 20
         yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
@@ -306,8 +303,8 @@ class TestSpatialQTestNUFFT:
         k_fft = FFTKernel(
             (ny, nx), spacing=(1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5, fft_solver="fft2"
         )
-        Q_n, p_n = spatial_q_test_nufft(x, k_nufft)
-        Q_f, p_f = spatial_q_test_fft(x.reshape(ny, nx), k_fft)
+        Q_n, p_n = spatial_q_test(x, k_nufft)
+        Q_f, p_f = spatial_q_test(x.reshape(ny, nx), k_fft)
         assert abs(Q_n - float(Q_f)) / abs(float(Q_f)) < 1e-6
         assert abs(p_n - float(p_f)) < 1e-3
 
@@ -321,7 +318,7 @@ class TestSpatialRTestNUFFT:
         pattern = np.sin(2 * np.pi * coords[:, 0] / 4.0)
         x_sig = pattern + 0.4 * rng.standard_normal(N)
         y_sig = pattern + 0.4 * rng.standard_normal(N)
-        R, p = spatial_r_test_nufft(x_sig, y_sig, k)
+        R, p = spatial_r_test(x_sig, y_sig, k)
         assert float(R) > 0, "correlated pair should give positive R"
         assert float(p) < 0.05, f"correlated pair significance; got p={float(p):.3f}"
 
@@ -332,18 +329,18 @@ class TestSpatialRTestNUFFT:
         k = NUFFTKernel(coords, (64, 64), (0.35, 0.35), method="matern", bandwidth=2.0, nu=1.5)
         x = rng.standard_normal(N)
         y = rng.standard_normal(N)
-        _, p = spatial_r_test_nufft(x, y, k)
+        _, p = spatial_r_test(x, y, k)
         assert float(p) > 0.05, f"random pair should not be significant; got p={float(p):.3f}"
 
 
 # ---------------------------------------------------------------------------
-# PatternDetectorNUFFT
+# DetectorNUFFT
 # ---------------------------------------------------------------------------
 
 
-class TestPatternDetectorNUFFTBackend:
-    """After Phase C, PatternDetectorNUFFT is gone — the same workflow runs
-    through :class:`PatternDetector` with ``backend='nufft'``."""
+class TestDetectorNUFFTBackend:
+    """After Phase C, DetectorNUFFT is gone — the same workflow runs
+    through :class:`DetectorIrregular` with ``backend='nufft'``."""
 
     def _mk_adata(self, n_spots=400, n_genes=10, with_signal=True, seed=0):
         import anndata as ad
@@ -361,12 +358,11 @@ class TestPatternDetectorNUFFTBackend:
         return adata
 
     def test_build_and_qstat(self):
-        from quadsv import PatternDetector
+        from quadsv import DetectorIrregular
 
         adata = self._mk_adata(n_spots=400, n_genes=8, with_signal=True)
-        det = PatternDetector(adata).build_kernel(
-            backend="nufft", method="matern", bandwidth=2.0, nu=1.5
-        )
+        det = DetectorIrregular(kernel_method="matern", backend="nufft", bandwidth=2.0, nu=1.5)
+        det.setup_data(adata)
         assert det.kernel_ is not None
         assert det.kernel_method_ == "matern"
         assert det.backend_ == "nufft"
@@ -377,13 +373,12 @@ class TestPatternDetectorNUFFTBackend:
         assert df.set_index("Feature").loc["g0", "P_value"] < 0.05
 
     def test_rstat_on_correlated_pair(self):
-        from quadsv import PatternDetector
+        from quadsv import DetectorIrregular
 
         adata = self._mk_adata(n_spots=400, n_genes=4, with_signal=True)
         adata.X[:, 1] = adata.X[:, 0] + 0.3 * np.random.default_rng(1).standard_normal(adata.n_obs)
-        det = PatternDetector(adata).build_kernel(
-            backend="nufft", method="matern", bandwidth=2.0, nu=1.5
-        )
+        det = DetectorIrregular(kernel_method="matern", backend="nufft", bandwidth=2.0, nu=1.5)
+        det.setup_data(adata)
         df = det.compute_rstat(features_x=["g0", "g1"], features_y=["g0", "g1"], n_jobs=1)
         row = df[(df.Feature_1 == "g0") & (df.Feature_2 == "g1")]
         assert not row.empty
@@ -392,19 +387,18 @@ class TestPatternDetectorNUFFTBackend:
     def test_invalid_spatial_key(self):
         import anndata as ad
 
-        from quadsv import PatternDetector
+        from quadsv import DetectorIrregular
 
         adata = ad.AnnData(X=np.zeros((5, 3)))
-        det = PatternDetector(adata)
+        det = DetectorIrregular(kernel_method="matern", backend="nufft")
         with pytest.raises(KeyError, match="spatial"):
-            det.build_kernel(backend="nufft", method="matern")
+            det.setup_data(adata)
 
     def test_requires_build_kernel(self):
-        from quadsv import PatternDetector
+        from quadsv import DetectorIrregular
 
-        adata = self._mk_adata(n_spots=50, n_genes=3)
-        det = PatternDetector(adata)
-        with pytest.raises(ValueError, match="Kernel not initialized"):
+        det = DetectorIrregular(kernel_method="matern", backend="nufft")
+        with pytest.raises((ValueError, RuntimeError), match="setup_data|Kernel not initialized"):
             det.compute_qstat(n_jobs=1)
 
 
@@ -413,26 +407,28 @@ class TestPhaseBNUFFTUnification:
     `null_params` without changing results."""
 
     def test_qtest_nufft_null_params_round_trip(self):
-        from quadsv.nufft import NUFFTKernel, spatial_q_test_nufft
+        from quadsv.nufft import NUFFTKernel
+        from quadsv.statistics import spatial_q_test
 
         rng = np.random.default_rng(0)
         ny, nx = 16, 16
         coords = rng.uniform(0, 15, size=(ny * nx, 2))
         k = NUFFTKernel(coords, (ny, nx), (1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5)
         z = rng.standard_normal(ny * nx)
-        Q_auto, p_auto = spatial_q_test_nufft(z, k)
+        Q_auto, p_auto = spatial_q_test(z, k)
         # Pre-supply rescaled eigenvalues exactly as the internal branch does.
         scale = k.n / (ny * nx)
-        evals = k.eigenvalues(return_full=True)
+        evals = k.eigenvalues(return_full_layout=True)
         sig_evals = evals[evals > 1e-9] * scale
-        Q_given, p_given = spatial_q_test_nufft(
+        Q_given, p_given = spatial_q_test(
             z, k, null_params={"method": "liu", "eigenvalues": sig_evals}
         )
         assert abs(Q_auto - Q_given) < 1e-10
         assert abs(p_auto - p_given) < 1e-10
 
     def test_rtest_nufft_null_params_round_trip(self):
-        from quadsv.nufft import NUFFTKernel, spatial_r_test_nufft
+        from quadsv.nufft import NUFFTKernel
+        from quadsv.statistics import spatial_r_test
 
         rng = np.random.default_rng(0)
         ny, nx = 16, 16
@@ -440,9 +436,9 @@ class TestPhaseBNUFFTUnification:
         k = NUFFTKernel(coords, (ny, nx), (1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5)
         x = rng.standard_normal(ny * nx)
         y = rng.standard_normal(ny * nx)
-        R_auto, p_auto = spatial_r_test_nufft(x, y, k)
+        R_auto, p_auto = spatial_r_test(x, y, k)
         scale = k.n / (ny * nx)
         var_R = float(k.square_trace()) * (scale**2)
-        R_given, p_given = spatial_r_test_nufft(x, y, k, null_params={"var_R": var_R})
+        R_given, p_given = spatial_r_test(x, y, k, null_params={"var_R": var_R})
         assert abs(R_auto - R_given) < 1e-10
         assert abs(p_auto - p_given) < 1e-10

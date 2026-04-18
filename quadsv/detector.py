@@ -10,12 +10,13 @@ from joblib import Parallel, delayed
 from scipy.stats import norm
 from tqdm import tqdm
 
-from quadsv.kernels import Kernel, SpatialKernel
-from quadsv.nufft import NUFFTKernel, spatial_q_test_nufft, spatial_r_test_nufft
-from quadsv.statistics import compute_null_params, spatial_q_test
+from quadsv._detector_base import Detector
+from quadsv.kernels import Kernel, MatrixKernel
+from quadsv.nufft import NUFFTKernel
+from quadsv.statistics import compute_null_params, spatial_q_test, spatial_r_test
 from quadsv.utils import _apply_bh_correction
 
-__all__ = ["PatternDetector"]
+__all__ = ["Detector", "DetectorIrregular"]
 
 logger = logging.getLogger(__name__)
 
@@ -266,211 +267,199 @@ def _rstat_worker_chunked(
     return results
 
 
-class PatternDetector:
+class DetectorIrregular(Detector):
     """
-    Detect spatial or graph-based feature variability using the quadratic-form statistic.
+    Detect spatial patterns on **irregular** samples (AnnData spots / cells).
 
-    This class implements univariate (Q-test) and bivariate (R-test) spatial statistics
-    for feature screening using kernel-based methods. Supports multiple kernel types
-    (Gaussian, Matérn, Moran's I, graph Laplacian, CAR) and integrates with scanpy/AnnData.
+    Univariate (Q-test) and bivariate (R-test) kernel-based spatial statistics.
+    Supports two backends:
 
-    The core test statistic is:
+    - ``backend='matrix'`` — :class:`~quadsv.MatrixKernel` (dense or implicit
+      sparse-precision, auto-selected by ``N``). Good up to ~10⁴ spots.
+    - ``backend='nufft'`` — :class:`~quadsv.NUFFTKernel`, ``O(N log N)`` quadratic
+      forms on arbitrary point sets. Recommended for ≥ 10⁴ spots.
 
-    - Univariate:  :math:`Q = \\mathbf{x}^T \\mathbf{K} \\mathbf{x}` for standardized feature vector :math:`\\mathbf{x}` and kernel :math:`\\mathbf{K}`.
-    - Bivariate: :math:`R = \\mathbf{x}^T \\mathbf{K} \\mathbf{y}` for cross-spatial correlation.
+    The core test statistics are:
+
+    - Univariate:  :math:`Q = \\mathbf{x}^T \\mathbf{K} \\mathbf{x}`
+    - Bivariate:  :math:`R = \\mathbf{x}^T \\mathbf{K} \\mathbf{y}`
+
+    Workflow
+    --------
+    1. **Construct** with kernel method + backend + kernel hyperparameters.
+    2. **Setup** with :meth:`setup_data` passing the :class:`anndata.AnnData`
+       plus spatial source (``coordinates_key`` in ``obsm``, or
+       ``obsp_key`` for precomputed adjacency / distance).
+    3. **Compute** with :meth:`compute_qstat` / :meth:`compute_rstat`.
 
     Parameters
     ----------
-    adata : scanpy.AnnData
-        Annotated data matrix containing gene expression or other features.
-    min_cells : int, default 1
-        Minimum number of non-zero observations required for a feature to be tested.
-    min_cells_frac : float, optional
-        If provided, overrides min_cells to be this fraction of total cells.
+    kernel_method : str, default ``'matern'``
+        One of ``'gaussian'``, ``'matern'``, ``'moran'``, ``'graph_laplacian'``,
+        ``'car'``.
+    backend : {``'matrix'``, ``'nufft'``}, default ``'matrix'``
+        Kernel backend.
+    **kernel_params
+        Method- and backend-specific kernel hyperparameters. Matrix backend:
+        ``bandwidth``, ``nu``, ``rho``, ``k_neighbors``, ``standardize``.
+        NUFFT backend: ``bandwidth``, ``nu``, ``rho``, ``neighbor_degree``,
+        plus grid controls ``grid_shape``, ``spacing``, ``unit_scale``,
+        ``oversample``, ``eps``.
 
     Attributes
     ----------
-    adata : scanpy.AnnData
-        Reference to the input data object.
-    n : int
-        Number of samples (cells/observations).
-    kernel_ : Kernel or None
-        Active kernel object (set by build_kernel_* methods).
-    kernel_method_ : str or None
-        Method used to construct the current kernel.
-    kernel_params_ : dict or None
-        Parameters used to construct the current kernel.
-
-    See Also
-    --------
-    :meth:`~quadsv.detector.PatternDetector.compute_qstat`
-        Compute univariate spatial statistics (Q-test).
-    :meth:`~quadsv.detector.PatternDetector.compute_rstat`
-        Compute bivariate spatial statistics (R-test).
-    :meth:`~quadsv.detector.PatternDetector.build_kernel_from_coordinates`
-        Construct kernel from spatial coordinates.
-    :meth:`~quadsv.detector.PatternDetector.build_kernel_from_obsp`
-        Construct kernel from precomputed distance/adjacency matrix.
+    backend_ : {``'matrix'``, ``'nufft'``}
+        Which backend was selected at construction.
+    adata : :class:`anndata.AnnData` or None
+        Input container set by :meth:`setup_data`.
+    min_cells : int or None
+        Minimum non-zero count per feature; set by :meth:`setup_data`.
+    kernel_ : :class:`~quadsv.Kernel` or None
+    kernel_method_, kernel_params_, n : see :class:`Detector`.
 
     Examples
     --------
-    >>> import anndata
-    >>> adata = anndata.read_h5ad('data.h5ad')
-    >>> detector = PatternDetector(adata, min_cells=10)
-    >>> detector.build_kernel_from_coordinates(adata.obsm['spatial'], method='gaussian', bandwidth=2.0)
-    >>> q_results = detector.compute_qstat(source='var', n_jobs=4)
+    >>> import anndata as ad, numpy as np
+    >>> from quadsv import DetectorIrregular
+    >>> rng = np.random.default_rng(0)
+    >>> adata = ad.AnnData(X=rng.standard_normal((200, 5)))
+    >>> adata.obsm["spatial"] = rng.standard_normal((200, 2))
+    >>> det = DetectorIrregular(kernel_method="car", rho=0.9, k_neighbors=8)
+    >>> det.setup_data(adata, min_cells=5)  # doctest: +ELLIPSIS
+    <DetectorIrregular ...>
+    >>> # q = det.compute_qstat()
     """
 
-    _available_kernels = ["gaussian", "matern", "moran", "graph_laplacian", "car"]
+    _NUFFT_ONLY_GRID_KEYS = ("grid_shape", "spacing", "unit_scale", "oversample", "eps")
 
-    def __init__(self, adata: Any, min_cells: int = 1, min_cells_frac: float | None = None) -> None:
+    def __init__(
+        self,
+        kernel_method: str = "matern",
+        backend: str = "matrix",
+        **kernel_params: Any,
+    ) -> None:
+        if backend not in ("matrix", "nufft"):
+            raise ValueError(f"backend must be 'matrix' or 'nufft', got {backend!r}.")
+        self.backend_: str = backend
+        """Which backend will build the kernel — ``'matrix'`` or ``'nufft'``."""
+        super().__init__(kernel_method, **kernel_params)
+
+        # Data-state attrs (populated by setup_data):
+        self.adata: Any | None = None
+        """Reference to the input :class:`anndata.AnnData`, set by :meth:`setup_data`."""
+        self.min_cells: int | None = None
+        """Minimum non-zero-count threshold applied in :meth:`setup_data`."""
+
+    def _merge_kernel_defaults(self, method: str, user_params: dict) -> dict:
+        """Merge per-method defaults with user overrides.
+
+        Matrix backend uses ``k_neighbors``; NUFFT backend uses
+        ``neighbor_degree`` (matching :class:`FFTKernel`) and exposes extra
+        grid-spacing controls.
         """
-        Initialize the PatternDetector with an AnnData object.
+        if self.backend_ == "matrix":
+            method_defaults = {
+                "gaussian": {"bandwidth": 2.0},
+                "matern": {"bandwidth": 2.0, "nu": 1.5},
+                "moran": {"k_neighbors": 4},
+                "graph_laplacian": {"k_neighbors": 4},
+                "car": {"rho": 0.9, "k_neighbors": 4, "standardize": False},
+            }
+        else:  # nufft
+            method_defaults = {
+                "gaussian": {"bandwidth": 2.0},
+                "matern": {"bandwidth": 2.0, "nu": 1.5},
+                "moran": {"neighbor_degree": 1},
+                "graph_laplacian": {"neighbor_degree": 1},
+                "car": {"rho": 0.9, "neighbor_degree": 1},
+            }
+        defaults = method_defaults.get(method, {}).copy()
+        # NUFFT accepts grid controls in addition to the kernel-method params.
+        # None sentinels → auto-infer inside NUFFTKernel.
+        if self.backend_ == "nufft":
+            defaults.update(
+                {
+                    "grid_shape": None,
+                    "spacing": None,
+                    "unit_scale": 1.0,
+                    "oversample": 2.0,
+                    "eps": 1e-6,
+                }
+            )
+        for k, v in user_params.items():
+            if k not in defaults:
+                raise ValueError(
+                    f"Unknown parameter {k!r} for method {method!r} under "
+                    f"backend={self.backend_!r}. Allowed: {sorted(defaults)}."
+                )
+            defaults[k] = v
+        return defaults
+
+    def setup_data(
+        self,
+        adata: Any,
+        *,
+        coordinates_key: str = "spatial",
+        obsp_key: str | None = None,
+        is_distance: bool = False,
+        min_cells: int = 1,
+        min_cells_frac: float | None = None,
+    ) -> DetectorIrregular:
+        """
+        Attach ``adata``, apply feature filters, build the kernel.
 
         Parameters
         ----------
-        adata : scanpy.AnnData
-            Annotated data matrix.
+        adata : :class:`anndata.AnnData`
+            Input container. Must have ``adata.obsm[coordinates_key]`` (unless
+            ``obsp_key`` is provided instead).
+        coordinates_key : str, default ``'spatial'``
+            Key in ``adata.obsm`` holding ``(n_obs, 2)`` spatial coordinates.
+            Used when ``obsp_key`` is ``None``.
+        obsp_key : str, optional
+            If provided, build the kernel from ``adata.obsp[obsp_key]``
+            instead of from coordinates. Not compatible with ``backend='nufft'``.
+        is_distance : bool, default ``False``
+            When ``obsp_key`` is given: treat the matrix as pairwise distances
+            (``True``) or adjacency / connectivity (``False``).
         min_cells : int, default 1
-            Minimum number of cells with non-zero expression for feature inclusion.
-            Clamped to ``[1, n_cells]``: values larger than the number of samples in
-            ``adata`` are silently capped at ``n_cells``.
+            Minimum number of cells with non-zero value for a feature to be
+            tested. Clamped to ``[1, n_obs]``.
         min_cells_frac : float, optional
             If provided, overrides ``min_cells`` with
-            ``max(1, int(min_cells_frac * n_cells))``.
+            ``max(1, int(min_cells_frac * n_obs))``.
+
+        Returns
+        -------
+        self : DetectorIrregular
         """
         self.adata = adata
-        """Reference to the input :class:`anndata.AnnData` object."""
-        self.n: int = adata.shape[0]
-        """Number of samples (cells/observations)."""
+        self.n = adata.shape[0]
         if min_cells_frac is not None:
-            self.min_cells: int = max(1, int(min_cells_frac * self.n))
+            self.min_cells = max(1, int(min_cells_frac * self.n))
         else:
             self.min_cells = min(min_cells, self.n)
-        """Minimum number of non-zero observations a feature must have to be tested."""
-        self.kernel_: Any | None = None
-        """Active kernel object (``SpatialKernel`` for ``backend='matrix'`` or
-        ``NUFFTKernel`` for ``backend='nufft'``), set by ``build_kernel*`` methods."""
-        self.kernel_method_: str | None = None
-        """Name of the kernel method used to build :attr:`kernel_`, or ``None`` until built."""
-        self.kernel_params_: dict | None = None
-        """Parameters used to build :attr:`kernel_`, or ``None`` until built."""
-        self.backend_: str | None = None
-        """Which backend built the kernel — ``'matrix'`` (SpatialKernel, dense or
-        sparse-implicit) or ``'nufft'`` (NUFFTKernel on irregular points). ``None``
-        until :meth:`build_kernel` / :meth:`build_kernel_from_coordinates` /
-        :meth:`build_kernel_from_obsp` has been called."""
 
-    def _get_default_params(self, method: str) -> dict[str, Any]:
-        """
-        Returns default parameters for specific kernel methods.
-
-        Parameters
-        ----------
-        method : str
-            Kernel method name. Should be one of _available_kernels.
-
-        Returns
-        -------
-        dict[str, Any]
-            Method defaults: bandwidth (gaussian/matern), nu (matern), k_neighbors (moran/graph_laplacian/car), rho (car).
-        """
-        method_defaults = {
-            "gaussian": {"bandwidth": 2.0},
-            "matern": {"bandwidth": 2.0, "nu": 1.5},
-            "moran": {"k_neighbors": 4},
-            "graph_laplacian": {"k_neighbors": 4},
-            "car": {"rho": 0.9, "k_neighbors": 4, "standardize": False},
-        }
-        return method_defaults.get(method, {})
-
-    def build_kernel(
-        self,
-        backend: str = "matrix",
-        method: str = "matern",
-        coordinates_key: str = "spatial",
-        **kernel_params: Any,
-    ) -> PatternDetector:
-        """
-        Build a kernel over ``adata.obsm[coordinates_key]``.
-
-        This is the unified builder — a single entry point that picks the
-        right kernel representation for the data. Irregular spots on a
-        regular grid work with either backend; irregular spots on an
-        arbitrary layout essentially require ``backend='nufft'`` at
-        large ``N``.
-
-        Parameters
-        ----------
-        backend : {'matrix', 'nufft'}, default 'matrix'
-            - ``'matrix'`` — builds a :class:`~quadsv.kernels.SpatialKernel`.
-              The kernel class decides internally whether to materialize
-              the dense ``(N, N)`` kernel or keep the sparse precision
-              matrix and solve linear systems on demand (switch at
-              ``N > 5000``). The caller does not choose representation;
-              the switch is memory-driven.
-            - ``'nufft'`` — builds a :class:`~quadsv.nufft.NUFFTKernel`
-              that evaluates ``x^T K x`` and ``K x`` via type-1/type-2
-              non-uniform FFTs in ``O(N log N + K log K)``. Needs
-              ``finufft`` installed. Ideal for ≥ 10⁴ irregular spots.
-        method : str, default 'matern'
-            Kernel method. One of ``'gaussian'``, ``'matern'``, ``'moran'``,
-            ``'graph_laplacian'``, ``'car'``.
-        coordinates_key : str, default 'spatial'
-            Key in ``adata.obsm`` containing the ``(n_obs, 2)`` spatial
-            coordinates.
-        **kernel_params
-            Kernel parameters forwarded to the underlying kernel class.
-            Matrix backend: ``bandwidth``, ``nu``, ``rho``, ``k_neighbors``.
-            NUFFT backend: ``bandwidth``, ``nu``, ``rho``, plus
-            ``grid_shape``, ``spacing``, ``unit_scale``, ``oversample``,
-            ``eps`` (see :class:`NUFFTKernel`). For NUFFT, ``grid_shape``
-            and ``spacing`` are auto-inferred from the coordinates alone
-            when not supplied.
-
-        Returns
-        -------
-        PatternDetector
-            ``self`` for chaining.
-
-        Raises
-        ------
-        ValueError
-            If ``backend`` or ``method`` is not recognized, or if
-            ``adata.obsm[coordinates_key]`` has the wrong shape.
-        KeyError
-            If ``coordinates_key`` is missing from ``adata.obsm``.
-
-        Examples
-        --------
-        Matrix backend (any irregular layout, dense-vs-sparse picked internally):
-
-        >>> import anndata as ad
-        >>> import numpy as np
-        >>> from quadsv import PatternDetector
-        >>> rng = np.random.default_rng(0)
-        >>> adata = ad.AnnData(X=rng.standard_normal((200, 5)))
-        >>> adata.obsm["spatial"] = rng.standard_normal((200, 2))
-        >>> det = PatternDetector(adata).build_kernel(
-        ...     backend="matrix", method="car", rho=0.9, k_neighbors=8
-        ... )
-        >>> det.backend_
-        'matrix'
-
-        NUFFT backend (large irregular layouts; grid auto-inferred from coords):
-
-        >>> det = PatternDetector(adata).build_kernel(
-        ...     backend="nufft", method="matern", bandwidth=1.0, nu=1.5
-        ... )
-        >>> det.backend_
-        'nufft'
-        """
-        if backend not in ("matrix", "nufft"):
-            raise ValueError(f"backend must be 'matrix' or 'nufft', got '{backend}'.")
-        if method not in self._available_kernels:
-            raise ValueError(
-                f"Method '{method}' not recognized. Must be one of {self._available_kernels}."
+        if obsp_key is not None:
+            if self.backend_ == "nufft":
+                raise ValueError("obsp_key is not supported with backend='nufft'.")
+            self._build_kernel_from_obsp(
+                obsp_key,
+                is_distance=is_distance,
+                method=self.kernel_method_,
+                **self.kernel_params_,
             )
+        else:
+            self._build_kernel_from_obsm(coordinates_key=coordinates_key)
+
+        self._data_ready = True
+        return self
+
+    def _build_kernel_from_obsm(self, coordinates_key: str = "spatial") -> None:
+        """Build the kernel over ``adata.obsm[coordinates_key]`` using the
+        backend / method / params selected at construction. Called from
+        :meth:`setup_data`.
+        """
         if coordinates_key not in self.adata.obsm:
             raise KeyError(
                 f"adata.obsm has no key '{coordinates_key}'; "
@@ -486,17 +475,20 @@ class PatternDetector:
                 f"coords shape {coords.shape} inconsistent with adata.shape=({self.n}, ...)."
             )
 
-        if backend == "matrix":
-            self.build_kernel_from_coordinates(coords, method=method, **kernel_params)
+        if self.backend_ == "matrix":
+            self._build_matrix_kernel_from_coords(
+                coords, method=self.kernel_method_, **self.kernel_params_
+            )
         else:
-            logger.info("Building %s NUFFTKernel over %d spots...", method, self.n)
-            self.kernel_ = NUFFTKernel(coords=coords, method=method, **kernel_params)
-            self.kernel_method_ = method
+            logger.info("Building %s NUFFTKernel over %d spots...", self.kernel_method_, self.n)
+            self.kernel_ = NUFFTKernel(
+                coords=coords, method=self.kernel_method_, **self.kernel_params_
+            )
+            # NUFFTKernel resolves its own params (including any None-sentinel
+            # auto-infers); snapshot them back so kernel_params_ reflects reality.
             self.kernel_params_ = dict(self.kernel_.params)
-            self.backend_ = "nufft"
-        return self
 
-    def build_kernel_from_coordinates(
+    def _build_matrix_kernel_from_coords(
         self, coords: np.ndarray, method: str = "car", **kernel_params: Any
     ) -> None:
         """
@@ -533,95 +525,34 @@ class PatternDetector:
         Examples
         --------
         >>> coords = np.random.randn(1000, 2)
-        >>> detector.build_kernel_from_coordinates(coords, method='gaussian', bandwidth=1.5)
+        >>> detector.setup_data(adata)  # builds kernel from adata.obsm["spatial"]
         """
         coords = np.asarray(coords)
-        if method not in self._available_kernels:
-            raise ValueError(
-                f"Method '{method}' not recognized. Must be one of {self._available_kernels}."
-            )
-
         if coords.shape[0] != self.n:
             raise ValueError(
                 f"Coordinate shape {coords.shape} does not match adata shape ({self.n},)."
             )
 
         logger.info("Building %s kernel from coordinates (n_samples=%d)...", method, self.n)
+        # kernel_params already carries defaults merged in __init__.
+        self.kernel_ = MatrixKernel.from_coordinates(coords, method=method, **kernel_params)
 
-        if not kernel_params:
-            # Use default parameters if none provided
-            kernel_params_ = self._get_default_params(method).copy()
-        else:
-            # Update provided params with defaults for missing keys
-            kernel_params_ = self._get_default_params(method).copy()
-            for key, value in kernel_params.items():
-                if key in kernel_params_:
-                    kernel_params_[key] = value
-                else:
-                    raise ValueError(f"Unknown parameter '{key}' for method '{method}'")
-
-        self.kernel_ = SpatialKernel.from_coordinates(coords, method=method, **kernel_params_)
-        self.kernel_method_ = method
-        self.kernel_params_ = kernel_params_
-        self.backend_ = "matrix"
-
-    def build_kernel_from_obsp(  # noqa: C901
+    def _build_kernel_from_obsp(  # noqa: C901
         self, key: str, is_distance: bool = False, method: str = "car", **kernel_params: Any
     ) -> None:
-        """
-        Builds a graph kernel from a precomputed matrix in adata.obsp.
+        """Build a graph kernel from ``adata.obsp[key]``. Called from
+        :meth:`setup_data` when ``obsp_key`` is provided.
 
-        Performs necessary transformations (e.g., distance to Gaussian weights,
-        adjacency to graph Laplacian) before initializing the kernel object.
-        Isolated nodes (zero degree) are automatically removed.
-
-        Parameters
-        ----------
-        key : str
-            Key in adata.obsp containing the precomputed matrix.
-        is_distance : bool, default False
-            If True, matrix is treated as distances. Otherwise treated as adjacency/connectivity.
-        method : str, default 'car'
-            Kernel construction method. Must be one of: 'gaussian', 'matern', 'moran',
-            'graph_laplacian', 'car', or 'precomputed'.
-            - 'precomputed': Uses obsp[key] directly as kernel matrix K (no transformation).
-            - Other methods: Apply distance/adjacency transformations.
-        kernel_params : dict, optional
-            Additional kernel-specific parameters (e.g., bandwidth, rho, nu).
-
-        Raises
-        ------
-        KeyError
-            If key not found in adata.obsp.
-        ValueError
-            If method not recognized or invalid for matrix type (e.g., Gaussian on adjacency).
-
-        Notes
-        -----
-        For distance matrices (is_distance=True):
-
-        - gaussian: :math:`K = \\exp(-d^2 / (2 \\sigma^2))` where :math:`\\sigma` is bandwidth.
-        - matern: Matérn kernel with nu and bandwidth parameters.
-
-        For adjacency matrices (is_distance=False):
-
-        - Symmetric normalization: :math:`W_{norm} = D^{-1/2} W D^{-1/2}`.
-        - moran: Uses :math:`W_{norm}` directly as kernel.
-        - graph_laplacian: :math:`K = I - W_{norm}`.
-        - car: :math:`K = (I - \\rho W_{norm})^{-1}` (implicit kernel).
-
-        Isolated nodes (degree=0) are automatically removed from the data.
-
-        Examples
-        --------
-        >>> detector.build_kernel_from_obsp('distances', is_distance=True, method='gaussian', bandwidth=5.0)
+        Handles 'precomputed' (matrix IS the kernel), distance matrices
+        (Gaussian / Matern transform), and adjacency matrices (Moran /
+        graph_laplacian / CAR). Isolated nodes (zero degree) are removed.
         """
         if key not in self.adata.obsp:
             raise KeyError(f"Matrix key '{key}' not found in adata.obsp")
 
         matrix = self.adata.obsp[key]
 
-        if method not in self._available_kernels + ["precomputed"]:
+        if method not in list(self._available_kernels) + ["precomputed"]:
             raise ValueError(
                 f"Method '{method}' not recognized. Must be one of {self._available_kernels} or 'precomputed'."
             )
@@ -629,10 +560,9 @@ class PatternDetector:
         # If the user says 'precomputed', they imply the matrix IS the kernel K
         if method == "precomputed":
             logger.info("Using obsp['%s'] directly as kernel matrix (n_samples=%d)...", key, self.n)
-            self.kernel_ = SpatialKernel.from_matrix(matrix, is_inverse=False)
+            self.kernel_ = MatrixKernel.from_matrix(matrix, is_inverse=False)
             self.kernel_params_ = kernel_params
             self.kernel_method_ = method
-            self.backend_ = "matrix"
             return
 
         logger.info(
@@ -643,19 +573,8 @@ class PatternDetector:
             self.n,
         )
 
-        # Set kernel configuration parameters
-        self.kernel_method_ = method
-        if not kernel_params:
-            # Use default parameters if none provided
-            kernel_params_ = self._get_default_params(method).copy()
-        else:
-            # Update provided params with defaults for missing keys
-            kernel_params_ = self._get_default_params(method).copy()
-            for key, value in kernel_params.items():
-                if key in kernel_params_:
-                    kernel_params_[key] = value
-                else:
-                    raise ValueError(f"Unknown parameter '{key}' for method '{method}'")
+        # kernel_params already carries defaults merged in __init__; no re-merge needed.
+        kernel_params_ = dict(kernel_params)
 
         # --- Distance Based Transformations ---
         if is_distance:
@@ -665,7 +584,7 @@ class PatternDetector:
                 if sp.issparse(matrix):
                     matrix = matrix.toarray()  # Gaussian usually requires dense
                 K = np.exp(-(matrix**2) / (2 * bw**2))
-                self.kernel_ = SpatialKernel.from_matrix(K, is_inverse=False)
+                self.kernel_ = MatrixKernel.from_matrix(K, is_inverse=False)
                 self.kernel_params_ = {"bandwidth": bw}
             elif method == "matern":
                 from scipy.special import gamma, kv
@@ -680,7 +599,7 @@ class PatternDetector:
                 factor = (np.sqrt(2 * nu) * dists) / bw
                 K = (2 ** (1 - nu) / gamma(nu)) * (factor**nu) * kv(nu, factor)
                 np.fill_diagonal(K, 1.0)
-                self.kernel_ = SpatialKernel.from_matrix(K, is_inverse=False)
+                self.kernel_ = MatrixKernel.from_matrix(K, is_inverse=False)
                 self.kernel_params_ = {"bandwidth": bw, "nu": nu}
             else:
                 raise ValueError(f"Method {method} not supported for distance matrices.")
@@ -717,28 +636,28 @@ class PatternDetector:
             if method == "moran":
                 # Already symmetric and normalized
                 K = W_norm
-                self.kernel_ = SpatialKernel.from_matrix(K, is_inverse=False)
+                self.kernel_ = MatrixKernel.from_matrix(K, is_inverse=False)
                 self.kernel_params_ = {}
 
             elif method == "graph_laplacian":
                 # K = I - W_norm
                 I = sp.eye(self.n, format="csr")
                 K = I - W_norm
-                self.kernel_ = SpatialKernel.from_matrix(K, is_inverse=False)
+                self.kernel_ = MatrixKernel.from_matrix(K, is_inverse=False)
                 self.kernel_params_ = {}
 
             elif method == "car":
                 # This is the "Implicit" case.
                 # The kernel K = (I - rho*W)^-1.
-                # We construct M = (I - rho*W) and tell SpatialKernel it is the INVERSE.
+                # We construct M = (I - rho*W) and tell MatrixKernel it is the INVERSE.
                 rho = kernel_params_["rho"]
                 standardize = kernel_params_["standardize"]
                 I = sp.eye(self.n, format="csc")
                 M = I - rho * W_norm  # M is the inverse of K
 
-                # We pass M and set is_inverse=True. SpatialKernel will handle
+                # We pass M and set is_inverse=True. MatrixKernel will handle
                 # standardizing the precision to ensure diag(K)=1 if requested.
-                self.kernel_ = SpatialKernel.from_matrix(
+                self.kernel_ = MatrixKernel.from_matrix(
                     M,
                     is_inverse=True,
                     method="car",
@@ -930,7 +849,7 @@ class PatternDetector:
 
         Examples
         --------
-        >>> detector.build_kernel_from_coordinates(adata.obsm['spatial'])
+        >>> detector.setup_data(adata)
         >>> results = detector.compute_qstat(source='var', features=['Gene1', 'Gene2'], n_jobs=-1)
         >>> top_genes = results.iloc[:10]
         """
@@ -939,7 +858,7 @@ class PatternDetector:
         if self.kernel_ is None:
             raise ValueError(
                 "Kernel not initialized. Call .build_kernel(), "
-                ".build_kernel_from_coordinates(), or .build_kernel_from_obsp() first."
+                "Call .setup_data(adata, ...) first."
             )
 
         # NUFFT backend takes a different code path (no dense K, different
@@ -1077,7 +996,7 @@ class PatternDetector:
 
         Examples
         --------
-        >>> detector.build_kernel_from_coordinates(adata.obsm['spatial'])
+        >>> detector.setup_data(adata)
         >>> # All pairwise correlations within gene set
         >>> results = detector.compute_rstat(features_x=['Gene1', 'Gene2', 'Gene3'], n_jobs=-1)
         >>> # Cross-correlation between two gene sets
@@ -1255,7 +1174,7 @@ class PatternDetector:
         chunk_size: int,
     ) -> pd.DataFrame:
         """NUFFT dispatch for :meth:`compute_qstat`. Builds null params once and
-        delegates per-feature work to :func:`spatial_q_test_nufft`."""
+        delegates per-feature work to :func:`quadsv.spatial_q_test`."""
         kernel = self.kernel_
         scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
         null_params: dict[str, float | np.ndarray] | None = None
@@ -1267,7 +1186,7 @@ class PatternDetector:
                     "var_Q": 2.0 * kernel.square_trace() * (scale**2),
                 }
             else:
-                full = kernel.eigenvalues(return_full=True)
+                full = kernel.eigenvalues(return_full_layout=True)
                 if full.min() < -0.1:
                     raise ValueError(
                         "Kernel has significant negative eigenvalues; "
@@ -1294,14 +1213,14 @@ class PatternDetector:
                 stds[batch_idx] > 0, stds[batch_idx], 1.0
             )[None, :]
             if return_pval:
-                Q_arr, P_arr = spatial_q_test_nufft(
+                Q_arr, P_arr = spatial_q_test(
                     block_std, kernel, null_params=null_params, is_standardized=True
                 )
                 Q_arr = np.atleast_1d(Q_arr)
                 P_arr = np.atleast_1d(P_arr)
             else:
                 Q_arr = np.atleast_1d(
-                    spatial_q_test_nufft(block_std, kernel, return_pval=False, is_standardized=True)
+                    spatial_q_test(block_std, kernel, return_pval=False, is_standardized=True)
                 )
                 P_arr = np.full_like(Q_arr, np.nan)
             # Reference trace and trace²-based Z for reporting.
@@ -1390,7 +1309,7 @@ class PatternDetector:
                 None, :
             ]
             # Use the R-test on the chunk so null-param handling lives in one place.
-            R_chunk = spatial_r_test_nufft(
+            R_chunk = spatial_r_test(
                 X_std,
                 Y_std,
                 kernel,

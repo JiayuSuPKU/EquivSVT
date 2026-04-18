@@ -14,7 +14,7 @@ def _apply_bh_correction(df: pd.DataFrame) -> None:
 
     Writes the adjusted p-values into a new column ``P_adj``. Entries with non-finite
     p-values (NaN / inf) are left as NaN in the output. Shared helper used by both
-    :class:`quadsv.detector.PatternDetector` and :class:`quadsv.detector_fft.PatternDetectorFFT`.
+    :class:`quadsv.detector.DetectorIrregular` and :class:`quadsv.detector_grid.DetectorGrid`.
 
     Parameters
     ----------

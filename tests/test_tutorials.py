@@ -19,7 +19,7 @@ except ImportError:
 
 HAS_SPATIALDATA = importlib.util.find_spec("spatialdata") is not None
 
-from quadsv.kernels import SpatialKernel
+from quadsv.kernels import MatrixKernel
 from quadsv.statistics import compute_null_params, spatial_q_test, spatial_r_test
 
 
@@ -47,7 +47,7 @@ class TestTutorialBasicQTest(unittest.TestCase):
         3. Verify output format
         """
         # Build CAR kernel (recommended)
-        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         # Compute Q-test
         Q, pval = spatial_q_test(self.gene_expr, kernel)
@@ -63,7 +63,7 @@ class TestTutorialBasicQTest(unittest.TestCase):
 
     def test_q_test_different_null_approximations(self):
         """Test: Q-test with different null approximation methods."""
-        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         # Test with different null approximations
         methods = ["welch", "liu"]
@@ -81,7 +81,7 @@ class TestTutorialBasicQTest(unittest.TestCase):
 
     def test_q_test_multiple_genes(self):
         """Test: Q-test on multiple genes (matrix input)."""
-        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         # Stack multiple genes
         n_genes = 5
@@ -115,7 +115,7 @@ class TestTutorialRTest(unittest.TestCase):
 
         Use case: Detect spatial co-expression between two genes.
         """
-        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         # Compute R-test
         R, pval = spatial_r_test(self.gene1, self.gene2, kernel)
@@ -128,7 +128,7 @@ class TestTutorialRTest(unittest.TestCase):
 
     def test_r_test_symmetry(self):
         """Test: R-test symmetry (order of genes shouldn't matter much)."""
-        kernel = SpatialKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         R1, pval1 = spatial_r_test(self.gene1, self.gene2, kernel)
         R2, pval2 = spatial_r_test(self.gene2, self.gene1, kernel)
@@ -171,19 +171,15 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
         2. Build kernel from obsm['spatial']
         3. Verify kernel properties
         """
-        from quadsv.detector import PatternDetector
+        from quadsv.detector import DetectorIrregular
 
-        # Initialize detector
-        detector = PatternDetector(self.adata, min_cells_frac=0.05)
+        # Initialize detector with kernel config, then attach data
+        detector = DetectorIrregular(kernel_method="car", k_neighbors=10, rho=0.9)
+        detector.setup_data(self.adata, min_cells_frac=0.05)
 
         # Verify detector initialized
         self.assertIsNotNone(detector.adata)
         self.assertEqual(detector.adata.n_obs, 500)
-
-        # Build kernel from coordinates
-        detector.build_kernel_from_coordinates(
-            self.adata.obsm["spatial"], method="car", k_neighbors=10, rho=0.9
-        )
 
         # Verify kernel was built
         self.assertIsNotNone(detector.kernel_)
@@ -191,12 +187,10 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
 
     def test_anndata_qstat_computation(self):
         """Test: Compute Q-statistics for subset of genes."""
-        from quadsv.detector import PatternDetector
+        from quadsv.detector import DetectorIrregular
 
-        detector = PatternDetector(self.adata, min_cells_frac=0.05)
-        detector.build_kernel_from_coordinates(
-            self.adata.obsm["spatial"], method="car", k_neighbors=10, rho=0.9
-        )
+        detector = DetectorIrregular(kernel_method="car", k_neighbors=10, rho=0.9)
+        detector.setup_data(self.adata, min_cells_frac=0.05)
 
         # Compute Q-statistics for subset of genes
         features = ["Gene_0", "Gene_1", "Gene_2"]
@@ -215,12 +209,10 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
 
     def test_anndata_rstat_computation(self):
         """Test: Compute pairwise R-statistics."""
-        from quadsv.detector import PatternDetector
+        from quadsv.detector import DetectorIrregular
 
-        detector = PatternDetector(self.adata, min_cells_frac=0.05)
-        detector.build_kernel_from_coordinates(
-            self.adata.obsm["spatial"], method="car", k_neighbors=10, rho=0.9
-        )
+        detector = DetectorIrregular(kernel_method="car", k_neighbors=10, rho=0.9)
+        detector.setup_data(self.adata, min_cells_frac=0.05)
 
         # Test on small subset for speed
         features_x = ["Gene_0", "Gene_1", "Gene_2"]
@@ -279,7 +271,7 @@ class TestTutorialFFTKernel(unittest.TestCase):
         xx, yy = np.meshgrid(x, y)
         grid_coords = np.column_stack((xx.ravel(), yy.ravel()))
 
-        kernel_spatial = SpatialKernel.from_coordinates(
+        kernel_spatial = MatrixKernel.from_coordinates(
             grid_coords,
             method="car",
             k_neighbors=4,

@@ -29,8 +29,8 @@ Pipeline
 This module only contains **array-level primitives**. The two high-level
 wrapper classes that drive the pipeline on :class:`anndata.AnnData` /
 :class:`spatialdata.SpatialData` containers live in
-:mod:`quadsv.comparators` (:class:`~quadsv.PatternComparatorNUFFT` /
-:class:`~quadsv.PatternComparatorFFT`).
+:mod:`quadsv.comparators` (:class:`~quadsv.ComparatorIrregular` /
+:class:`~quadsv.ComparatorGrid`).
 
 Notes
 -----

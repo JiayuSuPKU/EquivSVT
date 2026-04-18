@@ -16,8 +16,8 @@ instead. :func:`power_spectrum_2d_nufft` evaluates
 at the same uniform ``(ny, nx)`` k-space grid that :func:`power_spectrum_2d`
 would produce for a rasterized input of the same physical extent, then returns
 :math:`|\\hat c|^2` with the standard scipy FFT layout (DC at ``[0, 0]``).
-Anything downstream — :func:`quadsv.spectral_compare.radial_bin_spectrum`,
-:class:`quadsv.PatternComparatorNUFFT` — works
+Anything downstream — :func:`quadsv.multisample.radial_bin_spectrum`,
+:class:`quadsv.ComparatorIrregular` — works
 identically.
 
 Per-sample unit handling
@@ -40,13 +40,12 @@ import numpy as np
 from scipy.stats import chi2, norm
 
 from quadsv.fft import FFTKernel
+from quadsv.kernels import Kernel
 from quadsv.statistics import liu_sf
 
 __all__ = [
     "power_spectrum_2d_nufft",
     "NUFFTKernel",
-    "spatial_q_test_nufft",
-    "spatial_r_test_nufft",
 ]
 
 logger = logging.getLogger(__name__)
@@ -230,7 +229,7 @@ class NUFFTKernel:
     Parallels :class:`quadsv.FFTKernel`, which requires a regular grid.
     ``NUFFTKernel`` lets ``xtKx``-style quadratic forms (the Q-test primitive)
     and matrix-vector products ``Kz`` run in ``O(N log N + K log K)`` on
-    arbitrary point sets — a 1,000× speed-up over the dense ``SpatialKernel``
+    arbitrary point sets — a 1,000× speed-up over the dense ``MatrixKernel``
     at N ≳ 10⁴.
 
     The kernel is diagonalized on a common uniform k-grid shared with an
@@ -391,14 +390,14 @@ class NUFFTKernel:
         )
 
     # ------------------------------------------------------------------
-    def eigenvalues(self, k: int | None = None, return_full: bool = False) -> np.ndarray:
+    def eigenvalues(self, k: int | None = None, return_full_layout: bool = False) -> np.ndarray:
         """Return the ``k`` largest eigenvalues of the underlying spectrum.
 
         Forwards to the internal :class:`FFTKernel`'s ``eigenvalues``. With
-        ``return_full=True``, returns the complete unsorted spectrum in the
+        ``return_full_layout=True``, returns the complete unsorted spectrum in the
         FFT mode layout (useful for Liu's null approximation).
         """
-        return self._fft_kernel.eigenvalues(k=k, return_full=return_full)
+        return self._fft_kernel.eigenvalues(k=k, return_full_layout=return_full_layout)
 
     # ------------------------------------------------------------------
     def xtKx(self, x: np.ndarray) -> float | np.ndarray:
@@ -517,7 +516,7 @@ class NUFFTKernel:
 def _standardize_features(X: np.ndarray) -> np.ndarray:
     """Z-score each column (ddof=1), leaving constant columns as zeros.
 
-    Matches the convention of :func:`quadsv.spatial_q_test_fft`.
+    Matches the convention of :func:`quadsv.spatial_q_test`.
     """
     mu = X.mean(axis=0, keepdims=True)
     sd = X.std(axis=0, keepdims=True, ddof=1)
@@ -527,7 +526,7 @@ def _standardize_features(X: np.ndarray) -> np.ndarray:
     return out
 
 
-def spatial_q_test_nufft(  # noqa: C901
+def _q_test_nufft(  # noqa: C901
     Xn: np.ndarray,
     kernel: NUFFTKernel,
     null_params: dict | None = None,
@@ -536,7 +535,7 @@ def spatial_q_test_nufft(  # noqa: C901
 ) -> float | np.ndarray | tuple[float, float] | tuple[np.ndarray, np.ndarray]:
     """
     Spatial Q-test on irregular 2D coordinates — NUFFT analogue of
-    :func:`quadsv.spatial_q_test_fft`.
+    :func:`quadsv.spatial_q_test`.
 
     Uses the kernel's full eigenvalue spectrum (from the internal
     :class:`FFTKernel`) and Liu's chi-squared-mixture approximation to the
@@ -581,12 +580,12 @@ def spatial_q_test_nufft(  # noqa: C901
     Examples
     --------
     >>> import numpy as np
-    >>> from quadsv import NUFFTKernel, spatial_q_test_nufft
+    >>> from quadsv import NUFFTKernel, spatial_q_test
     >>> rng = np.random.default_rng(0)
     >>> coords = rng.uniform(0, 20, size=(400, 2))
     >>> kernel = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
     >>> z = rng.standard_normal(400)
-    >>> Q, pval = spatial_q_test_nufft(z, kernel)
+    >>> Q, pval = spatial_q_test(z, kernel)
     >>> 0.0 <= pval <= 1.0
     True
     """
@@ -631,7 +630,7 @@ def spatial_q_test_nufft(  # noqa: C901
         if null_params is not None and "eigenvalues" in null_params:
             sig_evals = np.asarray(null_params["eigenvalues"], dtype=float)
         else:
-            evals = kernel.eigenvalues(return_full=True)
+            evals = kernel.eigenvalues(return_full_layout=True)
             if evals.min() < -0.1:
                 raise ValueError(
                     "Kernel has significant negative eigenvalues; Liu's method may be invalid."
@@ -644,7 +643,7 @@ def spatial_q_test_nufft(  # noqa: C901
     return float(Q_arr[0]), float(pvals[0])
 
 
-def spatial_r_test_nufft(
+def _r_test_nufft(
     Xn: np.ndarray,
     Yn: np.ndarray,
     kernel: NUFFTKernel,
@@ -654,7 +653,7 @@ def spatial_r_test_nufft(
 ) -> float | np.ndarray | tuple[float, float] | tuple[np.ndarray, np.ndarray]:
     """
     Spatial R-test on irregular 2D coordinates — NUFFT analogue of
-    :func:`quadsv.spatial_r_test_fft`.
+    :func:`quadsv.spatial_r_test`.
 
     Computes ``R = x^T K y`` and returns a two-sided normal-approximation
     p-value with null variance ``var_R = trace(K²)``.
@@ -693,13 +692,13 @@ def spatial_r_test_nufft(
     Examples
     --------
     >>> import numpy as np
-    >>> from quadsv import NUFFTKernel, spatial_r_test_nufft
+    >>> from quadsv import NUFFTKernel, spatial_r_test
     >>> rng = np.random.default_rng(0)
     >>> coords = rng.uniform(0, 20, size=(400, 2))
     >>> kernel = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
     >>> x = rng.standard_normal(400)
     >>> y = rng.standard_normal(400)
-    >>> R, pval = spatial_r_test_nufft(x, y, kernel)
+    >>> R, pval = spatial_r_test(x, y, kernel)
     >>> 0.0 <= pval <= 1.0
     True
     """
@@ -725,7 +724,7 @@ def spatial_r_test_nufft(
         return R.squeeze() if R.size > 1 else float(R)
 
     # Rescale trace(K²) to the N-point effective operator, matching the
-    # eigenvalue rescaling used by spatial_q_test_nufft.
+    # eigenvalue rescaling used by _q_test_nufft.
     if null_params is not None and "var_R" in null_params:
         var_R = float(null_params["var_R"])
     else:
@@ -735,3 +734,8 @@ def spatial_r_test_nufft(
     z_scores = R / sigma
     pvals = 2.0 * norm.sf(np.abs(z_scores))
     return R.squeeze(), pvals.squeeze()
+
+
+# Register NUFFTKernel as a virtual subclass of the Kernel ABC so that
+# isinstance(kernel, Kernel) dispatch in quadsv.statistics picks it up.
+Kernel.register(NUFFTKernel)

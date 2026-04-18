@@ -17,10 +17,12 @@ from joblib import Parallel, delayed
 from scipy.stats import norm
 from tqdm import tqdm
 
-from quadsv.fft import FFTKernel, spatial_q_test_fft
+from quadsv._detector_base import Detector
+from quadsv.fft import FFTKernel
+from quadsv.statistics import spatial_q_test
 from quadsv.utils import _apply_bh_correction
 
-__all__ = ["PatternDetectorFFT"]
+__all__ = ["DetectorGrid"]
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +58,9 @@ def _qstat_worker_fft(
 
     # Compute statistics
     if return_pval:
-        stats, pvals = spatial_q_test_fft(data_chunk_transposed, kernel, return_pval=True)
+        stats, pvals = spatial_q_test(data_chunk_transposed, kernel, return_pval=True)
     else:
-        stats = spatial_q_test_fft(data_chunk_transposed, kernel, return_pval=False)
+        stats = spatial_q_test(data_chunk_transposed, kernel, return_pval=False)
         pvals = None
 
     # Ensure array semantics for iteration (handle 0-d arrays)
@@ -87,128 +89,67 @@ def _qstat_worker_fft(
     return results
 
 
-class PatternDetectorFFT:
+class DetectorGrid(Detector):
     """
-    High-level API for detecting spatial patterns in grid data using FFT-accelerated tests.
+    Detect spatial patterns on **regular grids** (SpatialData bins) with
+    FFT-accelerated kernel tests.
 
-    This class integrates with spatialdata objects to perform univariate (Q-test) and
-    bivariate (R-test) spatial statistics across large feature sets efficiently using
-    FFT-based kernel methods and parallel processing.
+    Univariate (Q-test) and bivariate (R-test) kernel-based spatial statistics
+    on rasterized :class:`spatialdata.SpatialData` bins.
+
+    Workflow
+    --------
+    1. **Construct** with kernel method + kernel hyperparameters / grid controls.
+    2. **Setup** with :meth:`setup_data` passing the :class:`spatialdata.SpatialData`
+       plus the bin / table / col / row keys. Setup rasterizes the table and
+       builds the :class:`~quadsv.FFTKernel` at the resulting grid shape.
+    3. **Compute** with :meth:`compute_qstat` / :meth:`compute_rstat`.
 
     Parameters
     ----------
-    sdata : sd.SpatialData
-        A SpatialData object containing tables with spatial coordinates and rasterized images.
-    min_count : int, optional
-        Minimum count threshold for features to be included in analysis. If None, no filtering.
-    kernel_method : str, default 'car'
-        Kernel method to use. Must be one of: 'gaussian', 'matern', 'moran', 'graph_laplacian', 'car'.
-    kernel_params : dict, optional
-        Additional kernel-specific parameters (e.g., bandwidth, nu, rho, neighbor_degree).
+    kernel_method : str, default ``'car'``
+        One of ``'gaussian'``, ``'matern'``, ``'moran'``, ``'graph_laplacian'``,
+        ``'car'``.
+    **kernel_params
+        Kernel hyperparameters plus grid controls (``spacing``, ``topology``,
+        ``fft_solver``, ``workers``). See :class:`~quadsv.FFTKernel`.
 
     Attributes
     ----------
-    sdata : sd.SpatialData
-        Reference to the input spatial data object.
+    sdata : :class:`spatialdata.SpatialData` or None
+        Input container set by :meth:`setup_data`.
     min_count : int or None
-        Feature count threshold applied when filtering features for testing.
-    kernel_ : FFTKernel or None
-        Lazily constructed FFT kernel. ``None`` until the first
-        :meth:`compute_qstat` or :meth:`compute_rstat` call, which rasterizes the
-        input grid and builds the kernel at the resulting shape. Rebuilt
-        automatically if a subsequent call uses a different grid shape.
-    kernel_method_ : str
-        The selected kernel method.
-    kernel_params_ : dict
-        Kernel parameters after defaults are merged with user overrides.
-
-    See Also
-    --------
-    :meth:`~quadsv.detector_fft.PatternDetectorFFT.compute_qstat`
-        Compute univariate spatial statistics (Q-test).
-    :meth:`~quadsv.detector_fft.PatternDetectorFFT.compute_rstat`
-        Compute bivariate spatial statistics (R-test).
+        Feature count threshold; set by :meth:`setup_data`.
+    kernel_ : :class:`~quadsv.FFTKernel` or None
+        Built in :meth:`setup_data` once the grid shape is known.
+    kernel_method_, kernel_params_, n : see :class:`Detector`.
 
     Examples
     --------
-    >>> detector = PatternDetectorFFT(sdata, kernel_method='car', rho=0.8)
-    >>> q_results = detector.compute_qstat('grid', 'table', 'col_idx', 'row_idx', features=['Gene_1', 'Gene_2'])
-    >>> r_results = detector.compute_rstat('grid', 'table', 'col_idx', 'row_idx')
+    >>> det = DetectorGrid(kernel_method='car', rho=0.8)
+    >>> det.setup_data(sdata, bins='grid', table_name='table',
+    ...                col_key='col_idx', row_key='row_idx')  # doctest: +SKIP
+    >>> q = det.compute_qstat(features=['Gene_1', 'Gene_2'])  # doctest: +SKIP
     """
 
-    _available_kernels = ["gaussian", "matern", "moran", "graph_laplacian", "car"]
+    def __init__(self, kernel_method: str = "car", **kernel_params: Any) -> None:
+        super().__init__(kernel_method, **kernel_params)
 
-    def __init__(
-        self,
-        sdata: sd.SpatialData,
-        min_count: int | None = None,
-        kernel_method: str = "car",
-        **kernel_params: Any,
-    ) -> None:
-        """
-        Initialize the detector with the SpatialData object and grid settings.
+        # Data-state attrs (populated by setup_data):
+        self.sdata: sd.SpatialData | None = None
+        """Reference to the input :class:`spatialdata.SpatialData`, set by :meth:`setup_data`."""
+        self.min_count: int | None = None
+        """Minimum total count per feature applied in :meth:`setup_data`."""
 
-        Parameters
-        ----------
-        sdata : sd.SpatialData
-            The spatial data object containing the tables.
-        min_count : int, optional
-            Minimum count threshold for features to be included.
-        kernel_method : str, default 'car'
-            The kernel method to use. Must be one of: 'gaussian', 'matern', 'moran', 'graph_laplacian', 'car'.
-        kernel_params : dict, optional
-            Additional parameters for the kernel (e.g., bandwidth, nu, neighbor_degree, rho).
-            Defaults are merged with user-provided values.
+        # Rasterization keys (populated by setup_data):
+        self._img_key: str | None = None
+        self._table_name: str | None = None
+        self._bins: str | None = None
+        self._col_key: str | None = None
+        self._row_key: str | None = None
 
-        Raises
-        ------
-        ValueError
-            If ``kernel_method`` is not one of :attr:`_available_kernels`, or if
-            ``kernel_params`` contains an unknown key for the chosen method.
-        """
-        self.sdata: sd.SpatialData = sdata
-        """Reference to the input :class:`spatialdata.SpatialData` object."""
-        self.min_count: int | None = min_count
-        """Minimum total count for a feature to be included in testing, or ``None`` for no filtering."""
-
-        if kernel_method not in self._available_kernels:
-            raise ValueError(
-                f"kernel_method must be one of {self._available_kernels}, got '{kernel_method}'"
-            )
-        self.kernel_method_: str = kernel_method
-        """Name of the kernel method used to build :attr:`kernel_`."""
-
-        # Merge user params with defaults
-        defaults = self._get_default_params(self.kernel_method_).copy()
-        if kernel_params:
-            for key, value in kernel_params.items():
-                if key in defaults:
-                    defaults[key] = value
-                else:
-                    raise ValueError(f"Unknown parameter '{key}' for method '{kernel_method}'")
-        self.kernel_params_: dict = defaults
-        """Kernel parameters after defaults are merged with user overrides."""
-
-        # FFTKernel will be initialized once grid shape is known
-        self.kernel_: FFTKernel | None = None
-        """Lazily constructed :class:`~quadsv.fft.FFTKernel`, built on first compute call."""
-
-    def _get_default_params(self, method: str) -> dict[str, Any]:
-        """
-        Returns default parameters for specific kernel methods.
-
-        Parameters
-        ----------
-        method : str
-            Kernel method name. Should be one of _available_kernels.
-
-        Returns
-        -------
-        dict[str, Any]
-            Merged dictionary of grid defaults and method-specific defaults.
-            Grid defaults: spacing, topology.
-            Method defaults: bandwidth (gaussian/matern), nu (matern), neighbor_degree (moran/graph_laplacian/car), rho (car).
-        """
+    def _merge_kernel_defaults(self, method: str, user_params: dict) -> dict:
+        """Merge grid-level + per-method FFTKernel defaults with user overrides."""
         general_defaults = {
             "spacing": (1.0, 1.0),
             "topology": "square",
@@ -222,7 +163,77 @@ class PatternDetectorFFT:
             "graph_laplacian": {"neighbor_degree": 1},
             "car": {"rho": 0.9, "neighbor_degree": 1},
         }
-        return {**general_defaults, **method_defaults.get(method, {})}
+        defaults = {**general_defaults, **method_defaults.get(method, {})}
+        for key, value in user_params.items():
+            if key not in defaults:
+                raise ValueError(
+                    f"Unknown parameter {key!r} for method {method!r}. "
+                    f"Allowed: {sorted(defaults)}."
+                )
+            defaults[key] = value
+        return defaults
+
+    def setup_data(
+        self,
+        sdata: sd.SpatialData,
+        *,
+        bins: str,
+        table_name: str,
+        col_key: str,
+        row_key: str,
+        value_key: str | None = None,
+        min_count: int | None = None,
+    ) -> DetectorGrid:
+        """
+        Attach ``sdata``, rasterize the chosen bins table, and build the FFTKernel.
+
+        Parameters
+        ----------
+        sdata : :class:`spatialdata.SpatialData`
+            Input container.
+        bins : str
+            Name of the SpatialElement (Shape) defining the grid-like bins.
+        table_name : str
+            Name of the table annotating the SpatialElement in ``sdata.tables``.
+        col_key, row_key : str
+            ``.obs`` columns holding integer column / row indices for the bins.
+        value_key : str, optional
+            Value column in ``.obs`` to rasterize. ``None`` uses counts / presence.
+        min_count : int, optional
+            Minimum total count for a feature to pass filtering. ``None`` disables.
+
+        Returns
+        -------
+        self : DetectorGrid
+        """
+        self.sdata = sdata
+        self.min_count = min_count
+        self._bins = bins
+        self._table_name = table_name
+        self._col_key = col_key
+        self._row_key = row_key
+
+        # Rasterize once, store the resulting image key.
+        self._img_key = self._rasterize_bins(
+            bins=bins,
+            table_name=table_name,
+            col_key=col_key,
+            row_key=row_key,
+            value_key=value_key,
+        )
+        raster_layer = self.sdata[self._img_key]
+        _, ny, nx = raster_layer.shape
+        self.n = ny * nx
+
+        logger.info(
+            "Building FFTKernel (%s) for grid shape (%d, %d)...",
+            self.kernel_method_,
+            ny,
+            nx,
+        )
+        self.kernel_ = FFTKernel(shape=(ny, nx), method=self.kernel_method_, **self.kernel_params_)
+        self._data_ready = True
+        return self
 
     def _rasterize_bins(
         self,
@@ -265,23 +276,11 @@ class PatternDetectorFFT:
         This method ensures the underlying matrix is in CSC sparse format for efficient
         column-wise operations required by rasterize_bins.
         """
-        # Ensure the table exists
-        if table_name not in self.sdata.tables:
-            raise ValueError(f"Table {table_name} not found in sdata.")
+        from quadsv._rasterize import rasterize_table
 
-        # Performance optimization: rasterize_bins requires CSC matrix
-        # We check and convert if necessary to avoid runtime errors
-        if hasattr(self.sdata.tables[table_name], "X"):
-            if not isinstance(self.sdata.tables[table_name].X, (np.ndarray)):
-                # Assuming scipy sparse; check format
-                if self.sdata.tables[table_name].X.format != "csc":
-                    self.sdata.tables[table_name].X = self.sdata.tables[table_name].X.tocsc()
-
-        # Construct the output key
         img_key = f"rasterized_{table_name}"
-
         logger.info("Rasterizing %s into %s...", table_name, img_key)
-        rasterized = sd.rasterize_bins(
+        rasterized = rasterize_table(
             self.sdata,
             bins=bins,
             table_name=table_name,
@@ -290,8 +289,6 @@ class PatternDetectorFFT:
             value_key=value_key,
             return_region_as_labels=return_region_as_labels,
         )
-
-        # Store in sdata images
         self.sdata[img_key] = rasterized
         return img_key
 
@@ -321,103 +318,39 @@ class PatternDetectorFFT:
 
     def compute_qstat(
         self,
-        bins: str,
-        table_name: str,
-        col_key: str,
-        row_key: str,
         features: list[str] | None = None,
         n_jobs: int = -1,
-        workers: int | None = None,
         return_pval: bool = True,
         chunk_size: int = 256,
     ) -> pd.DataFrame:
         """
-        Computes spatial Q-statistic for specified features in parallel.
+        Compute the spatial Q-statistic across features in parallel.
 
-        Tests each feature for significant spatial clustering or dispersion using
-        the selected kernel method. Parallelizes computation across features and
-        applies Benjamini-Hochberg multiple testing correction.
+        Requires :meth:`setup_data` to have been called; rasterization and
+        kernel construction happen there. This method pulls the rasterized
+        feature tensor from :attr:`sdata` and runs per-feature FFT Q-tests.
 
         Parameters
         ----------
-        bins : str
-            Name of the SpatialElement (Shape) which defines the grid-like bins.
-        table_name : str
-            Name of the table annotating the SpatialElement in sdata.tables.
-        col_key : str
-            Column in sdata[table_name].obs containing column indices (integers) for bins.
-        row_key : str
-            Column in sdata[table_name].obs containing row indices (integers) for bins.
-        features : Optional[List[str]]
-            List of feature names to analyze. If None, all features in table are processed.
+        features : list of str, optional
+            Feature names to analyze. ``None`` uses all features that pass
+            the ``min_count`` filter from :meth:`setup_data`.
         n_jobs : int, default -1
-            Number of parallel worker processes for feature chunks. -1 uses all available cores; 1 for sequential.
-        workers : int, optional
-            Number of threads for scipy.fft parallelization within each worker.
-            Will overwrite kernel_params_['workers'] if provided.
+            Number of parallel workers for per-feature chunks. ``-1`` = all cores.
         return_pval : bool, default True
-            Whether to return p-values and adjusted p-values (Benjamini-Hochberg).
+            Whether to compute p-values + Benjamini–Hochberg–adjusted p-values.
         chunk_size : int, default 256
-            Number of features to process in a single batch per worker (for efficiency).
-            Larger grids may require smaller chunks to avoid OOM.
+            Features per worker batch.
 
         Returns
         -------
-        df : pd.DataFrame
-            Results table sorted by Q (descending). Columns:
-            - Feature: feature name
-            - Q: test statistic (univariate spatial statistic)
-            - Z_score: standardized Q by null mean/std
-            - P_value: tail probability under H₀ (if return_pval=True)
-            - P_adj: adjusted p-value via Benjamini-Hochberg (if return_pval=True)
-
-        Raises
-        ------
-        ValueError
-            If table_name not found in sdata, or no valid features pass filters.
-
-        Notes
-        -----
-        Under H₀: feature is spatially independent (null distribution approximated via Liu or Normal).
-        Under H₁: mean-shift present.
-
-        Rasterization is performed lazily via dask for memory efficiency.
-        Kernel is auto-initialized if grid shape differs from previous call.
-
-        Examples
-        --------
-        >>> detector = PatternDetectorFFT(sdata, kernel_method='car', rho=0.8)
-        >>> results = detector.compute_qstat('grid_bins', 'counts', 'col_idx', 'row_idx', n_jobs=4, workers=-1)
-        >>> top_features = results.head(10)  # Top 10 by spatial signal strength
+        pandas.DataFrame
+            Indexed by feature. Columns: ``Q``, ``Z_score``, and (if
+            ``return_pval=True``) ``P_value``, ``P_adj``. Sorted by ``Q`` desc.
         """
-        # 1. Rasterize (Lazy construction)
-        img_key = self._rasterize_bins(
-            bins=bins, table_name=table_name, col_key=col_key, row_key=row_key
-        )
-
-        # Get the DataArray (Lazy Dask array)
-        raster_layer = self.sdata[img_key]
-
-        # 2. Handle Feature Selection
-        features = self._filter_features(features, table_name)
-
-        # 3. Build Kernel (Requires Grid Shape)
-        _, ny, nx = raster_layer.shape
-
-        # Only rebuild kernel if shape changed or not initialized
-        if self.kernel_ is None or (self.kernel_.ny, self.kernel_.nx) != (ny, nx):
-            logger.info(
-                "Building FFTKernel (%s) for grid shape (%d, %d)...",
-                self.kernel_method_,
-                ny,
-                nx,
-            )
-            # Pass workers to kernel for FFT parallelization
-            if workers is not None:  # Override if provided
-                self.kernel_params_["workers"] = workers
-            self.kernel_ = FFTKernel(
-                shape=(ny, nx), method=self.kernel_method_, **self.kernel_params_
-            )
+        self._require_setup()
+        raster_layer = self.sdata[self._img_key]
+        features = self._filter_features(features, self._table_name)
 
         # 4. Determine number of parallel jobs
         if n_jobs == -1:
@@ -500,85 +433,42 @@ class PatternDetectorFFT:
 
     def compute_rstat(  # noqa: C901
         self,
-        bins: str,
-        table_name: str,
-        col_key: str,
-        row_key: str,
         features_x: list[str] | None = None,
         features_y: list[str] | None = None,
         return_pval: bool = True,
         chunk_size: int = 256,
-        workers: int | None = -1,
     ) -> pd.DataFrame:
         """
-        Computes spatial R-statistic (bivariate spatial correlation) for feature pairs.
+        Compute the bivariate spatial R-statistic across feature pairs.
 
-        Tests for significant spatial co-variation between pairs of features using
-        kernel-based cross-correlation. Parallelizes computation and applies multiple
-        testing correction via Benjamini-Hochberg adjustment.
+        Requires :meth:`setup_data` to have been called.
 
         Parameters
         ----------
-        bins : str
-            Name of the SpatialElement (Shape) which defines the grid-like bins.
-        table_name : str
-            Name of the table annotating the SpatialElement in sdata.tables.
-        col_key : str
-            Column in sdata[table_name].obs containing column indices (integers) for bins.
-        row_key : str
-            Column in sdata[table_name].obs containing row indices (integers) for bins.
-        features_x : Optional[List[str]]
-            List of feature names for the X variable. If None and features_y is None,
-            all features are used (symmetric pairwise mode).
-        features_y : Optional[List[str]]
-            List of feature names for the Y variable. If None, computes all pairwise
-            comparisons within features_x (mode='symmetric'). If provided with features_x,
-            computes all X vs Y pairs (mode='bipartite').
-        workers : int, default -1
-            Number of parallel workers for scipt.fft. -1 uses all available cores.
-            Will overwrite kernel_params_['workers'] if provided.
+        features_x : list of str, optional
+            Features for the X variable. If ``None`` and ``features_y`` is
+            ``None``, uses all features (symmetric pairwise mode).
+        features_y : list of str, optional
+            Features for the Y variable. If ``None``, pairs are drawn from
+            ``features_x`` (symmetric, upper-triangular). If provided, returns
+            all X × Y pairs (bipartite).
         return_pval : bool, default True
-            Whether to return p-values and adjusted p-values (Benjamini-Hochberg).
+            Whether to compute p-values + Benjamini–Hochberg–adjusted p-values.
         chunk_size : int, default 256
-            Number of genes to process in a batch.
-            Recommended: 512 - 2048 depending on RAM. Larger grids may require smaller chunks to avoid OOM.
+            Y-features per batch (reuses the pre-computed ``K @ Y`` block).
 
         Returns
         -------
-        df : pd.DataFrame
-            Results table sorted by R (descending). Columns:
-            - Feature_1: first feature name
-            - Feature_2: second feature name
-            - R: test statistic (bivariate spatial correlation)
-            - Z_score: standardized R by null mean/std
-            - P_value: two-tailed p-value under H₀ (if return_pval=True)
-            - P_adj: adjusted p-value via Benjamini-Hochberg (if return_pval=True)
-
-        Raises
-        ------
-        ValueError
-            If table_name not found in sdata, or features_x is None when features_y is provided,
-            or no valid feature pairs are generated.
-
-        Notes
-        -----
-        Under H₀: features are spatially independent (Normal approximation).
-        Under H₁: significant spatial co-clustering or co-dispersion detected.
-
-        Symmetric mode (features_x only): Returns upper triangular pairs (Feature_1 < Feature_2).
-        Bipartite mode (features_x and features_y): Returns all X vs Y pairs.
-
-        Examples
-        --------
-        >>> detector = PatternDetectorFFT(sdata, kernel_method='car', rho=0.8)
-        >>> results = detector.compute_rstat('grid_bins', 'counts', 'col_idx', 'row_idx', workers=4)
-        >>> top_pairs = results.head(10)  # Top 10 spatially co-correlated pairs
+        pandas.DataFrame
+            Columns ``Feature_1``, ``Feature_2``, ``R``, ``Z_score`` and (if
+            ``return_pval=True``) ``P_value``, ``P_adj``. Sorted by ``R`` desc.
         """
         import gc  # Garbage collector
 
-        # 1. Rasterize (Lazy)
-        img_key = self._rasterize_bins(bins, table_name, col_key, row_key)
-        raster_layer = self.sdata[img_key]
+        self._require_setup()
+        raster_layer = self.sdata[self._img_key]
+        table_name = self._table_name
+        _, ny, nx = raster_layer.shape
 
         # 2. Resolve Features
         all_features = raster_layer.coords["c"].values
@@ -596,23 +486,7 @@ class PatternDetectorFFT:
         if mode == "bipartite":
             features_y = self._filter_features(features_y, table_name)
 
-        # 3. Initialize Kernel
-        _, ny, nx = raster_layer.shape
-
-        # Update workers in kernel params if provided
-        if workers is not None:
-            self.kernel_params_["workers"] = workers
-
-        if self.kernel_ is None or (self.kernel_.ny, self.kernel_.nx) != (ny, nx):
-            logger.info(
-                "Building FFTKernel (%s) for grid shape (%d, %d)...",
-                self.kernel_method_,
-                ny,
-                nx,
-            )
-            self.kernel_ = FFTKernel((ny, nx), method=self.kernel_method_, **self.kernel_params_)
-
-        # 4. Prepare Batches
+        # 3. Prepare Batches
         chunks_x = np.array_split(features_x, np.ceil(len(features_x) / chunk_size))
         if mode == "bipartite":
             chunks_y = np.array_split(features_y, np.ceil(len(features_y) / chunk_size))
