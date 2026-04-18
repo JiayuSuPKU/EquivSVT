@@ -308,7 +308,7 @@ class TestFFTVsMatrixKernelComparison(unittest.TestCase):
             if method == "car":
                 rho = kwargs.get("rho", 0.9)
                 W = np.eye(n) - rho * W
-                spatial_kernel = MatrixKernel.from_matrix(W, method=method, is_inverse=True)
+                spatial_kernel = MatrixKernel.from_matrix(W, method=method, is_precision=True)
             else:  # Moran
                 spatial_kernel = MatrixKernel.from_matrix(W, method=method)
 

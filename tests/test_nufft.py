@@ -125,7 +125,7 @@ class TestNUFFTKernelConstruction:
         assert k.grid_shape == (32, 32)
         assert k.spacing == (0.5, 0.5)
         assert k.method == "matern"
-        assert k.is_implicit is False
+        assert k.stores_precision is False
         assert "bandwidth" in k.params and "nu" in k.params
 
     def test_auto_grid_from_coords(self):

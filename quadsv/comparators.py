@@ -416,7 +416,7 @@ class ComparatorIrregular(_ComparatorBase):
     Cross-sample pattern comparison on irregular spots via NUFFT.
 
     Accepts a list of :class:`anndata.AnnData` (one per sample). For each
-    sample, the per-sample ``obsm[coordinates_key]`` supplies the irregular
+    sample, the per-sample ``obsm[obsm_key]`` supplies the irregular
     ``(y, x)`` coordinates and ``.X`` (or ``.layers[layer]`` when set) is the
     expression matrix. Spectra are evaluated with a batched type-1 NUFFT
     (``finufft.nufft2d1``), densifying at most :attr:`nufft_chunk_size`
@@ -432,7 +432,7 @@ class ComparatorIrregular(_ComparatorBase):
         the same ``var_names``.
     feature_mode : {'radial', '2d'}, default 'radial'
     n_radial_bins : int, default 30
-    coordinates_key : str, default 'spatial'
+    obsm_key : str, default 'spatial'
     layer : str, optional
     unit_scales : sequence of float, optional
         Per-sample multiplier applied to coords before NUFFT (e.g. pixels→μm).
@@ -464,7 +464,7 @@ class ComparatorIrregular(_ComparatorBase):
         *,
         feature_mode: str = "radial",
         n_radial_bins: int = 30,
-        coordinates_key: str = "spatial",
+        obsm_key: str = "spatial",
         layer: str | None = None,
         unit_scales: Sequence[float] | None = None,
         grid_shape: tuple[int, int] | None = None,
@@ -507,7 +507,7 @@ class ComparatorIrregular(_ComparatorBase):
         self._spectrum_fft_solver = "fft2"
 
         self._layer = layer
-        self._coordinates_key = coordinates_key
+        self._obsm_key = obsm_key
         self._nufft_eps = float(eps)
 
         # Per-sample coords / grids.
@@ -526,15 +526,15 @@ class ComparatorIrregular(_ComparatorBase):
         grids: list[tuple[int, int]] = []
         spacings: list[tuple[float, float]] = []
         for i, ad_s in enumerate(samples_list):
-            if coordinates_key not in ad_s.obsm:
+            if obsm_key not in ad_s.obsm:
                 raise KeyError(
-                    f"sample {i} has no obsm['{coordinates_key}']; "
+                    f"sample {i} has no obsm['{obsm_key}']; "
                     f"available: {list(ad_s.obsm.keys())}."
                 )
-            c = np.asarray(ad_s.obsm[coordinates_key], dtype=np.float64)
+            c = np.asarray(ad_s.obsm[obsm_key], dtype=np.float64)
             if c.ndim != 2 or c.shape[1] != 2:
                 raise ValueError(
-                    f"sample {i} obsm['{coordinates_key}'] must be (N, 2), got {c.shape}."
+                    f"sample {i} obsm['{obsm_key}'] must be (N, 2), got {c.shape}."
                 )
             coords_list.append(c)
             if grid_shape is not None and spacing is not None:

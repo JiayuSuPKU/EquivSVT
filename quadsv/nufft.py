@@ -292,7 +292,7 @@ class NUFFTKernel:
         Kernel method.
     params : dict
         Resolved kernel parameters.
-    is_implicit : bool
+    stores_precision : bool
         Always ``False`` — NUFFTKernel never holds an N×N matrix.
     """
 
@@ -348,7 +348,7 @@ class NUFFTKernel:
         self._unit_scale: float = float(unit_scale)
         self._eps: float = float(eps)
         self.workers: int | None = workers
-        self.is_implicit: bool = False
+        self.stores_precision: bool = False
 
         # Internal FFTKernel holds the eigenvalue spectrum on the k-grid. We
         # use fft2 (full spectrum) so the ifftshift trick aligns NUFFT output

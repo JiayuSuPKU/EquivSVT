@@ -135,13 +135,29 @@ def compute_null_params(
     Returns
     -------
     dict[str, float or np.ndarray]
-        Parameters shared by Q-tests and R-tests:
+        Always populated (regardless of ``method``):
 
-        - ``'method'`` — the method used (for Q-tests).
-        - ``'var_R'`` — ``trace(K²)``, the null variance of the R statistic.
-        - For ``'liu'``: ``'eigenvalues'`` (np.ndarray of kernel eigenvalues).
-        - For ``'welch'`` / ``'clt'``: ``'mean_Q'``, ``'var_Q'``, and for
-          ``'welch'`` also ``'scale_g'``, ``'df_h'``.
+        - ``'method'`` : str — the Q-test approximation selected.
+        - ``'var_R'`` : float — ``trace(K²)``, the null variance of ``R``
+          (used by :func:`spatial_r_test`).
+
+        Method-specific additions:
+
+        - ``method='liu'`` (default for FFT / NUFFT kernels):
+
+          * ``'eigenvalues'`` : ``np.ndarray`` of non-trivial kernel eigenvalues.
+
+        - ``method='welch'`` (default for MatrixKernel Q-tests):
+
+          * ``'mean_Q'`` : ``trace(K)``
+          * ``'var_Q'`` : ``2 · trace(K²)``
+          * ``'scale_g'`` : Welch scale parameter ``var_Q / (2 · mean_Q)``
+          * ``'df_h'`` : Welch df ``2 · mean_Q² / var_Q``
+
+        - ``method='clt'``: ``'mean_Q'``, ``'var_Q'`` only.
+
+    Consumers (``spatial_q_test`` / ``spatial_r_test``) read only the keys
+    their approximation needs; the dict is safe to reuse across calls.
 
     Raises
     ------
@@ -297,77 +313,71 @@ def spatial_q_test(  # noqa: C901
     is_sparse = sp.issparse(Xn)
 
     if is_sparse:
-        # Get shape from sparse matrix
         n, M = Xn.shape if Xn.ndim == 2 else (Xn.shape[0], 1)
         if Xn.ndim == 1 or M == 1:
-            Xn = Xn.reshape(-1, 1) if hasattr(Xn, "reshape") else Xn
+            Xn = Xn.reshape(-1, 1)
             M = 1
     else:
-        Xn = np.asarray(Xn).astype(float)
-        # Detect batch mode
-        # If ndim=1 -> (N, 1). If ndim=2 -> (N, M)
+        Xn = np.asarray(Xn, dtype=float)
         if Xn.ndim == 1:
             Xn = Xn.reshape(-1, 1)
         n, M = Xn.shape
 
-    # Determine chunking
     if chunk_size == -1 or chunk_size >= M:
         chunk_size = M
-
-    # Process in chunks
     n_chunks = int(np.ceil(M / chunk_size))
-    Q_results = []
 
     iterator = range(n_chunks)
     if show_progress and n_chunks > 1:
         iterator = tqdm(
             iterator,
-            desc="Processing features",
+            desc="Q-test chunks",
             total=n_chunks,
             bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
         )
 
+    # Fast path: sparse Xn + unstandardized + kernel exposes xtKx_standardized.
+    # Uses the (K·1, 1^T K 1) expansion so sparse Xn never needs densification.
+    use_sparse_fastpath = (
+        is_sparse and not is_standardized and hasattr(kernel, "xtKx_standardized")
+    )
+
+    Q_results = []
     for chunk_idx in iterator:
         start_idx = chunk_idx * chunk_size
         end_idx = min(start_idx + chunk_size, M)
-
-        # Extract chunk
         Xn_chunk = Xn[:, start_idx:end_idx]
 
-        # 1. Preprocessing (Standardization)
-        if is_standardized:
-            z = Xn_chunk
+        if use_sparse_fastpath:
+            # Compute means / stds from sparse directly (ddof=1 to match below).
+            col_sum = np.asarray(Xn_chunk.sum(axis=0)).ravel()
+            means = col_sum / n
+            sq_sum = np.asarray(Xn_chunk.multiply(Xn_chunk).sum(axis=0)).ravel()
+            var = (sq_sum - n * means**2) / max(n - 1, 1)
+            var[var < 0] = 0.0
+            stds = np.sqrt(var)
+            Q_chunk = kernel.xtKx_standardized(Xn_chunk, means, stds)
         else:
-            # Convert sparse to dense for standardization (centering destroys sparsity anyway)
-            if is_sparse:
-                Xn_chunk = Xn_chunk.toarray()
-
-            # Compute stats along axis 0 (samples)
-            means = np.mean(Xn_chunk, axis=0)
-            stds = np.std(Xn_chunk, axis=0, ddof=1)
-
-            # Handle constant features (std=0) to avoid NaNs
-            valid_mask = stds > 1e-12
-            z = np.zeros_like(Xn_chunk)
-
-            if np.any(valid_mask):
-                z[:, valid_mask] = (Xn_chunk[:, valid_mask] - means[valid_mask]) / stds[valid_mask]
-
-        # 2. Compute Statistic Q = z^T K z
-        # Use optimized class method if available
-        if hasattr(kernel, "xtKx"):
-            # This now supports (N, M) inputs and returns (M,)
-            Q_chunk = kernel.xtKx(z)
-        else:
-            # Fallback for raw matrices
-            if sp.issparse(kernel):
-                Kz = kernel.dot(z)
+            if is_standardized:
+                z = Xn_chunk
             else:
-                Kz = np.dot(kernel, z)
+                if is_sparse:
+                    Xn_chunk = Xn_chunk.toarray()
+                means = np.mean(Xn_chunk, axis=0)
+                stds = np.std(Xn_chunk, axis=0, ddof=1)
+                valid_mask = stds > 1e-12
+                z = np.zeros_like(Xn_chunk)
+                if np.any(valid_mask):
+                    z[:, valid_mask] = (
+                        Xn_chunk[:, valid_mask] - means[valid_mask]
+                    ) / stds[valid_mask]
 
-            # Efficient diagonal of z.T @ Kz without full matrix mult
-            # sum(z_ij * (Kz)_ij) along axis 0
-            Q_chunk = np.sum(z * Kz, axis=0)
+            if hasattr(kernel, "xtKx"):
+                Q_chunk = kernel.xtKx(z)
+            else:
+                # Fallback for raw matrices.
+                Kz = kernel.dot(z) if sp.issparse(kernel) else np.dot(kernel, z)
+                Q_chunk = np.sum(z * Kz, axis=0)
 
         Q_results.append(Q_chunk)
 
@@ -430,12 +440,13 @@ def spatial_q_test(  # noqa: C901
 
 
 def spatial_r_test(  # noqa: C901
-    Xn: np.ndarray,
-    Yn: np.ndarray,
+    Xn: np.ndarray | sp.spmatrix,
+    Yn: np.ndarray | sp.spmatrix,
     kernel: Kernel,
     null_params: dict | None = None,
     return_pval: bool = True,
     is_standardized: bool = False,
+    show_progress: bool = False,
 ) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
     """
     Bivariate spatial R-test for correlation between two spatial variables.
@@ -515,45 +526,57 @@ def spatial_r_test(  # noqa: C901
             is_standardized=is_standardized,
         )
 
-    Xn = np.asarray(Xn)
-    Yn = np.asarray(Yn)
-    if Xn.ndim == 1:
-        Xn = Xn.reshape(-1, 1)
-    if Yn.ndim == 1:
-        Yn = Yn.reshape(-1, 1)
+    # Normalize shapes; preserve sparsity of inputs.
+    def _prep(A):
+        if sp.issparse(A):
+            return A.reshape(-1, 1) if A.ndim == 1 else A
+        arr = np.asarray(A, dtype=float)
+        return arr.reshape(-1, 1) if arr.ndim == 1 else arr
 
+    Xn, Yn = _prep(Xn), _prep(Yn)
+    if Xn.shape != Yn.shape:
+        raise ValueError(f"Xn and Yn shapes must match, got {Xn.shape} vs {Yn.shape}.")
     n, M = Xn.shape
-    assert Xn.shape == Yn.shape, "Xn and Yn shapes must match"
-    assert n == kernel.n, "Kernel dimensions must match data size"
+    if n != kernel.n:
+        raise ValueError(f"Kernel.n={kernel.n} does not match data rows {n}.")
 
-    # 1. Preprocessing (Standardization)
+    def _standardize(A):
+        """Z-score A (sparse or dense) column-wise with ddof=1. Returns dense."""
+        if sp.issparse(A):
+            col_sum = np.asarray(A.sum(axis=0)).ravel()
+            means = col_sum / n
+            sq_sum = np.asarray(A.multiply(A).sum(axis=0)).ravel()
+            var = (sq_sum - n * means**2) / max(n - 1, 1)
+            var[var < 0] = 0.0
+            stds = np.sqrt(var)
+            Z = A.toarray() - means
+        else:
+            means = np.mean(A, axis=0)
+            stds = np.std(A, axis=0, ddof=1)
+            Z = A - means
+        valid = stds > 1e-12
+        Z[:, ~valid] = 0.0
+        if np.any(valid):
+            Z[:, valid] /= stds[valid]
+        return Z
+
     if is_standardized:
-        Zx, Zy = Xn, Yn
+        # ``is_standardized=True`` implies dense already (sparse can't be pre-z-scored).
+        Zx = np.asarray(Xn.toarray() if sp.issparse(Xn) else Xn, dtype=float)
+        Zy = np.asarray(Yn.toarray() if sp.issparse(Yn) else Yn, dtype=float)
     else:
-        # Standardize Xn
-        means = np.mean(Xn, axis=0)
-        stds = np.std(Xn, axis=0, ddof=1)
-        valid_mask = stds > 1e-12
-        Zx = np.zeros_like(Xn)
+        if show_progress:
+            with tqdm(total=2, desc="Standardizing", leave=False) as pbar:
+                Zx = _standardize(Xn)
+                pbar.update(1)
+                Zy = _standardize(Yn)
+                pbar.update(1)
+        else:
+            Zx = _standardize(Xn)
+            Zy = _standardize(Yn)
 
-        if np.any(valid_mask):
-            Zx[:, valid_mask] = (Xn[:, valid_mask] - means[valid_mask]) / stds[valid_mask]
-
-        # Standardize Yn
-        means = np.mean(Yn, axis=0)
-        stds = np.std(Yn, axis=0, ddof=1)
-        valid_mask = stds > 1e-12
-        Zy = np.zeros_like(Yn)
-        if np.any(valid_mask):
-            Zy[:, valid_mask] = (Yn[:, valid_mask] - means[valid_mask]) / stds[valid_mask]
-
-    # 2. Compute R = Zx.T @ K @ Zy through the public Kx primitive so the
-    # implicit / explicit / sparse / dense branching lives in one place
-    # (Kernel.Kx) instead of being duplicated here.
-    K_Zy = kernel.Kx(Zy)
-
-    # Paired bilinear diagonal: sum(Zx_ij * (K Zy)_ij) along axis 0.
-    R = np.sum(Zx * K_Zy, axis=0)
+    # R = diag(Zx^T K Zy) via the kernel's public bilinear primitive.
+    R = np.atleast_1d(np.asarray(kernel.xtKy(Zx, Zy)))
 
     # Unwrap if M=1
     if M == 1 and R.size == 1:

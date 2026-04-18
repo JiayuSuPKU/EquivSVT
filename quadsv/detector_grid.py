@@ -316,12 +316,62 @@ class DetectorGrid(Detector):
 
         return valid
 
+    # ------------------------------------------------------------------
+    # Auto-tuning helpers
+    # ------------------------------------------------------------------
+    def _auto_chunk_size(self, budget_bytes: int = 2**28) -> int:
+        """Resolve ``chunk_size='auto'`` against the grid size.
+
+        Memory per batched feature: ``ny · nx · 24 B`` (float64 raster + complex
+        FFT scratch). Targets ``budget_bytes`` (default 256 MB) per worker batch,
+        clipped to ``[16, 1024]``.
+        """
+        ny, nx = self.kernel_.ny, self.kernel_.nx
+        per_feat = max(1, ny * nx * 24)
+        return int(np.clip(budget_bytes // per_feat, 16, 1024))
+
+    def _auto_schedule(
+        self, n_batches: int, n_jobs: int | str, workers: int | str | None
+    ) -> tuple[int, int | None]:
+        """Balance joblib ``n_jobs`` and scipy.fft ``workers`` to the CPU count.
+
+        Both ``n_jobs`` and ``workers`` parallelize, and stacking them thrashes
+        cores. ``'auto'`` policy:
+
+        - If ``n_batches >= cpu_count``: parallelize across batches
+          (``n_jobs=cpu_count``), let each FFT call be single-threaded (``workers=1``).
+        - Otherwise (few batches, big grids): cap ``n_jobs`` at ``n_batches`` and
+          give each worker ``cpu_count / n_jobs`` FFT threads.
+
+        Concrete integers passed by the caller are respected.
+        """
+        import os
+
+        cpu = os.cpu_count() or 1
+        if n_jobs == "auto" or n_jobs == -1:
+            if n_batches >= cpu:
+                n_jobs_resolved = cpu
+                workers_resolved = 1 if workers == "auto" else workers
+            else:
+                n_jobs_resolved = max(1, n_batches)
+                workers_resolved = (
+                    max(1, cpu // max(1, n_batches)) if workers == "auto" else workers
+                )
+        else:
+            n_jobs_resolved = int(n_jobs)
+            workers_resolved = (
+                max(1, cpu // max(1, n_jobs_resolved)) if workers == "auto" else workers
+            )
+        return n_jobs_resolved, workers_resolved
+
     def compute_qstat(
         self,
         features: list[str] | None = None,
-        n_jobs: int = -1,
+        n_jobs: int | str = "auto",
+        workers: int | str | None = "auto",
         return_pval: bool = True,
-        chunk_size: int = 256,
+        chunk_size: int | str = "auto",
+        show_progress: bool = True,
     ) -> pd.DataFrame:
         """
         Compute the spatial Q-statistic across features in parallel.
@@ -335,12 +385,20 @@ class DetectorGrid(Detector):
         features : list of str, optional
             Feature names to analyze. ``None`` uses all features that pass
             the ``min_count`` filter from :meth:`setup_data`.
-        n_jobs : int, default -1
-            Number of parallel workers for per-feature chunks. ``-1`` = all cores.
+        n_jobs : int or ``'auto'``, default ``'auto'``
+            Joblib workers over feature batches. ``'auto'`` balances against
+            ``workers`` — see :meth:`_auto_schedule`. ``-1`` is also accepted
+            and behaves like ``'auto'``.
+        workers : int, ``'auto'``, or None, default ``'auto'``
+            Threads for scipy.fft inside each worker. ``'auto'`` co-balances with
+            ``n_jobs``; ``None`` defers to scipy's default.
         return_pval : bool, default True
             Whether to compute p-values + Benjamini–Hochberg–adjusted p-values.
-        chunk_size : int, default 256
-            Features per worker batch.
+        chunk_size : int or ``'auto'``, default ``'auto'``
+            Features per worker batch. ``'auto'`` resolves to ``~256 MB / (ny·nx·24)``
+            via :meth:`_auto_chunk_size` and clips to ``[16, 1024]``.
+        show_progress : bool, default True
+            Show a tqdm progress bar over worker chunks.
 
         Returns
         -------
@@ -352,32 +410,37 @@ class DetectorGrid(Detector):
         raster_layer = self.sdata[self._img_key]
         features = self._filter_features(features, self._table_name)
 
-        # 4. Determine number of parallel jobs
-        if n_jobs == -1:
-            import os
+        if isinstance(chunk_size, str):
+            if chunk_size != "auto":
+                raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
+            chunk_size = self._auto_chunk_size()
 
-            n_jobs = os.cpu_count() or 1
-
-        # 5. Split features into batches for parallel processing
         feature_batches = [
             features[i : i + chunk_size] for i in range(0, len(features), chunk_size)
         ]
+        n_jobs, workers = self._auto_schedule(len(feature_batches), n_jobs, workers)
+        # Let the FFT path pick up the balanced workers setting.
+        self.kernel_.workers = workers
 
         logger.info(
-            "Processing %d features in %d batches using %d cores...",
+            "Q-test on %d features — %d batches, n_jobs=%d, workers=%s, chunk_size=%d",
             len(features),
             len(feature_batches),
             n_jobs,
+            workers,
+            chunk_size,
         )
 
-        # 6. Parallel execution
-        results_list = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_qstat_worker_fft)(raster_layer, batch, self.kernel_, return_pval)
-            for batch in tqdm(
+        batch_iter = feature_batches
+        if show_progress:
+            batch_iter = tqdm(
                 feature_batches,
                 desc=f"Q ({self.kernel_method_})",
                 bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
             )
+        results_list = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_qstat_worker_fft)(raster_layer, batch, self.kernel_, return_pval)
+            for batch in batch_iter
         )
 
         # 7. Flatten results
@@ -436,7 +499,9 @@ class DetectorGrid(Detector):
         features_x: list[str] | None = None,
         features_y: list[str] | None = None,
         return_pval: bool = True,
-        chunk_size: int = 256,
+        chunk_size: int | str = "auto",
+        workers: int | str | None = "auto",
+        show_progress: bool = True,
     ) -> pd.DataFrame:
         """
         Compute the bivariate spatial R-statistic across feature pairs.
@@ -454,8 +519,16 @@ class DetectorGrid(Detector):
             all X × Y pairs (bipartite).
         return_pval : bool, default True
             Whether to compute p-values + Benjamini–Hochberg–adjusted p-values.
-        chunk_size : int, default 256
+        chunk_size : int or ``'auto'``, default ``'auto'``
             Y-features per batch (reuses the pre-computed ``K @ Y`` block).
+            ``'auto'`` targets ~256 MB per embedding batch via
+            :meth:`_auto_chunk_size`.
+        workers : int, ``'auto'``, or None, default ``'auto'``
+            Threads for scipy.fft inside the embedding pass. ``'auto'`` gives
+            every FFT all CPU cores (the R-test loop is sequential over X/Y
+            chunk pairs so there is no joblib contention).
+        show_progress : bool, default True
+            Show a tqdm progress bar over X chunks.
 
         Returns
         -------
@@ -469,6 +542,18 @@ class DetectorGrid(Detector):
         raster_layer = self.sdata[self._img_key]
         table_name = self._table_name
         _, ny, nx = raster_layer.shape
+
+        if isinstance(chunk_size, str):
+            if chunk_size != "auto":
+                raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
+            chunk_size = self._auto_chunk_size()
+        # compute_rstat is sequential across X-chunks, so give every FFT the
+        # full CPU budget by default.
+        if workers == "auto":
+            import os
+
+            workers = os.cpu_count() or 1
+        self.kernel_.workers = workers
 
         # 2. Resolve Features
         all_features = raster_layer.coords["c"].values
@@ -504,7 +589,8 @@ class DetectorGrid(Detector):
         results_list = []
 
         # 5. Block Iteration
-        for i, batch_x_names in enumerate(tqdm(chunks_x, desc="Processing X chunks")):
+        x_iter = tqdm(chunks_x, desc="Processing X chunks") if show_progress else chunks_x
+        for i, batch_x_names in enumerate(x_iter):
             # Load Embeddings X (High Memory Usage)
             embeddings_x = self._compute_batch_spectral_embeddings(raster_layer, batch_x_names)
 

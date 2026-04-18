@@ -36,15 +36,15 @@ class Kernel(ABC):
     params : dict
         Resolved kernel parameters after defaults have been merged with user overrides
         (e.g., ``bandwidth``, ``nu``, ``rho``, ``k_neighbors``).
-    is_implicit : bool
+    stores_precision : bool
         If ``True``, the kernel is represented implicitly via its precision matrix and
         linear solves are used for :meth:`xtKx` and trace estimation. If ``False``,
         the realized kernel matrix is stored and used directly.
 
     Notes
     -----
-    The internal buffer ``_K`` stores the kernel matrix when ``is_implicit=False`` and
-    the precision matrix ``K^{-1}`` when ``is_implicit=True``. Public methods
+    The internal buffer ``_K`` stores the kernel matrix when ``stores_precision=False`` and
+    the precision matrix ``K^{-1}`` when ``stores_precision=True``. Public methods
     (:meth:`xtKx`, :meth:`trace`, :meth:`square_trace`, :meth:`eigenvalues`) transparently
     handle both cases; callers should not access ``_K`` directly.
     """
@@ -71,13 +71,13 @@ class Kernel(ABC):
 
         # Threshold (in samples) for switching to the implicit representation.
         self._implicit_threshold = 5000
-        self.is_implicit: bool = False
+        self.stores_precision: bool = False
         """Whether the kernel is stored in precision form (``True``) or as the realized kernel matrix (``False``)."""
         self._lu = None  # Cache for sparse LU factorization if needed
         self._lu_lock = threading.Lock()  # Thread safety for lazy LU init
 
-        # _K stores the kernel matrix when is_implicit=False and the precision
-        # matrix K^{-1} when is_implicit=True (see class Notes).
+        # _K stores the kernel matrix when stores_precision=False and the precision
+        # matrix K^{-1} when stores_precision=True (see class Notes).
         self._K = self._build_kernel()
         self._spectrum = None  # Lazy-evaluated eigenvalues cache (access via eigenvalues())
 
@@ -105,7 +105,7 @@ class Kernel(ABC):
 
     def __repr__(self):
         return (
-            f"<Kernel method={self.method} n={self.n} implicit={self.is_implicit} "
+            f"<Kernel method={self.method} n={self.n} implicit={self.stores_precision} "
             f"threshold={self._implicit_threshold} params={{ {self._format_params()} }}>"
         )
 
@@ -114,7 +114,7 @@ class Kernel(ABC):
             "Kernel\n"
             f"- Method: {self.method}\n"
             f"- Samples: {self.n}\n"
-            f"- Implicit: {self.is_implicit} (threshold={self._implicit_threshold})\n"
+            f"- Implicit: {self.stores_precision} (threshold={self._implicit_threshold})\n"
             f"- Params: {self._format_params()}"
         )
 
@@ -129,10 +129,10 @@ class Kernel(ABC):
 
         Notes
         -----
-        If ``is_implicit`` is True, this forces expensive dense inversion of the
+        If ``stores_precision`` is True, this forces expensive dense inversion of the
         precision matrix. Prefer :meth:`xtKx` and :meth:`trace` for implicit kernels.
         """
-        if self.is_implicit:
+        if self.stores_precision:
             # _K is M = K^-1. We need to invert it.
             if sp.issparse(self._K):
                 return inv(self._K.toarray())
@@ -166,7 +166,7 @@ class Kernel(ABC):
 
         k_orig = k  # preserve original before internal modification
 
-        if self.is_implicit:
+        if self.stores_precision:
             # Implicit case with kernel inverse: Use sparse methods
             from scipy.sparse.linalg import eigsh
 
@@ -187,29 +187,71 @@ class Kernel(ABC):
         self._spectrum = np.sort(vals)[::-1]  # always store descending
         return self._spectrum if k_orig is None else self._spectrum[:k_orig]
 
+    # ------------------------------------------------------------------
+    # Internal primitive: compute ``K @ x`` as a dense 2D block
+    # ------------------------------------------------------------------
+    def _apply_K_dense(self, x_2d: np.ndarray) -> np.ndarray:
+        """Compute ``K @ x_2d`` and return a dense ``(N, M)`` ndarray.
+
+        Used as the shared kernel of :meth:`Kx`, :meth:`xtKx`, :meth:`xtKy`.
+        Expects a dense ``(N, M)`` input; sparse inputs must be densified by
+        the caller. Implicit precision solves go through a cached LU; explicit
+        kernels dispatch to the underlying sparse / dense matmul.
+        """
+        if self.stores_precision:
+            if sp.issparse(self._K):
+                with self._lu_lock:
+                    if self._lu is None:
+                        self._lu = splu(self._K.tocsc())
+                y = self._lu.solve(x_2d)
+            else:
+                with self._lu_lock:
+                    if self._lu is None:
+                        self._lu = lu_factor(self._K)
+                y = lu_solve(self._lu, x_2d)
+            return np.asarray(y)
+        # Explicit: sparse K → K.dot(dense) returns dense. Dense K → dense @ dense.
+        y = self._K.dot(x_2d)
+        if sp.issparse(y):  # pragma: no cover — current scipy always returns dense
+            y = np.asarray(y.todense())
+        return np.asarray(y)
+
+    @staticmethod
+    def _to_2d(x: np.ndarray | sp.spmatrix) -> tuple[Any, bool]:
+        """Normalize ``x`` to a 2D ``(N, M)`` (sparse or dense) and report whether
+        the caller passed a 1D vector. Does *not* densify sparse input.
+        """
+        if sp.issparse(x):
+            if x.ndim == 1 or x.shape[1] == 1 and x.shape[0] == 1:
+                # scipy rarely exposes 1D sparse; reshape if someone slipped it in.
+                return x.reshape(-1, 1), True
+            if x.shape[1] == 1 and x.shape[0] > 1:
+                return x, False  # already a (N, 1) sparse column
+            return x, False
+        arr = np.asarray(x)
+        if arr.ndim == 1:
+            return arr.reshape(-1, 1), True
+        return arr, False
+
     def Kx(self, x: np.ndarray | sp.spmatrix) -> np.ndarray:
         """
         Apply the kernel operator to ``x``, returning ``K @ x``.
 
-        This is the single public primitive for kernel–vector products. It
-        handles the explicit case (dense or sparse kernel matrix stored in
-        ``_K``) and the implicit case (precision matrix stored in ``_K``;
-        a cached LU factorization is used to solve ``K^{-1} y = x``). Callers
-        that need a quadratic or bilinear form should go through
-        :meth:`xtKx` or :meth:`xtKy` instead of calling :meth:`Kx` twice.
+        Single public primitive for kernel–vector products. Handles explicit
+        (dense or sparse ``K``) and implicit (precision matrix + cached LU) cases
+        uniformly.
 
         Parameters
         ----------
         x : np.ndarray or scipy.sparse matrix
-            Input vector of shape ``(N,)`` or batch ``(N, M)``. Sparse inputs
-            are densified internally because the downstream solvers / BLAS
-            paths require dense RHS.
+            ``(N,)`` or ``(N, M)``. Sparse inputs are densified internally because
+            ``scipy.linalg.lu_solve`` / ``splu.solve`` require dense RHS and
+            ``K @ x`` typically returns dense anyway.
 
         Returns
         -------
         np.ndarray
-            ``K @ x`` with the same number of columns as ``x``; shape
-            ``(N,)`` if ``x`` was 1D, otherwise ``(N, M)``.
+            ``(N,)`` if ``x`` was 1D, else ``(N, M)``.
 
         Examples
         --------
@@ -218,59 +260,54 @@ class Kernel(ABC):
         >>> rng = np.random.default_rng(0)
         >>> coords = rng.standard_normal((40, 2))
         >>> kernel = MatrixKernel.from_coordinates(coords, method="matern")
-        >>> z = rng.standard_normal(40)
-        >>> Kz = kernel.Kx(z)
-        >>> Kz.shape
+        >>> kernel.Kx(rng.standard_normal(40)).shape
         (40,)
         """
-        if sp.issparse(x):
-            x_in = x.toarray()
-        else:
-            x_in = np.asarray(x)
+        x_2d, squeeze = self._to_2d(x)
+        if sp.issparse(x_2d):
+            x_2d = x_2d.toarray()
+        y = self._apply_K_dense(x_2d)
+        return y.ravel() if squeeze else y
 
-        squeeze = x_in.ndim == 1
-        if squeeze:
-            x_in = x_in.reshape(-1, 1)
+    def _xtKy_from_Ky(
+        self,
+        x: np.ndarray | sp.spmatrix,
+        Ky: np.ndarray,
+        n_cols: int,
+    ) -> float | np.ndarray:
+        """Given sparse-or-dense ``x`` (``(N, M)``) and dense ``Ky`` (``(N, M)``),
+        return the paired diagonal ``sum(x_i * Ky_i, axis=0)``.
 
-        if self.is_implicit:
-            # _K is the precision matrix M = K^{-1}; solve M y = x.
-            if sp.issparse(self._K):
-                with self._lu_lock:
-                    if self._lu is None:
-                        self._lu = splu(self._K.tocsc())
-                y = self._lu.solve(x_in)
-            else:
-                with self._lu_lock:
-                    if self._lu is None:
-                        self._lu = lu_factor(self._K)
-                y = lu_solve(self._lu, x_in)
-        else:
-            # Explicit: K is stored directly; dispatch to sparse or dense matmul.
-            y = self._K.dot(x_in)
-            if sp.issparse(y):  # pragma: no cover (sparse @ dense is dense today)
-                y = np.asarray(y.todense())
-
-        return y.ravel() if squeeze else np.asarray(y)
-
-    def xtKy(self, x: np.ndarray | sp.spmatrix, y: np.ndarray | sp.spmatrix) -> float | np.ndarray:
+        Preserves sparsity of ``x`` — ``x.multiply(Ky).sum(axis=0)`` iterates only
+        x's non-zeros. Falls back to ``np.sum(x * Ky, axis=0)`` when ``x`` is dense.
         """
-        Bilinear form ``x^T K y`` at the kernel's coordinates.
+        if sp.issparse(x):
+            result = np.asarray(x.multiply(Ky).sum(axis=0)).ravel()
+        else:
+            result = np.sum(x * Ky, axis=0)
+        if n_cols == 1:
+            return float(result.item())
+        return result
 
-        For a single pair of vectors returns a scalar; for batched inputs
-        ``(N, M)`` returns the *paired* diagonal — ``sum(x_i * (K y)_i, axis=0)``
-        of shape ``(M,)`` — matching the convention used by
-        :func:`quadsv.spatial_r_test`.
+    def xtKy(
+        self, x: np.ndarray | sp.spmatrix, y: np.ndarray | sp.spmatrix
+    ) -> float | np.ndarray:
+        """
+        Bilinear form ``x^T K y`` (paired diagonal for batched inputs).
+
+        For ``(N, M)`` batches returns ``(M,)`` — the diagonal of ``X^T K Y``
+        in the same column order, matching :func:`quadsv.spatial_r_test`.
+        Sparse ``x`` is preserved; only ``K @ y`` is densified.
 
         Parameters
         ----------
         x, y : np.ndarray or scipy.sparse matrix
-            Input vectors of shape ``(N,)`` or batches of shape ``(N, M)``.
-            Must share the same leading dimension ``N = self.n``.
+            ``(N,)`` or ``(N, M)`` (must share the M).
 
         Returns
         -------
         float or np.ndarray
-            Scalar if both inputs are 1D; shape ``(M,)`` when batched.
+            Scalar if 1D inputs; ``(M,)`` if batched.
 
         Examples
         --------
@@ -281,118 +318,118 @@ class Kernel(ABC):
         >>> kernel = MatrixKernel.from_coordinates(coords, method="matern")
         >>> x = rng.standard_normal(40)
         >>> y = rng.standard_normal(40)
-        >>> R = kernel.xtKy(x, y)
-        >>> isinstance(R, float)
+        >>> isinstance(kernel.xtKy(x, y), float)
         True
         """
-        if sp.issparse(x):
-            x_dense = np.asarray(x.toarray())
-        else:
-            x_dense = np.asarray(x)
+        x_2d, x_squeeze = self._to_2d(x)
+        y_2d, y_squeeze = self._to_2d(y)
+        squeeze = x_squeeze and y_squeeze
+        n_cols = x_2d.shape[1]
+        y_dense = y_2d.toarray() if sp.issparse(y_2d) else y_2d
+        Ky = self._apply_K_dense(y_dense)
+        return self._xtKy_from_Ky(x_2d, Ky, 1 if squeeze else n_cols)
 
-        Ky = self.Kx(y)
-
-        if x_dense.ndim == 1 and Ky.ndim == 1:
-            return float(np.dot(x_dense, Ky))
-
-        x_mat = x_dense.reshape(-1, 1) if x_dense.ndim == 1 else x_dense
-        Ky_mat = Ky.reshape(-1, 1) if Ky.ndim == 1 else Ky
-        out = np.sum(x_mat * Ky_mat, axis=0)
-        if out.size == 1:
-            return float(out.item())
-        return out
-
-    def xtKx(self, x: np.ndarray | sp.spmatrix) -> float | np.ndarray:  # noqa: C901
+    def xtKx(self, x: np.ndarray | sp.spmatrix) -> float | np.ndarray:
         """
-        Efficiently compute the quadratic form x^T K x.
-
-        Handles both single vectors and batches. Uses implicit solvers when the
-        kernel is stored in precision form (``is_implicit=True``) to avoid dense
-        matrix operations. Supports sparse input matrices without densification.
+        Quadratic form ``x^T K x`` (paired diagonal for batched inputs).
 
         Parameters
         ----------
         x : np.ndarray or scipy.sparse matrix
-            Input vector of shape (N,) or batch of vectors (N, M).
-            Can be dense numpy array or sparse matrix (CSC/CSR format).
+            ``(N,)`` or ``(N, M)``. Sparse ``x`` is preserved through the
+            final ``x^T (K x)`` contraction — only the right side ``K @ x``
+            needs a dense RHS for the solver / BLAS call.
 
         Returns
         -------
         float or np.ndarray
-            Quadratic form value(s). Scalar if input was 1D, shape (M,) if input was 2D.
-
-        Notes
-        -----
-        For implicit kernels, uses sparse solve instead of matrix inversion.
-        For sparse input, maintains sparsity throughout computation where possible.
+            Scalar if 1D input, ``(M,)`` if batched.
         """
-        # Handle sparse input
-        is_sparse_input = sp.issparse(x)
+        x_2d, squeeze = self._to_2d(x)
+        n_cols = x_2d.shape[1]
+        x_dense = x_2d.toarray() if sp.issparse(x_2d) else x_2d
+        Kx = self._apply_K_dense(x_dense)
+        return self._xtKy_from_Ky(x_2d, Kx, 1 if squeeze else n_cols)
 
-        # Allow x to be a matrix (N, n_vectors) or vector (N,)
-        # If vector, reshape to (N, 1) to ensure matrix math works
-        if is_sparse_input:
-            if x.ndim == 1 or (hasattr(x, "shape") and len(x.shape) == 1):
-                x_in = x.reshape(-1, 1)
-            else:
-                x_in = x
-            n_cols = x_in.shape[1]
+    # ------------------------------------------------------------------
+    # Sparsity-preserving standardized quadratic form
+    # ------------------------------------------------------------------
+    def _K_column_sums(self) -> tuple[np.ndarray, float]:
+        """Return (``K @ 1_N``, ``1_N^T K 1_N``), computed once and cached.
+
+        Used by :meth:`xtKx_standardized` to evaluate the mean-centering
+        correction without densifying sparse inputs.
+        """
+        cache = getattr(self, "_K_col_sum_cache", None)
+        if cache is not None:
+            return cache
+        ones = np.ones((self.n, 1))
+        K_sum = self._apply_K_dense(ones).ravel()  # (N,)
+        K_total = float(K_sum.sum())
+        self._K_col_sum_cache = (K_sum, K_total)
+        return self._K_col_sum_cache
+
+    def xtKx_standardized(
+        self,
+        x: np.ndarray | sp.spmatrix,
+        means: np.ndarray,
+        stds: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Compute ``z^T K z`` where ``z = (x - means) / stds`` *without* densifying
+        sparse ``x``.
+
+        Uses the expansion
+        ``z^T K z = (x^T K x - 2 μ (K·1)^T x + μ² (1^T K 1)) / σ²``
+        and the cached row sums of ``K`` to compute every term sparse-aware.
+        This is the fast path for standardizing large sparse feature matrices
+        (e.g. scRNA-seq counts) before a Q-test.
+
+        Parameters
+        ----------
+        x : np.ndarray or scipy.sparse matrix
+            ``(N,)`` or ``(N, M)``. Columns correspond to features.
+        means, stds : np.ndarray
+            ``(M,)`` per-feature mean and std (``ddof=1`` to match
+            :func:`quadsv.statistics.spatial_q_test`).
+
+        Returns
+        -------
+        np.ndarray
+            ``(M,)`` standardized quadratic form values. Columns with
+            ``std <= 0`` are returned as zero.
+        """
+        x_2d, _ = self._to_2d(x)
+        n_cols = x_2d.shape[1]
+        means = np.asarray(means, dtype=float).reshape(-1)
+        stds = np.asarray(stds, dtype=float).reshape(-1)
+        if means.shape[0] != n_cols or stds.shape[0] != n_cols:
+            raise ValueError(
+                f"means/stds shape {means.shape}/{stds.shape} "
+                f"inconsistent with x columns ({n_cols})."
+            )
+
+        K_sum, K_total = self._K_column_sums()  # K_sum: (N,), K_total: scalar
+
+        # Term 1: x^T K x — reuse xtKx (handles sparse/dense uniformly).
+        q_raw = np.atleast_1d(np.asarray(self.xtKx(x_2d))).astype(float)
+
+        # Term 2: (K·1)^T x → (M,). x^T @ K_sum, preserving x's sparsity.
+        if sp.issparse(x_2d):
+            ksum_x = np.asarray(x_2d.T @ K_sum).ravel()
         else:
-            x_in = x if x.ndim > 1 else x.reshape(-1, 1)
-            n_cols = x_in.shape[1]
+            ksum_x = x_2d.T @ K_sum
 
-        if self.is_implicit:
-            # Case: CAR model (Large N)
-            # We want x^T M^-1 x
-            # Solve My = x
-            if sp.issparse(self._K):
-                # Cache LU factorization for efficiency (thread-safe)
-                with self._lu_lock:
-                    if self._lu is None:
-                        self._lu = splu(self._K.tocsc())
-                if is_sparse_input:
-                    # Convert to dense for solver (most efficient for sparse solvers)
-                    y = self._lu.solve(x_in.toarray())
-                else:
-                    y = self._lu.solve(x_in)
-            else:
-                # Cache LU factorization for efficiency (thread-safe)
-                with self._lu_lock:
-                    if self._lu is None:
-                        self._lu = lu_factor(self._K)
-                if is_sparse_input:
-                    y = lu_solve(self._lu, x_in.toarray())
-                else:
-                    y = lu_solve(self._lu, x_in)
-
-            # Compute x^T @ y efficiently
-            if is_sparse_input:
-                # For sparse x, use multiply and sum
-                result = np.asarray(x_in.multiply(y).sum(axis=0)).flatten()
-            else:
-                result_matrix = x_in.T.dot(y)  # (M, M)
-                result = np.diag(result_matrix) if n_cols > 1 else result_matrix.item()
-        else:
-            # Standard Case: K is realized as a dense or sparse matrix
-            if is_sparse_input:
-                # Sparse @ Dense matrix multiplication
-                Kx = self._K.dot(x_in.toarray() if hasattr(x_in, "toarray") else x_in)
-                # x^T @ Kx with sparse x
-                result = np.asarray(x_in.multiply(Kx).sum(axis=0)).flatten()
-            else:
-                Kx = self._K.dot(x_in)
-                result_matrix = x_in.T.dot(Kx)  # (M, M)
-                result = np.diag(result_matrix) if n_cols > 1 else result_matrix.item()
-
-        # Return appropriate shape
-        if n_cols > 1:
-            return result if isinstance(result, np.ndarray) else np.diag(result)
-        else:
-            return result if np.isscalar(result) else result.item()
+        # Standardized quadratic form
+        q_centered = q_raw - 2.0 * means * ksum_x + (means**2) * K_total
+        valid = stds > 1e-12
+        out = np.zeros(n_cols, dtype=float)
+        out[valid] = q_centered[valid] / (stds[valid] ** 2)
+        return out
 
     def _get_rvs_trace_cache(self, n_vectors=15):
         """Generate random vectors for trace estimation caching."""
-        if not self.is_implicit:
+        if not self.stores_precision:
             raise RuntimeError("Trace caching is only for implicit kernels.")
 
         # Check if cache exists
@@ -445,7 +482,7 @@ class Kernel(ABC):
         ``n_vectors=15`` Hutchinson probes; repeated calls reuse the cached probes
         so the returned value is deterministic within a given instance.
         """
-        if self.is_implicit:
+        if self.stores_precision:
             # Trace estimation using Hutchinson's trick
             n_vectors = 15
             cache = self._get_rvs_trace_cache(n_vectors)
@@ -477,7 +514,7 @@ class Kernel(ABC):
         For implicit kernels the result is a stochastic estimate using a fixed
         ``n_vectors=15`` Hutchinson probes (shared with :meth:`trace`).
         """
-        if self.is_implicit:
+        if self.stores_precision:
             # Trace(K^2) estimation
             n_vectors = 15
             cache = self._get_rvs_trace_cache(n_vectors)
@@ -594,7 +631,7 @@ class MatrixKernel(Kernel):
     Concrete spatial kernel built from coordinates or a precomputed matrix.
 
     Inherits all public attributes and methods from :class:`Kernel`
-    (``n``, ``method``, ``params``, ``is_implicit``, :meth:`realization`,
+    (``n``, ``method``, ``params``, ``stores_precision``, :meth:`realization`,
     :meth:`eigenvalues`, :meth:`xtKx`, :meth:`trace`, :meth:`square_trace`).
 
     See Also
@@ -747,7 +784,7 @@ class MatrixKernel(Kernel):
     def from_matrix(
         cls,
         matrix: np.ndarray | sp.spmatrix,
-        is_inverse: bool = False,
+        is_precision: bool = False,
         method: str = "precomputed",
         **kwargs,
     ) -> MatrixKernel:
@@ -758,7 +795,7 @@ class MatrixKernel(Kernel):
         ----------
         matrix : np.ndarray or scipy.sparse matrix
             Kernel matrix (N, N) or its inverse (precision matrix).
-        is_inverse : bool, default False
+        is_precision : bool, default False
             If True, matrix is treated as the inverse (precision) matrix K^-1.
         method : str, default 'precomputed'
             The logical kernel method (e.g., 'car' for precision matrices).
@@ -773,9 +810,9 @@ class MatrixKernel(Kernel):
         Examples
         --------
         >>> K = np.array([[2, -1], [-1, 2]])  # kernel matrix
-        >>> kernel = MatrixKernel.from_matrix(K, is_inverse=False)
+        >>> kernel = MatrixKernel.from_matrix(K, is_precision=False)
         """
-        mode = "precomputed_inverse" if is_inverse else "precomputed"
+        mode = "precomputed_inverse" if is_precision else "precomputed"
         return cls(matrix, mode=mode, method=method, **kwargs)
 
     def _build_kernel(self):  # noqa: C901
@@ -849,7 +886,7 @@ class MatrixKernel(Kernel):
 
                 return 0.5 * (K_dense + K_dense.T)
             else:
-                self.is_implicit = True
+                self.stores_precision = True
                 if standardize:
                     M = self._standardize_precision(M)
                 return M
@@ -921,7 +958,7 @@ class MatrixKernel(Kernel):
                 M = I - rho * W_norm
 
                 if self.n > self._implicit_threshold:
-                    self.is_implicit = True
+                    self.stores_precision = True
                     if standardize:
                         M = self._standardize_precision(M)
                     return M
@@ -971,7 +1008,7 @@ class MatrixKernel(Kernel):
 
         return (
             f"<MatrixKernel method={self.method} mode={self._mode} n={self.n} "
-            f"implicit={self.is_implicit} data={data_desc} params={{ {self._format_params()} }}>"
+            f"implicit={self.stores_precision} data={data_desc} params={{ {self._format_params()} }}>"
         )
 
     def __str__(self):
@@ -981,7 +1018,7 @@ class MatrixKernel(Kernel):
             f"- Method: {self.method}",
             f"- Mode: {self._mode}",
             f"- Samples: {self.n}",
-            f"- Implicit: {self.is_implicit} (threshold={self._implicit_threshold})",
+            f"- Implicit: {self.stores_precision} (threshold={self._implicit_threshold})",
         ]
 
         # Add a brief data description

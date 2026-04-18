@@ -39,7 +39,7 @@ class TestMatrixKernel(unittest.TestCase):
         """Test Gaussian RBF kernel construction."""
         kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)
+        self.assertFalse(kernel.stores_precision)
 
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
@@ -54,7 +54,7 @@ class TestMatrixKernel(unittest.TestCase):
         """Test Matérn kernel construction."""
         kernel = MatrixKernel(self.coords, mode="coords", method="matern", bandwidth=1.0, nu=1.5)
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)
+        self.assertFalse(kernel.stores_precision)
 
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
@@ -69,7 +69,7 @@ class TestMatrixKernel(unittest.TestCase):
         """Test Moran's I adjacency kernel construction."""
         kernel = MatrixKernel(self.coords, mode="coords", method="moran", k_neighbors=4)
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)
+        self.assertFalse(kernel.stores_precision)
 
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
@@ -83,7 +83,7 @@ class TestMatrixKernel(unittest.TestCase):
         """Test Graph Laplacian kernel construction."""
         kernel = MatrixKernel(self.coords, mode="coords", method="graph_laplacian", k_neighbors=4)
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)
+        self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
 
@@ -91,7 +91,7 @@ class TestMatrixKernel(unittest.TestCase):
         """Test CAR kernel in explicit mode (small N)."""
         kernel = MatrixKernel(self.coords, mode="coords", method="car", k_neighbors=4, rho=0.9)
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)  # Small N, should be explicit
+        self.assertFalse(kernel.stores_precision)  # Small N, should be explicit
 
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
@@ -185,7 +185,7 @@ class TestMatrixKernel(unittest.TestCase):
         # Construct the kernel
         kernel = MatrixKernel(coords_large, mode="coords", method="car", k_neighbors=4, rho=0.9)
         self.assertEqual(kernel.n, n_large)
-        self.assertTrue(kernel.is_implicit)  # Should be implicit due to size
+        self.assertTrue(kernel.stores_precision)  # Should be implicit due to size
 
         true_K = kernel.realization()
         self.assertEqual(true_K.shape, (n_large, n_large))
@@ -227,7 +227,7 @@ class TestCARStandardize(unittest.TestCase):
             rho=0.85,
             standardize=True,
         )
-        self.assertFalse(kernel.is_implicit)  # small N explicit path
+        self.assertFalse(kernel.stores_precision)  # small N explicit path
         K = kernel.realization()
         diag = np.diag(K)
         self.assertEqual(K.shape, (self.n, self.n))
@@ -270,7 +270,7 @@ class TestImplicitTraceOperations(unittest.TestCase):
             k_neighbors=4,
             rho=0.85,
         )
-        self.assertTrue(kernel.is_implicit)
+        self.assertTrue(kernel.stores_precision)
         self.assertEqual(kernel.n, self.n)
 
         # Compute trace via implicit method (Hutchinson's trick)
@@ -295,7 +295,7 @@ class TestImplicitTraceOperations(unittest.TestCase):
             k_neighbors=4,
             rho=0.85,
         )
-        self.assertTrue(kernel.is_implicit)
+        self.assertTrue(kernel.stores_precision)
 
         # Compute square trace via implicit method
         implicit_sq_trace = kernel.square_trace()
@@ -371,7 +371,7 @@ class TestStandardizationPerformance(unittest.TestCase):
         start_sparse = time.time()
         kernel_sparse = MatrixKernel.from_matrix(
             M_sparse,
-            is_inverse=True,
+            is_precision=True,
             method="car",
             standardize=True,
         )
@@ -392,7 +392,7 @@ class TestStandardizationPerformance(unittest.TestCase):
             warnings.simplefilter("ignore", RuntimeWarning)
             kernel_dense = MatrixKernel.from_matrix(
                 M_dense,
-                is_inverse=True,
+                is_precision=True,
                 method="car",
                 standardize=True,
             )
@@ -456,12 +456,12 @@ class TestKernelUtilities(unittest.TestCase):
     def test_from_matrix_precomputed_and_inverse(self):
         """from_matrix should support precomputed kernels and precision matrices."""
         K = np.array([[2.0, -1.0], [-1.0, 2.0]])
-        kernel_pre = MatrixKernel.from_matrix(K, is_inverse=False)
+        kernel_pre = MatrixKernel.from_matrix(K, is_precision=False)
         np.testing.assert_allclose(kernel_pre.realization(), K, rtol=1e-12)
 
         # Singular precision triggers pseudo-inverse path
         M = np.array([[1.0, 0.0], [0.0, 0.0]])
-        kernel_inv = MatrixKernel.from_matrix(M, is_inverse=True, method="car", standardize=True)
+        kernel_inv = MatrixKernel.from_matrix(M, is_precision=True, method="car", standardize=True)
         K_inv = kernel_inv.realization()
         self.assertEqual(K_inv.shape, (2, 2))
         self.assertTrue(np.allclose(K_inv, K_inv.T, rtol=1e-12))

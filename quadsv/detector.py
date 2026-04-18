@@ -68,63 +68,57 @@ def _qstat_worker(
     """
     results = []
 
-    # Process in chunks (e.g., 64 features at a time)
-    BATCH_SIZE = chunk_size
-    # n_features is the number of features in THIS worker's chunk
     n_features = len(feature_indices)
-
     mu = null_params["mean_Q"]
     sigma = np.sqrt(null_params["var_Q"])
+    # Fast path: pass sparse X_batch + (means, stds) straight into the kernel's
+    # sparsity-preserving standardized quadratic form. Avoids the (N, batch) dense
+    # copy that the old path allocated just to subtract the per-column mean.
+    use_sparse_fastpath = hasattr(kernel_obj, "xtKx_standardized")
 
-    for start in range(0, n_features, BATCH_SIZE):
-        end = min(start + BATCH_SIZE, n_features)
-
-        # 1. Determine Indices
-        # 'local_slice' is for indexing X_csc (which is already a subset/chunk)
+    for start in range(0, n_features, chunk_size):
+        end = min(start + chunk_size, n_features)
         local_slice = slice(start, end)
-
-        # 'batch_global_indices' is for looking up global metadata (means, stds, names)
         batch_global_indices = feature_indices[start:end]
 
-        # 2. Extract Batch: Convert sparse subset to dense (N, batch_size)
-        # We index X_csc using LOCAL indices (0..chunk_size), not global IDs
-        X_batch = X_csc[:, local_slice].toarray()
-
-        # 3. Standardize Batch using GLOBAL statistics
         b_means = means[batch_global_indices]
         b_stds = stds[batch_global_indices]
-
-        # Prevent division by zero
         valid_mask = b_stds > 1e-9
 
-        Z_batch = np.zeros_like(X_batch)
-        # Broadcasting: (N, M) - (M,) / (M,)
-        if np.any(valid_mask):
-            Z_batch[:, valid_mask] = (X_batch[:, valid_mask] - b_means[valid_mask]) / b_stds[
-                valid_mask
-            ]
-
-        # 4. Vectorized Q-test
-        if return_pval:
-            Q_batch, P_batch = spatial_q_test(
-                Z_batch, kernel_obj, null_params, return_pval=True, is_standardized=True
+        if use_sparse_fastpath:
+            X_batch_sp = X_csc[:, local_slice]
+            Q_batch = np.atleast_1d(
+                kernel_obj.xtKx_standardized(X_batch_sp, b_means, b_stds)
+            )
+            # xtKx_standardized already returns 0.0 for std<=0 columns.
+            P_batch = (
+                _pvals_from_null(Q_batch, null_params)
+                if return_pval
+                else np.full(Q_batch.shape, np.nan)
             )
         else:
-            Q_batch = spatial_q_test(
-                Z_batch, kernel_obj, null_params, return_pval=False, is_standardized=True
-            )
-            P_batch = np.full(Q_batch.shape, np.nan)
+            # Fallback (e.g. raw-matrix "kernel"): densify and z-score explicitly.
+            X_batch = X_csc[:, local_slice].toarray()
+            Z_batch = np.zeros_like(X_batch)
+            if np.any(valid_mask):
+                Z_batch[:, valid_mask] = (
+                    X_batch[:, valid_mask] - b_means[valid_mask]
+                ) / b_stds[valid_mask]
+            if return_pval:
+                Q_batch, P_batch = spatial_q_test(
+                    Z_batch, kernel_obj, null_params, return_pval=True, is_standardized=True
+                )
+            else:
+                Q_batch = spatial_q_test(
+                    Z_batch, kernel_obj, null_params, return_pval=False, is_standardized=True
+                )
+                P_batch = np.full(np.shape(Q_batch), np.nan)
+            Q_batch = np.atleast_1d(Q_batch)
+            P_batch = np.atleast_1d(P_batch)
 
-        # Ensure outputs are arrays even if batch size is 1
-        Q_batch = np.atleast_1d(Q_batch)
-        P_batch = np.atleast_1d(P_batch)
-
-        # 5. Compute Z-scores relative to null distribution
         Z_scores = (Q_batch - mu) / sigma if sigma > 0 else np.zeros_like(Q_batch)
 
-        # 6. Pack results
         for k, global_idx in enumerate(batch_global_indices):
-            # If the feature had 0 variance, force null results
             if not valid_mask[k]:
                 res = {"Feature": names[global_idx], "Q": 0.0, "P_value": 1.0, "Z_score": 0.0}
             else:
@@ -137,6 +131,38 @@ def _qstat_worker(
             results.append(res)
 
     return results
+
+
+def _pvals_from_null(Q: np.ndarray, null_params: dict) -> np.ndarray:
+    """Apply the configured null approximation to a pre-computed Q vector.
+
+    Used by the sparse fast path in :func:`_qstat_worker`, where the quadratic
+    form has already been computed via
+    :meth:`~quadsv.kernels.MatrixKernel.xtKx_standardized` and only the p-value
+    stage remains. Mirrors the dispatch logic in
+    :func:`quadsv.statistics.spatial_q_test`.
+    """
+    from scipy.stats import chi2 as _chi2
+
+    method = null_params.get("method", "welch")
+    if method == "welch":
+        g = null_params["scale_g"]
+        d = null_params["df_h"]
+        return _chi2.sf(Q / g, df=d)
+    if method == "clt":
+        mu = null_params["mean_Q"]
+        var = null_params["var_Q"]
+        if var <= 0:
+            return np.ones_like(Q, dtype=float)
+        z = (Q - mu) / np.sqrt(var)
+        return _chi2.sf(z**2, df=1)
+    if method == "liu":
+        from quadsv.statistics import _DELTA, liu_sf
+
+        lambs = np.asarray(null_params["eigenvalues"], dtype=float)
+        lambs = lambs[np.abs(lambs) > _DELTA]
+        return np.array([liu_sf(float(q), lambs) for q in Q])
+    return np.ones_like(Q, dtype=float)
 
 
 # optimized R-stat worker with pre-computed K@Y
@@ -186,83 +212,79 @@ def _rstat_worker_chunked(
     results = []
     sigma = np.sqrt(null_params["var_R"])
 
-    # 1. Extract and standardize Y chunk.
-    # spatial_r_test standardizes both X and Y (subtracts means, divides by
-    # stds), which destroys sparsity, so each per-pair-chunk slice has to be
-    # dense. This is still only `chunk_size` columns at a time — a small
-    # (N, chunk_size) block — not the full AnnData.
-    Y_chunk = X_csc[:, y_chunk_indices].toarray()  # (N, n_y)
+    # Slice X and Y blocks as *sparse* — no densification for standardization.
+    # The only unavoidable densification is ``K @ Y_block`` for kernels whose
+    # apply is naturally dense (LU solve / BLAS matmul); done once per Y-chunk.
+    Y_block = X_csc[:, y_chunk_indices]  # (N, n_y) sparse
+    X_block = X_csc[:, x_indices]  # (N, n_x) sparse
+
     y_means = means[y_chunk_indices]
     y_stds = stds[y_chunk_indices]
+    x_means = means[x_indices]
+    x_stds = stds[x_indices]
     y_valid = y_stds > 1e-9
+    x_valid = x_stds > 1e-9
 
-    Zy_chunk = np.zeros_like(Y_chunk)
-    if np.any(y_valid):
-        Zy_chunk[:, y_valid] = (Y_chunk[:, y_valid] - y_means[y_valid]) / y_stds[y_valid]
-
-    # 2. Pre-compute K @ Zy_chunk (ONCE for entire chunk)
-    # Handle implicit vs explicit kernels
-    if hasattr(kernel_obj, "is_implicit") and kernel_obj.is_implicit:
-        # Implicit solve: M^-1 @ Zy_chunk
-        if sp.issparse(kernel_obj._K):
-            from scipy.sparse.linalg import splu
-
-            if kernel_obj._lu is None:
-                kernel_obj._lu = splu(kernel_obj._K.tocsc())
-            KZy_chunk = kernel_obj._lu.solve(Zy_chunk)
-        else:
-            from scipy.linalg import lu_factor, lu_solve
-
-            if kernel_obj._lu is None:
-                kernel_obj._lu = lu_factor(kernel_obj._K)
-            KZy_chunk = lu_solve(kernel_obj._lu, Zy_chunk)
+    if hasattr(kernel_obj, "_apply_K_dense") and hasattr(kernel_obj, "_K_column_sums"):
+        # Sparse-preserving cross R-test.
+        # R[i,j] = (x_i - μx[i])ᵀ K (y_j - μy[j]) / (σx[i] σy[j])
+        #        = ( x_iᵀ K y_j - μx[i]·K_sumᵀy_j - μy[j]·K_sumᵀx_i
+        #            + μx[i]·μy[j]·K_total ) / (σx[i]·σy[j])
+        # Every term is computed from sparse X / Y blocks and the kernel's
+        # cached (K·1, 1ᵀK1) moments.
+        K_sum, K_total = kernel_obj._K_column_sums()  # (N,), scalar
+        KY = kernel_obj._apply_K_dense(Y_block.toarray())  # (N, n_y) dense, once
+        R_raw = np.asarray(X_block.T @ KY)  # (n_x, n_y) sparse.T @ dense
+        ksum_x = np.asarray(X_block.T @ K_sum).ravel()  # (n_x,)
+        ksum_y = np.asarray(Y_block.T @ K_sum).ravel()  # (n_y,)
+        R_corrected = (
+            R_raw
+            - x_means[:, None] * ksum_y[None, :]
+            - y_means[None, :] * ksum_x[:, None]
+            + np.outer(x_means, y_means) * K_total
+        )
+        sx = np.where(x_valid, x_stds, 1.0)
+        sy = np.where(y_valid, y_stds, 1.0)
+        R_block = R_corrected / (sx[:, None] * sy[None, :])
+        R_block[~x_valid, :] = 0.0
+        R_block[:, ~y_valid] = 0.0
     else:
-        # Explicit kernel
-        KZy_chunk = kernel_obj._K.dot(Zy_chunk)  # (N, n_y)
+        # Fallback for raw matrices without the Kernel helpers: old dense path.
+        Y_dense = Y_block.toarray()
+        Zy = np.zeros_like(Y_dense)
+        if np.any(y_valid):
+            Zy[:, y_valid] = (Y_dense[:, y_valid] - y_means[y_valid]) / y_stds[y_valid]
+        KZy = (
+            kernel_obj.dot(Zy) if hasattr(kernel_obj, "dot") else np.asarray(kernel_obj @ Zy)
+        )
+        X_dense = X_block.toarray()
+        Zx = np.zeros_like(X_dense)
+        if np.any(x_valid):
+            Zx[:, x_valid] = (X_dense[:, x_valid] - x_means[x_valid]) / x_stds[x_valid]
+        R_block = Zx.T @ KZy  # (n_x, n_y)
 
-    # 3. Process all X features against this Y chunk
-    # n_x = len(x_indices)
-    # n_y = len(y_chunk_indices)
+    # Vectorized p-value / z-score stage
+    if return_pval and sigma > 0:
+        Z_scores_block = R_block / sigma
+        P_block = 2 * norm.sf(np.abs(Z_scores_block))
+    else:
+        Z_scores_block = np.full_like(R_block, np.nan)
+        P_block = np.full_like(R_block, np.nan)
 
-    for x_idx in x_indices:
-        # Extract X feature
-        x_col = X_csc[:, x_idx].toarray().flatten()  # (N,)
-
-        # Standardize X
-        x_mean = means[x_idx]
-        x_std = stds[x_idx]
-
-        if x_std > 1e-9:
-            zx = (x_col - x_mean) / x_std
-        else:
-            zx = np.zeros_like(x_col)
-
-        # Compute R for all pairs (x, y_i) in chunk
-        # R_i = zx^T @ (K @ zy_i) = sum(zx * (K@zy_i))
-        # Broadcast: (N,) * (N, n_y) -> (N, n_y), then sum(axis=0) -> (n_y,)
-        R_batch = np.sum(zx[:, np.newaxis] * KZy_chunk, axis=0)  # (n_y,)
-
-        # P-values (Normal approximation)
-        if return_pval:
-            Z_scores = R_batch / sigma if sigma > 0 else np.zeros_like(R_batch)
-            P_batch = 2 * norm.sf(np.abs(Z_scores))
-        else:
-            Z_scores = np.full_like(R_batch, np.nan)
-            P_batch = np.full_like(R_batch, np.nan)
-
-        # Pack results for this X feature
-        for y_idx, y_global_idx in enumerate(y_chunk_indices):
-            name_x = names[x_idx]
-            name_y = names[y_global_idx]
-
-            res = {
-                "Feature_1": name_x,
-                "Feature_2": name_y,
-                "R": R_batch[y_idx],
-                "Z_score": Z_scores[y_idx],
-                "P_value": P_batch[y_idx],
-            }
-            results.append(res)
+    # Emit one result row per (x, y) pair — preserves the original output shape
+    # (y_idx iterates local positions within this chunk).
+    for xi, x_idx in enumerate(x_indices):
+        name_x = names[x_idx]
+        for yj, y_global_idx in enumerate(y_chunk_indices):
+            results.append(
+                {
+                    "Feature_1": name_x,
+                    "Feature_2": names[y_global_idx],
+                    "R": R_block[xi, yj],
+                    "Z_score": Z_scores_block[xi, yj],
+                    "P_value": P_block[xi, yj],
+                }
+            )
 
     return results
 
@@ -288,7 +310,7 @@ class DetectorIrregular(Detector):
     --------
     1. **Construct** with kernel method + backend + kernel hyperparameters.
     2. **Setup** with :meth:`setup_data` passing the :class:`anndata.AnnData`
-       plus spatial source (``coordinates_key`` in ``obsm``, or
+       plus spatial source (``obsm_key`` in ``obsm``, or
        ``obsp_key`` for precomputed adjacency / distance).
     3. **Compute** with :meth:`compute_qstat` / :meth:`compute_rstat`.
 
@@ -399,7 +421,7 @@ class DetectorIrregular(Detector):
         self,
         adata: Any,
         *,
-        coordinates_key: str = "spatial",
+        obsm_key: str = "spatial",
         obsp_key: str | None = None,
         is_distance: bool = False,
         min_cells: int = 1,
@@ -411,9 +433,9 @@ class DetectorIrregular(Detector):
         Parameters
         ----------
         adata : :class:`anndata.AnnData`
-            Input container. Must have ``adata.obsm[coordinates_key]`` (unless
+            Input container. Must have ``adata.obsm[obsm_key]`` (unless
             ``obsp_key`` is provided instead).
-        coordinates_key : str, default ``'spatial'``
+        obsm_key : str, default ``'spatial'``
             Key in ``adata.obsm`` holding ``(n_obs, 2)`` spatial coordinates.
             Used when ``obsp_key`` is ``None``.
         obsp_key : str, optional
@@ -450,92 +472,63 @@ class DetectorIrregular(Detector):
                 **self.kernel_params_,
             )
         else:
-            self._build_kernel_from_obsm(coordinates_key=coordinates_key)
+            self._build_kernel_from_obsm(obsm_key=obsm_key)
 
         self._data_ready = True
         return self
 
-    def _build_kernel_from_obsm(self, coordinates_key: str = "spatial") -> None:
-        """Build the kernel over ``adata.obsm[coordinates_key]`` using the
+    # ------------------------------------------------------------------
+    # Auto-tuning helpers
+    # ------------------------------------------------------------------
+    def _auto_chunk_size(self, budget_bytes: int = 2**28) -> int:
+        """Resolve ``chunk_size='auto'`` to a concrete integer.
+
+        Heuristic: each column in a worker batch costs roughly ``4 · N · 8`` bytes
+        (dense Z block + ``K @ Z`` scratch + incidentals). Target a per-batch
+        footprint of ``budget_bytes`` (default 256 MB) and clip the result to
+        ``[16, 512]``.
+        """
+        n = self.n or 1
+        per_col = max(1, 4 * n * 8)
+        return int(np.clip(budget_bytes // per_col, 16, 512))
+
+    def _build_kernel_from_obsm(self, obsm_key: str = "spatial") -> None:
+        """Build the kernel over ``adata.obsm[obsm_key]`` using the
         backend / method / params selected at construction. Called from
         :meth:`setup_data`.
         """
-        if coordinates_key not in self.adata.obsm:
+        if obsm_key not in self.adata.obsm:
             raise KeyError(
-                f"adata.obsm has no key '{coordinates_key}'; "
+                f"adata.obsm has no key '{obsm_key}'; "
                 f"available: {list(self.adata.obsm.keys())}."
             )
-        coords = np.asarray(self.adata.obsm[coordinates_key], dtype=np.float64)
+        coords = np.asarray(self.adata.obsm[obsm_key], dtype=np.float64)
         if coords.ndim != 2 or coords.shape[1] != 2:
             raise ValueError(
-                f"adata.obsm['{coordinates_key}'] must be (n_obs, 2), got {coords.shape}."
+                f"adata.obsm['{obsm_key}'] must be (n_obs, 2), got {coords.shape}."
             )
         if coords.shape[0] != self.n:
             raise ValueError(
                 f"coords shape {coords.shape} inconsistent with adata.shape=({self.n}, ...)."
             )
 
+        logger.info(
+            "Building %s %sKernel over %d spots...",
+            self.kernel_method_,
+            "Matrix" if self.backend_ == "matrix" else "NUFFT",
+            self.n,
+        )
         if self.backend_ == "matrix":
-            self._build_matrix_kernel_from_coords(
+            self.kernel_ = MatrixKernel.from_coordinates(
                 coords, method=self.kernel_method_, **self.kernel_params_
             )
         else:
-            logger.info("Building %s NUFFTKernel over %d spots...", self.kernel_method_, self.n)
             self.kernel_ = NUFFTKernel(
                 coords=coords, method=self.kernel_method_, **self.kernel_params_
             )
             # NUFFTKernel resolves its own params (including any None-sentinel
             # auto-infers); snapshot them back so kernel_params_ reflects reality.
             self.kernel_params_ = dict(self.kernel_.params)
-
-    def _build_matrix_kernel_from_coords(
-        self, coords: np.ndarray, method: str = "car", **kernel_params: Any
-    ) -> None:
-        """
-        Builds a spatial kernel from an array of coordinates.
-
-        Constructs distance-based kernel matrix from sample coordinates using
-        specified method. Updates ``self.kernel_`` and ``self.kernel_params_``.
-
-        Parameters
-        ----------
-        coords : np.ndarray
-            Coordinate array of shape (n_samples, n_dims). Typically 2D spatial coordinates.
-        method : str, default 'car'
-            Kernel construction method. Must be one of: 'gaussian', 'matern', 'moran',
-            'graph_laplacian', 'car'.
-        kernel_params : dict, optional
-            Additional kernel-specific parameters (e.g., bandwidth, rho, k_neighbors, nu).
-
-        Raises
-        ------
-        ValueError
-            If method not in available kernels or coordinate shape mismatch.
-
-        Notes
-        -----
-        Common parameters by method:
-
-        - gaussian: bandwidth (float, default 1.0)
-        - matern: bandwidth (float, default 1.0), nu (float, default 1.5)
-        - moran: k_neighbors (int, default 10)
-        - graph_laplacian: k_neighbors (int, default 10)
-        - car: rho (float in [0, 1), default 0.9), k_neighbors (int, default 10)
-
-        Examples
-        --------
-        >>> coords = np.random.randn(1000, 2)
-        >>> detector.setup_data(adata)  # builds kernel from adata.obsm["spatial"]
-        """
-        coords = np.asarray(coords)
-        if coords.shape[0] != self.n:
-            raise ValueError(
-                f"Coordinate shape {coords.shape} does not match adata shape ({self.n},)."
-            )
-
-        logger.info("Building %s kernel from coordinates (n_samples=%d)...", method, self.n)
-        # kernel_params already carries defaults merged in __init__.
-        self.kernel_ = MatrixKernel.from_coordinates(coords, method=method, **kernel_params)
 
     def _build_kernel_from_obsp(  # noqa: C901
         self, key: str, is_distance: bool = False, method: str = "car", **kernel_params: Any
@@ -560,7 +553,7 @@ class DetectorIrregular(Detector):
         # If the user says 'precomputed', they imply the matrix IS the kernel K
         if method == "precomputed":
             logger.info("Using obsp['%s'] directly as kernel matrix (n_samples=%d)...", key, self.n)
-            self.kernel_ = MatrixKernel.from_matrix(matrix, is_inverse=False)
+            self.kernel_ = MatrixKernel.from_matrix(matrix, is_precision=False)
             self.kernel_params_ = kernel_params
             self.kernel_method_ = method
             return
@@ -584,7 +577,7 @@ class DetectorIrregular(Detector):
                 if sp.issparse(matrix):
                     matrix = matrix.toarray()  # Gaussian usually requires dense
                 K = np.exp(-(matrix**2) / (2 * bw**2))
-                self.kernel_ = MatrixKernel.from_matrix(K, is_inverse=False)
+                self.kernel_ = MatrixKernel.from_matrix(K, is_precision=False)
                 self.kernel_params_ = {"bandwidth": bw}
             elif method == "matern":
                 from scipy.special import gamma, kv
@@ -599,7 +592,7 @@ class DetectorIrregular(Detector):
                 factor = (np.sqrt(2 * nu) * dists) / bw
                 K = (2 ** (1 - nu) / gamma(nu)) * (factor**nu) * kv(nu, factor)
                 np.fill_diagonal(K, 1.0)
-                self.kernel_ = MatrixKernel.from_matrix(K, is_inverse=False)
+                self.kernel_ = MatrixKernel.from_matrix(K, is_precision=False)
                 self.kernel_params_ = {"bandwidth": bw, "nu": nu}
             else:
                 raise ValueError(f"Method {method} not supported for distance matrices.")
@@ -636,14 +629,14 @@ class DetectorIrregular(Detector):
             if method == "moran":
                 # Already symmetric and normalized
                 K = W_norm
-                self.kernel_ = MatrixKernel.from_matrix(K, is_inverse=False)
+                self.kernel_ = MatrixKernel.from_matrix(K, is_precision=False)
                 self.kernel_params_ = {}
 
             elif method == "graph_laplacian":
                 # K = I - W_norm
                 I = sp.eye(self.n, format="csr")
                 K = I - W_norm
-                self.kernel_ = MatrixKernel.from_matrix(K, is_inverse=False)
+                self.kernel_ = MatrixKernel.from_matrix(K, is_precision=False)
                 self.kernel_params_ = {}
 
             elif method == "car":
@@ -655,11 +648,11 @@ class DetectorIrregular(Detector):
                 I = sp.eye(self.n, format="csc")
                 M = I - rho * W_norm  # M is the inverse of K
 
-                # We pass M and set is_inverse=True. MatrixKernel will handle
+                # We pass M and set is_precision=True. MatrixKernel will handle
                 # standardizing the precision to ensure diag(K)=1 if requested.
                 self.kernel_ = MatrixKernel.from_matrix(
                     M,
-                    is_inverse=True,
+                    is_precision=True,
                     method="car",
                     rho=rho,
                     standardize=standardize,
@@ -793,7 +786,8 @@ class DetectorIrregular(Detector):
         n_jobs: int = -1,
         layer: str | None = None,
         return_pval: bool = True,
-        chunk_size: int = 64,
+        chunk_size: int | str = "auto",
+        show_progress: bool = True,
     ) -> pd.DataFrame:
         """
         Compute univariate spatial Q-statistic for selected features.
@@ -814,10 +808,13 @@ class DetectorIrregular(Detector):
             If source='var', which layer to use (e.g., 'raw', 'log1p'). If None, uses .X.
         return_pval : bool, default True
             If True, returns p-values and BH-corrected p-values. If False, returns Q only.
-        chunk_size : int, default 64
-            Number of features to process in each internal batch for vectorization.
-            If n_jobs > 1, each worker processes chunk_size features at a time.
-            May be adjusted for memory/speed tradeoff.
+        chunk_size : int or ``'auto'``, default ``'auto'``
+            Number of features each worker densifies at once (inner batch). ``'auto'``
+            targets ~256 MB per batch using :meth:`_auto_chunk_size`, yielding
+            ``chunk_size ≈ clip(16, 512, 256 MB / (4 · N · 8 B))``. Override with an
+            integer when memory is tight or you want deterministic batching.
+        show_progress : bool, default True
+            Show a tqdm progress bar over worker chunks.
 
         Returns
         -------
@@ -855,11 +852,14 @@ class DetectorIrregular(Detector):
         """
 
         # 1. Ensure Kernel Exists
-        if self.kernel_ is None:
-            raise ValueError(
-                "Kernel not initialized. Call .build_kernel(), "
-                "Call .setup_data(adata, ...) first."
-            )
+        self._require_setup()
+
+        # Resolve chunk_size='auto' once up front so downstream paths (incl.
+        # NUFFT dispatch) see a concrete integer.
+        if isinstance(chunk_size, str):
+            if chunk_size != "auto":
+                raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
+            chunk_size = self._auto_chunk_size()
 
         # NUFFT backend takes a different code path (no dense K, different
         # null rescaling). Dispatch early and delegate.
@@ -871,6 +871,7 @@ class DetectorIrregular(Detector):
                 layer=layer,
                 return_pval=return_pval,
                 chunk_size=chunk_size,
+                show_progress=show_progress,
             )
 
         # 2. Compute Null Distribution
@@ -893,7 +894,17 @@ class DetectorIrregular(Detector):
         indices = np.arange(n_feats)
         chunks = np.array_split(indices, max(n_jobs * 4, 1))
 
-        logger.info("Testing %d features using %d cores...", n_feats, n_jobs)
+        logger.info(
+            "Testing %d features (n_jobs=%d, chunk_size=%d)...", n_feats, n_jobs, chunk_size
+        )
+
+        chunk_iter = chunks
+        if show_progress:
+            chunk_iter = tqdm(
+                chunks,
+                desc=f"Q ({self.kernel_method_})",
+                bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
+            )
 
         results_list = Parallel(n_jobs=n_jobs)(
             delayed(_qstat_worker)(
@@ -907,11 +918,7 @@ class DetectorIrregular(Detector):
                 return_pval,
                 chunk_size,
             )
-            for chunk_idxs in tqdm(
-                chunks,
-                desc=f"Q ({self.kernel_method_})",
-                bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
-            )
+            for chunk_idxs in chunk_iter
         )
 
         # 5. Aggregate Results
@@ -934,7 +941,8 @@ class DetectorIrregular(Detector):
         n_jobs: int = -1,
         layer: str | None = None,
         return_pval: bool = True,
-        chunk_size: int = 64,
+        chunk_size: int | str = "auto",
+        show_progress: bool = True,
     ) -> pd.DataFrame:
         """
         Compute bivariate spatial R-statistic (cross-spatial correlation) for feature pairs.
@@ -958,9 +966,12 @@ class DetectorIrregular(Detector):
             If source='var', which layer to use (e.g., 'raw', 'log1p'). If None, uses .X.
         return_pval : bool, default True
             If True, returns p-values and BH-corrected p-values. If False, returns R only.
-        chunk_size : int, default 64
-            Number of Y features to process together, pre-computing K@Y_chunk.
-            Larger values use more memory but fewer K matrix multiplications.
+        chunk_size : int or ``'auto'``, default ``'auto'``
+            Number of Y features to batch together when pre-computing ``K @ Y_chunk``.
+            ``'auto'`` uses :meth:`_auto_chunk_size` (~256 MB per batch target);
+            integer values override the heuristic.
+        show_progress : bool, default True
+            Show a tqdm progress bar over the Y-chunk loop.
 
         Returns
         -------
@@ -1006,8 +1017,12 @@ class DetectorIrregular(Detector):
         ...     n_jobs=-1
         ... )
         """
-        if self.kernel_ is None:
-            raise ValueError("Kernel not initialized.")
+        self._require_setup()
+
+        if isinstance(chunk_size, str):
+            if chunk_size != "auto":
+                raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
+            chunk_size = self._auto_chunk_size()
 
         if self.backend_ == "nufft":
             return self._compute_rstat_nufft(
@@ -1018,6 +1033,7 @@ class DetectorIrregular(Detector):
                 layer=layer,
                 return_pval=return_pval,
                 chunk_size=chunk_size,
+                show_progress=show_progress,
             )
 
         # 1. Compute Null Params for R
@@ -1099,10 +1115,14 @@ class DetectorIrregular(Detector):
                 names,
                 return_pval,
             )
-            for y_chunk in tqdm(
-                y_chunks,
-                desc=f"R ({self.kernel_method_})",
-                bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
+            for y_chunk in (
+                tqdm(
+                    y_chunks,
+                    desc=f"R ({self.kernel_method_})",
+                    bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
+                )
+                if show_progress
+                else y_chunks
             )
         )
 
@@ -1172,6 +1192,7 @@ class DetectorIrregular(Detector):
         layer: str | None,
         return_pval: bool,
         chunk_size: int,
+        show_progress: bool = True,
     ) -> pd.DataFrame:
         """NUFFT dispatch for :meth:`compute_qstat`. Builds null params once and
         delegates per-feature work to :func:`quadsv.spatial_q_test`."""
@@ -1251,9 +1272,11 @@ class DetectorIrregular(Detector):
 
         idx_all = np.arange(n_feats)
         batches = [idx_all[i : i + chunk_size] for i in range(0, n_feats, chunk_size)]
+        batch_iter = (
+            tqdm(batches, desc=f"Q (NUFFT, {self.kernel_method_})") if show_progress else batches
+        )
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_batch)(batch)
-            for batch in tqdm(batches, desc=f"Q (NUFFT, {self.kernel_method_})")
+            delayed(_batch)(batch) for batch in batch_iter
         )
         flat = [row for chunk in results for row in chunk]
         df = pd.DataFrame(flat)
@@ -1272,6 +1295,7 @@ class DetectorIrregular(Detector):
         layer: str | None,
         return_pval: bool,
         chunk_size: int,
+        show_progress: bool = True,
     ) -> pd.DataFrame:
         """NUFFT dispatch for :meth:`compute_rstat`."""
         kernel = self.kernel_
@@ -1303,7 +1327,10 @@ class DetectorIrregular(Detector):
 
         results: list[dict[str, Any]] = []
         y_chunks = [slice(i, i + chunk_size) for i in range(0, len(names_y), chunk_size)]
-        for ysl in tqdm(y_chunks, desc=f"R (NUFFT, {self.kernel_method_})"):
+        y_iter = (
+            tqdm(y_chunks, desc=f"R (NUFFT, {self.kernel_method_})") if show_progress else y_chunks
+        )
+        for ysl in y_iter:
             Y_block = np.asarray(X_y[:, ysl].todense())
             Y_std = (Y_block - means_y[ysl][None, :]) / np.where(stds_y[ysl] > 0, stds_y[ysl], 1.0)[
                 None, :
