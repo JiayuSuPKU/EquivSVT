@@ -533,7 +533,7 @@ class ComparatorIrregular(_ComparatorBase):
                 )
             c = np.asarray(ad_s.obsm[obsm_key], dtype=np.float64)
             if c.ndim != 2 or c.shape[1] != 2:
-                raise ValueError(f"sample {i} obsm['{obsm_key}'] must be (N, 2), got {c.shape}.")
+                raise ValueError(f"sample {i} obsm['{obsm_key}'] must be (n, 2), got {c.shape}.")
             coords_list.append(c)
             if grid_shape is not None and spacing is not None:
                 gs_i = (int(grid_shape[0]), int(grid_shape[1]))

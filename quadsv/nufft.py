@@ -29,9 +29,9 @@ Dimensions:
 - ``(dy, dx)``: **physical** spacing per k-grid cell, same unit as the spatial coordinates
   after multiplying ``unit_scale``.
 - ``unit_scale``: multiplier that converts the input coordinates ``S`` to the same unit as
-  ``(dy, dx)`` (e.g., 0.35 if ``S`` are in pixels at 0.35 μm/pixel). Samples from differen slides
-  and platforms may ship coordinates in different units; this parameter harmonizes them onto
-  the same **physical** unit for the internal k-grid and all downstream spectra and tests.
+  ``(dy, dx)`` (e.g., 0.35 if ``S`` are in pixels at 0.35 μm/pixel). Samples from different
+  slides and platforms may ship coordinates in different units; this parameter harmonizes them
+  onto the same **physical** unit for the internal k-grid and all downstream spectra and tests.
 
 Vectors and matrices:
 
@@ -41,7 +41,7 @@ Vectors and matrices:
   ``λ(k) = F(K')(k)``.
 - ``U``: the ``n × n'`` type-2 NUFFT evaluation matrix; the band-limited
   approximation is ``K ≈ (1/n') · U · diag(λ) · Uᴴ``.
-- ``x̂ = Uᴴ x``: type-1 NUFFT of a length-``n`` signal onto the k-grid ``(ny, nx)`` (vectorized).
+- ``x̂ = Uᴴ x``: type-1 NUFFT of a length-``N`` signal onto the k-grid ``(ny, nx)`` (vectorized).
 
 """
 
@@ -89,7 +89,7 @@ def _infer_grid_from_coords(
 
     scaled = np.asarray(coords, dtype=np.float64) * float(unit_scale)
     if scaled.ndim != 2 or scaled.shape[1] != 2:
-        raise ValueError(f"coords must be (N, 2), got {scaled.shape}.")
+        raise ValueError(f"coords must be (n, 2), got {scaled.shape}.")
     L_y = float(scaled[:, 0].max() - scaled[:, 0].min()) * padding
     L_x = float(scaled[:, 1].max() - scaled[:, 1].min()) * padding
     if L_y <= 0 or L_x <= 0:
@@ -128,12 +128,12 @@ def power_spectrum_2d_nufft(
     Parameters
     ----------
     coords : np.ndarray
-        Non-uniform spatial coordinates, shape ``(N, 2)`` in the order
+        Non-uniform spatial coordinates, shape ``(n, 2)`` in the order
         ``(y, x)``. Values outside the physical domain implied by
         ``grid_shape`` and ``spacing`` are folded into ``[-π, π)`` by finufft.
     values : np.ndarray
-        Signal strengths at each coordinate. Shape ``(N,)`` for a single
-        feature, or ``(N, M)`` for ``M`` stacked features (e.g., genes) on the
+        Signal strengths at each coordinate. Shape ``(n,)`` for a single
+        feature, or ``(n, M)`` for ``M`` stacked features (e.g., genes) on the
         same coordinates. Real-valued; promoted to complex internally.
     grid_shape : tuple[int, int]
         ``(ny, nx)`` of the target uniform k-space grid. Match whatever grid
@@ -180,10 +180,10 @@ def power_spectrum_2d_nufft(
     (32, 32)
     """
     if coords.ndim != 2 or coords.shape[1] != 2:
-        raise ValueError(f"coords must have shape (N, 2), got {coords.shape}.")
+        raise ValueError(f"coords must have shape (n, 2), got {coords.shape}.")
     if values.shape[0] != coords.shape[0]:
         raise ValueError(
-            f"values first dim {values.shape[0]} must match coords N={coords.shape[0]}."
+            f"values first dim {values.shape[0]} must match coords n={coords.shape[0]}."
         )
 
     ny, nx = grid_shape
@@ -259,7 +259,7 @@ class NUFFTKernel(Kernel):
     :func:`quadsv.spatial_r_test` take against this kernel:
 
     - ``'spectral'`` (default): k-space Parseval via :meth:`xtKx` /
-      :meth:`xtKy`; null moments from the analytic N-point-scaled FFT
+      :meth:`xtKy`; null moments from the analytic n-point-scaled FFT
       spectrum.
     - ``'matmul'``: length-``n`` matrix product via :meth:`xtKx_matmul` /
       :meth:`Kx`; null moments from Hutchinson probes through ``K``.
@@ -474,7 +474,7 @@ class NUFFTKernel(Kernel):
         return (
             f"NUFFTKernel\n"
             f"- Method: {self.method}\n"
-            f"- N spots: {self.n}\n"
+            f"- Number of spots: {self.n}\n"
             f"- k-grid: {self.grid_shape} at spacing {self.spacing}\n"
             f"- Compute method: {self.compute_method}\n"
             f"- Params: {self.params}"
@@ -786,7 +786,7 @@ class NUFFTKernel(Kernel):
     # Null-moment estimators — analytic (Path A) and Hutchinson (Path B)
     # ------------------------------------------------------------------
     def _get_rvs_trace_cache(self, n_probes: int = 15) -> dict:
-        """Cache Hutchinson probes ``v ∈ {±1}^N`` and their ``K v`` images.
+        """Cache Hutchinson probes ``v ∈ {±1}^n`` and their ``K v`` images.
 
         Used by :meth:`trace` / :meth:`square_trace` with
         ``method='hutchinson'``. The probes are drawn from a seeded RNG
@@ -991,7 +991,7 @@ def _r_test_nufft(
         ``(n,)`` or ``(n, M)``.
     kernel : NUFFTKernel
     null_params : dict, optional
-        ``{'var_R': ...}`` in the N-point-operator units.
+        ``{'var_R': ...}`` in the n-point-operator units.
     return_pval : bool, default True
     is_standardized : bool, default False
     """

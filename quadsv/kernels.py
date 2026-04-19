@@ -81,15 +81,14 @@ class MatrixKernelBase(Kernel):
     """
     Concrete base for kernels backed by an explicit or implicit ``n × n`` matrix.
 
-    Subclass this when you want a custom way to **construct** ``K`` (e.g. a bespoke
+    Subclass this when you want a custom way to construct ``K`` (e.g. a bespoke
     function of coordinates, a learnt kernel, or an ad-hoc adjacency matrix) while
     inheriting every downstream primitive ready-to-use.
 
-    **What a subclass must provide.** Just one thing: an implementation of
-    :meth:`_build_kernel` that returns either the ``(n, n)`` kernel matrix
-    (dense ``np.ndarray`` or ``scipy.sparse``) or its precision matrix
-    ``M = K^{-1}``. If it returns a precision matrix, set
-    ``self.stores_precision = True`` *before* calling ``super().__init__``,
+    Subclasses must implement :meth:`_build_kernel` to return either the
+    ``(n, n)`` kernel matrix (dense ``np.ndarray`` or ``scipy.sparse``) or
+    its precision matrix ``M = K^{-1}``. If a precision matrix is returned,
+    set ``self.stores_precision = True`` before calling ``super().__init__``,
     or flip it inside ``_build_kernel`` while the buffer is being built; the
     :class:`MatrixKernel` CAR / precomputed-inverse path shows a worked example.
 
@@ -107,7 +106,7 @@ class MatrixKernelBase(Kernel):
     Attributes
     ----------
     n : int
-        Number of observations.
+        Number of observations (``n``).
     method : str
         Kernel method name (free-form; used only for diagnostics / provenance).
     params : dict
@@ -196,12 +195,12 @@ class MatrixKernelBase(Kernel):
 
     def realization(self) -> np.ndarray:
         """
-        Return the realized (N, N) kernel matrix.
+        Return the realized (n, n) kernel matrix.
 
         Returns
         -------
         np.ndarray
-            Dense (N, N) kernel matrix.
+            Dense (n, n) kernel matrix.
 
         Notes
         -----
@@ -218,7 +217,7 @@ class MatrixKernelBase(Kernel):
 
     def eigenvalues(self, k: int | None = None) -> np.ndarray:
         """
-        Compute the k largest eigenvalues of the kernel matrix.
+        Compute the ``k`` largest eigenvalues of the kernel matrix.
 
         Results are cached internally; subsequent calls reuse the cached spectrum
         when it contains enough values to satisfy the request.
@@ -231,7 +230,7 @@ class MatrixKernelBase(Kernel):
         Returns
         -------
         np.ndarray
-            Eigenvalues sorted in descending order, shape (k,) or (n,).
+            Eigenvalues sorted in descending order, shape ``(k,)`` or ``(n,)``.
         """
         if self._spectrum is not None:
             # check if we have enough cached (spectrum is always descending)
@@ -267,10 +266,10 @@ class MatrixKernelBase(Kernel):
     # Internal primitive: compute ``K @ x`` as a dense 2D block
     # ------------------------------------------------------------------
     def _apply_K_dense(self, x_2d: np.ndarray) -> np.ndarray:
-        """Compute ``K @ x_2d`` and return a dense ``(N, M)`` ndarray.
+        """Compute ``K @ x_2d`` and return a dense ``(n, M)`` ndarray.
 
         Used as the shared kernel of :meth:`Kx`, :meth:`xtKx`, :meth:`xtKy`.
-        Expects a dense ``(N, M)`` input; sparse inputs must be densified by
+        Expects a dense ``(n, M)`` input; sparse inputs must be densified by
         the caller. Implicit precision solves go through a cached LU; explicit
         kernels dispatch to the underlying sparse / dense matmul.
         """
@@ -294,7 +293,7 @@ class MatrixKernelBase(Kernel):
 
     @staticmethod
     def _to_2d(x: np.ndarray | sp.spmatrix) -> tuple[Any, bool]:
-        """Normalize ``x`` to a 2D ``(N, M)`` (sparse or dense) and report whether
+        """Normalize ``x`` to a 2D ``(n, M)`` (sparse or dense) and report whether
         the caller passed a 1D vector. Does *not* densify sparse input.
         """
         if sp.issparse(x):
@@ -302,7 +301,7 @@ class MatrixKernelBase(Kernel):
                 # scipy rarely exposes 1D sparse; reshape if someone slipped it in.
                 return x.reshape(-1, 1), True
             if x.shape[1] == 1 and x.shape[0] > 1:
-                return x, False  # already a (N, 1) sparse column
+                return x, False  # already a (n, 1) sparse column
             return x, False
         arr = np.asarray(x)
         if arr.ndim == 1:
@@ -320,14 +319,14 @@ class MatrixKernelBase(Kernel):
         Parameters
         ----------
         x : np.ndarray or scipy.sparse matrix
-            ``(N,)`` or ``(N, M)``. Sparse inputs are densified internally because
+            ``(n,)`` or ``(n, M)``. Sparse inputs are densified internally because
             ``scipy.linalg.lu_solve`` / ``splu.solve`` require dense RHS and
             ``K @ x`` typically returns dense anyway.
 
         Returns
         -------
         np.ndarray
-            ``(N,)`` if ``x`` was 1D, else ``(N, M)``.
+            ``(n,)`` if ``x`` was 1D, else ``(n, M)``.
 
         Examples
         --------
@@ -351,7 +350,7 @@ class MatrixKernelBase(Kernel):
         Ky: np.ndarray,
         n_cols: int,
     ) -> float | np.ndarray:
-        """Given sparse-or-dense ``x`` (``(N, M)``) and dense ``Ky`` (``(N, M)``),
+        """Given sparse-or-dense ``x`` (``(n, M)``) and dense ``Ky`` (``(n, M)``),
         return the paired diagonal ``sum(x_i * Ky_i, axis=0)``.
 
         Preserves sparsity of ``x`` — ``x.multiply(Ky).sum(axis=0)`` iterates only
@@ -369,14 +368,14 @@ class MatrixKernelBase(Kernel):
         """
         Bilinear form ``x^T K y`` (paired diagonal for batched inputs).
 
-        For ``(N, M)`` batches returns ``(M,)`` — the diagonal of ``X^T K Y``
+        For ``(n, M)`` batches returns ``(M,)`` — the diagonal of ``X^T K Y``
         in the same column order, matching :func:`quadsv.spatial_r_test`.
         Sparse ``x`` is preserved; only ``K @ y`` is densified.
 
         Parameters
         ----------
         x, y : np.ndarray or scipy.sparse matrix
-            ``(N,)`` or ``(N, M)`` (must share the M).
+            ``(n,)`` or ``(n, M)`` (must share the M).
 
         Returns
         -------
@@ -410,7 +409,7 @@ class MatrixKernelBase(Kernel):
         Parameters
         ----------
         x : np.ndarray or scipy.sparse matrix
-            ``(N,)`` or ``(N, M)``. Sparse ``x`` is preserved through the
+            ``(n,)`` or ``(n, M)``. Sparse ``x`` is preserved through the
             final ``x^T (K x)`` contraction — only the right side ``K @ x``
             needs a dense RHS for the solver / BLAS call.
 
@@ -438,7 +437,7 @@ class MatrixKernelBase(Kernel):
         if cache is not None:
             return cache
         ones = np.ones((self.n, 1))
-        K_sum = self._apply_K_dense(ones).ravel()  # (N,)
+        K_sum = self._apply_K_dense(ones).ravel()  # (n,)
         K_total = float(K_sum.sum())
         self._K_col_sum_cache = (K_sum, K_total)
         return self._K_col_sum_cache
@@ -462,7 +461,7 @@ class MatrixKernelBase(Kernel):
         Parameters
         ----------
         x : np.ndarray or scipy.sparse matrix
-            ``(N,)`` or ``(N, M)``. Columns correspond to features.
+            ``(n,)`` or ``(n, M)``. Columns correspond to features.
         means, stds : np.ndarray
             ``(M,)`` per-feature mean and std (``ddof=1`` to match
             :func:`quadsv.statistics.spatial_q_test`).
@@ -483,7 +482,7 @@ class MatrixKernelBase(Kernel):
                 f"inconsistent with x columns ({n_cols})."
             )
 
-        K_sum, K_total = self._K_column_sums()  # K_sum: (N,), K_total: scalar
+        K_sum, K_total = self._K_column_sums()  # K_sum: (n,), K_total: scalar
 
         # Term 1: x^T K x — reuse xtKx (handles sparse/dense uniformly).
         q_raw = np.atleast_1d(np.asarray(self.xtKx(x_2d))).astype(float)
@@ -546,7 +545,7 @@ class MatrixKernelBase(Kernel):
         Compute the trace of the kernel matrix Tr(K).
 
         For implicit kernels, uses Hutchinson's trick with random ±1 vectors
-        for efficient O(N) estimation instead of O(N³) eigendecomposition.
+        for efficient O(n) estimation instead of O(n³) eigendecomposition.
 
         Returns
         -------
@@ -579,7 +578,7 @@ class MatrixKernelBase(Kernel):
         Compute the trace of the squared kernel Tr(K²).
 
         Used for variance estimation in statistical tests. For implicit kernels,
-        uses Hutchinson's trick for efficient O(N) estimation.
+        uses Hutchinson's trick for efficient O(n) estimation.
 
         Returns
         -------
@@ -610,7 +609,7 @@ class MatrixKernelBase(Kernel):
         """Compute diagonal of K = M^{-1} using batched solves to save memory.
 
         For sparse M, uses batched splu solves on chunks of the identity matrix.
-        This avoids allocating a dense N x N inverse matrix.
+        This avoids allocating a dense n x n inverse matrix.
         """
         n = self.n
 
@@ -741,8 +740,8 @@ class MatrixKernel(MatrixKernelBase):
         ----------
         data : np.ndarray or scipy.sparse matrix
             Input data whose interpretation is controlled by ``mode``:
-            an ``(N, D)`` coordinate array when ``mode='coords'``, an ``(N, N)``
-            kernel matrix when ``mode='precomputed'``, or an ``(N, N)`` precision
+            an ``(n, D)`` coordinate array when ``mode='coords'``, an ``(n, n)``
+            kernel matrix when ``mode='precomputed'``, or an ``(n, n)`` precision
             matrix when ``mode='precomputed_inverse'``.
         mode : {'coords', 'precomputed', 'precomputed_inverse'}, default 'coords'
             How ``data`` should be interpreted.
@@ -836,7 +835,7 @@ class MatrixKernel(MatrixKernelBase):
         Parameters
         ----------
         coords : np.ndarray
-            Array of spatial coordinates, shape (N, D).
+            Array of spatial coordinates, shape (n, D).
         method : str, default 'matern'
             Kernel method. Must be one of 'gaussian', 'matern', 'moran', 'graph_laplacian', 'car'.
         **kwargs : dict
@@ -876,9 +875,9 @@ class MatrixKernel(MatrixKernelBase):
         Parameters
         ----------
         matrix : np.ndarray or scipy.sparse matrix
-            Kernel matrix (N, N) or its inverse (precision matrix).
+            Kernel matrix ``(n, n)`` or its inverse (precision matrix).
         is_precision : bool, default False
-            If True, matrix is treated as the inverse (precision) matrix K^-1.
+            If True, ``matrix`` is treated as the inverse (precision) matrix ``K^{-1}``.
         method : str, default 'precomputed'
             The logical kernel method (e.g., 'car' for precision matrices).
         **kwargs : dict

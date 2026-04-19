@@ -224,14 +224,16 @@ def spatial_q_test(  # noqa: C901
     Parameters
     ----------
     Xn : np.ndarray or scipy.sparse matrix
-        Input data array of shape (N,) for single feature or (N, M) for M features.
+        Input data array of shape (n,) for single feature or (n, M) for M features.
         Can be dense numpy array or sparse matrix (CSC/CSR format recommended).
         Should be standardized before calling unless is_standardized=True.
     kernel : Kernel
-        Pre-constructed kernel object (Kernel, MatrixKernel, FFTKernel, or scipy.sparse matrix).
+        Pre-constructed :class:`~quadsv.Kernel` (``MatrixKernel`` / ``FFTKernel`` /
+        ``NUFFTKernel``) or a raw dense / sparse kernel matrix.
     null_params : dict, optional
-        Pre-computed null distribution parameters from compute_null_params().
-        If None, computed on-the-fly using 'welch' method (only accurate when kernel is positive semi-definite).
+        Pre-computed null distribution parameters from :func:`compute_null_params`.
+        If None, computed on-the-fly using the ``'welch'`` method (only accurate when
+        the kernel is positive semi-definite).
     return_pval : bool, default True
         If True, returns (Q, pval) tuple; if False, returns Q only.
     is_standardized : bool, default False
@@ -260,7 +262,7 @@ def spatial_q_test(  # noqa: C901
     Under H₀: data is spatially independent.
     Under H₁: mean-shift present.
 
-    The test statistic Q = x^T K x where K is the kernel matrix,
+    The test statistic ``Q = xᵀ K x`` where ``K`` is the kernel matrix
     follows approximately a chi-squared mixture distribution:
 
     .. math::
@@ -449,15 +451,15 @@ def spatial_r_test(  # noqa: C901
     """
     Bivariate spatial R-test for correlation between two spatial variables.
 
-    Computes the pairwise spatial statistic R = x^T K y, testing for spatial
+    Computes the pairwise spatial statistic ``R = xᵀ K y``, testing for spatial
     association between two variables. Supports batch processing.
 
     Parameters
     ----------
     Xn : np.ndarray
-        First input data vector or batch. Shape (N,) or (N, M).
+        First input data vector or batch. Shape (n,) or (n, M).
     Yn : np.ndarray
-        Second input data vector or batch. Shape (N,) or (N, M) matching Xn.
+        Second input data vector or batch. Shape (n,) or (n, M) matching Xn.
     kernel : Kernel
         Pre-constructed kernel object compatible with xtKy() method.
     null_params : dict, optional
@@ -485,7 +487,7 @@ def spatial_r_test(  # noqa: C901
     -----
     Under H₀: the two variables are spatially uncorrelated.
 
-    The test statistic R = x^T K y is approximated as Normal under the null:
+    The test statistic ``R = xᵀ K y`` is approximated as Normal under the null:
 
     .. math::
        R \\sim N(0, \\text{Trace}(K^2))

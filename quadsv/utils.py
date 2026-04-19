@@ -59,7 +59,7 @@ def get_rect_coords(n_rows: int = 32, n_cols: int = 32) -> tuple[np.ndarray, tup
     Returns
     -------
     coords : np.ndarray
-        Grid coordinates of shape (N, 2) where N = n_rows × n_cols.
+        Grid coordinates of shape (n, 2) where n = n_rows × n_cols.
         Format: [[y₀, x₀], [y₁, x₁], ...] in row-major order.
     grid_dims : tuple of int
         (n_rows, n_cols) - the grid dimensions.
@@ -101,7 +101,7 @@ def get_visium_coords(n_rows: int = 78, n_cols: int = 64) -> tuple[np.ndarray, t
     Returns
     -------
     coords : np.ndarray
-        Array indices of shape (N, 2) where N ≤ n_rows × n_cols.
+        Array indices of shape (n, 2) where n ≤ n_rows × n_cols.
         Format: [[row₀, col₀], [row₁, col₁], ...].
         Rows are 0-indexed. Columns follow Visium array layout (even/odd offset).
     grid_dims : tuple of int
@@ -150,13 +150,13 @@ def convert_visium_to_physical(coords: np.ndarray) -> np.ndarray:
     Parameters
     ----------
     coords : np.ndarray
-        Visium array indices of shape (N, 2) in format [[row, col], ...].
+        Visium array indices of shape (n, 2) in format [[row, col], ...].
         Rows and columns are integers as returned by get_visium_coords().
 
     Returns
     -------
     phys_coords : np.ndarray
-        Physical coordinates of shape (N, 2) in format [[y, x], ...].
+        Physical coordinates of shape (n, 2) in format [[y, x], ...].
 
     Notes
     -----
@@ -207,14 +207,14 @@ def compute_torus_distance_matrix(
     Parameters
     ----------
     phys_coords : np.ndarray
-        Physical coordinates of shape (N, 2) in format [[y, x], ...].
+        Physical coordinates of shape (n, 2) in format [[y, x], ...].
     domain_dims : tuple of float
         Physical dimensions of the periodic domain: (height, width).
 
     Returns
     -------
     dist_matrix : np.ndarray
-        Pairwise distance matrix of shape (N, N) where entry [i, j] is the
+        Pairwise distance matrix of shape (n, n) where entry [i, j] is the
         shortest Euclidean distance between points i and j on the torus.
 
     Notes
@@ -241,7 +241,7 @@ def compute_torus_distance_matrix(
     domain_h, domain_w = domain_dims
 
     # Compute absolute differences (broadcasting)
-    # Shape: (N, N)
+    # Shape: (n, n)
     diff_y = np.abs(phys_coords[:, None, 0] - phys_coords[None, :, 0])
     diff_x = np.abs(phys_coords[:, None, 1] - phys_coords[None, :, 1])
 

@@ -439,7 +439,7 @@ class FFTKernel(Kernel):
         Compute the quadratic form x^T K x efficiently using FFT.
 
         Uses Parseval's theorem to compute the result in frequency domain
-        for O(N log N) complexity instead of O(N²).
+        for O(n log n) complexity instead of O(n²).
 
         Parameters
         ----------
@@ -488,7 +488,7 @@ class FFTKernel(Kernel):
             if nx % 2 == 0:
                 weighted_power -= np.sum(weighted[:, -1, :], axis=0)
 
-        # FFT is unnormalized: Parseval requires 1/N normalization
+        # FFT is unnormalized: Parseval requires 1/n normalization
         Q = weighted_power / (ny * nx)
 
         # Unwrap if M=1
@@ -496,7 +496,7 @@ class FFTKernel(Kernel):
 
     def Kx(self, x: np.ndarray) -> np.ndarray:
         """
-        Apply the kernel operator to ``x`` via FFT in O(N log N).
+        Apply the kernel operator to ``x`` via FFT in O(n log n).
 
         Implemented as ``K x = F^{-1}(λ · F(x))`` where ``λ`` is the full
         eigenvalue spectrum on the torus. The result is returned on the
@@ -652,8 +652,8 @@ def _q_test_fft(  # noqa: C901
     FFT-accelerated spatial Q-test for grid data.
 
     Tests whether a spatial variable exhibits significant clustering or dispersion
-    using FFT-based spectral decomposition. This function provides fast approximation
-    via Parseval's theorem compared to dense kernel methods.
+    using FFT-based spectral decomposition. Parseval's theorem reduces the
+    quadratic form to an elementwise spectral weighting.
 
     Parameters
     ----------
@@ -686,17 +686,17 @@ def _q_test_fft(  # noqa: C901
 
     Raises
     ------
-    AssertionError
-        If Xn spatial dimensions don't match kernel shape (ny, nx).
+    ValueError
+        If ``Xn`` spatial dimensions don't match kernel shape ``(ny, nx)``.
 
     Notes
     -----
     Under H₀: data is spatially independent.
     Under H₁: mean-shift present.
 
-    Computationally: Q = z^T K z where z is standardized data.
+    Computationally: ``Q = zᵀ K z`` where ``z`` is standardized data.
     Uses FFT via Parseval's theorem to compute :math:`Q = \\sum_{i,j} \\lambda_{i,j} Z^2_{i,j}`
-    in O(N log N) time instead of O(N³) dense methods.
+    in O(n' log n') time instead of O(n'³) dense methods.
 
     For Moran's I kernel (which has negative eigenvalues), uses Normal approximation
     based on asymptotic theory. For other kernels, uses Liu's chi-squared mixture approximation.
@@ -834,7 +834,7 @@ def _r_test_fft(
     FFT-accelerated spatial R-test (bivariate) for grid data.
 
     Tests for spatial co-variation between two variables using the specified kernel.
-    Computes the cross-variance statistic R = x^T K y via FFT-based spectral methods.
+    Computes the cross-variance statistic ``R = xᵀ K y`` via FFT-based spectral methods.
 
     Parameters
     ----------
@@ -867,8 +867,8 @@ def _r_test_fft(
 
     Raises
     ------
-    AssertionError
-        If Xn and Yn shapes don't match, or spatial dimensions don't match kernel.
+    ValueError
+        If ``Xn`` and ``Yn`` shapes don't match, or spatial dimensions don't match kernel.
 
     Notes
     -----
@@ -881,6 +881,7 @@ def _r_test_fft(
     P-value calculation assumes asymptotic Normality with variance estimated from
     kernel trace: :math:`\\text{Var}(R) \\approx \\text{Trace}(K^2) / N^2`.
     Returns two-tailed probability: :math:`p = 2 P(|Z| > |\\text{z-score}|)`.
+
     Examples
     --------
     >>> ny, nx = 32, 32
@@ -915,7 +916,7 @@ def _r_test_fft(
     # 2. Compute R = Zx^T K Zy via FFT (Parseval's theorem)
     R_sum = _spectral_cross_product(Zx, Zy, kernel, ny, nx)
 
-    # Apply Parseval's 1/N normalization
+    # Apply Parseval's 1/n normalization
     n_pixels = ny * nx
     R = R_sum / n_pixels
 

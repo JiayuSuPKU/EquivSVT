@@ -34,15 +34,12 @@ try:
 except (ImportError, PackageNotFoundError):
     __version__ = "0.1.0"
 
-# Layer 1: Kernels
 from quadsv.comparators import ComparatorGrid, ComparatorIrregular
 from quadsv.detector import DetectorIrregular
 from quadsv.detector_grid import DetectorGrid
 from quadsv.fft import FFTKernel
 from quadsv.kernels import Kernel, MatrixKernel, MatrixKernelBase
 from quadsv.nufft import NUFFTKernel
-
-# Layer 2: Statistical tests (single dispatching entry point per test)
 from quadsv.statistics import spatial_q_test, spatial_r_test
 
 __all__ = [

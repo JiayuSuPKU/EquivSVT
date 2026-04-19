@@ -72,7 +72,7 @@ def _qstat_worker(
     mu = null_params["mean_Q"]
     sigma = np.sqrt(null_params["var_Q"])
     # Fast path: pass sparse X_batch + (means, stds) straight into the kernel's
-    # sparsity-preserving standardized quadratic form. Avoids the (N, batch) dense
+    # sparsity-preserving standardized quadratic form. Avoids the (n, batch) dense
     # copy that the old path allocated just to subtract the per-column mean.
     use_sparse_fastpath = hasattr(kernel_obj, "xtKx_standardized")
 
@@ -192,7 +192,8 @@ def _rstat_worker_chunked(
     kernel_obj : Kernel
         Pre-constructed kernel object.
     null_params : dict
-        Pre-computed null parameters: 'mean_R', 'var_R'.
+        Pre-computed null parameters: ``'var_R'`` (``trace(K²)``). ``'mean_R'``
+        is implicitly 0.
     means : np.ndarray
         Feature means for standardization.
     stds : np.ndarray
@@ -213,8 +214,8 @@ def _rstat_worker_chunked(
     # Slice X and Y blocks as *sparse* — no densification for standardization.
     # The only unavoidable densification is ``K @ Y_block`` for kernels whose
     # apply is naturally dense (LU solve / BLAS matmul); done once per Y-chunk.
-    Y_block = X_csc[:, y_chunk_indices]  # (N, n_y) sparse
-    X_block = X_csc[:, x_indices]  # (N, n_x) sparse
+    Y_block = X_csc[:, y_chunk_indices]  # (n, n_y) sparse
+    X_block = X_csc[:, x_indices]  # (n, n_x) sparse
 
     y_means = means[y_chunk_indices]
     y_stds = stds[y_chunk_indices]
@@ -230,8 +231,8 @@ def _rstat_worker_chunked(
         #            + μx[i]·μy[j]·K_total ) / (σx[i]·σy[j])
         # Every term is computed from sparse X / Y blocks and the kernel's
         # cached (K·1, 1ᵀK1) moments.
-        K_sum, K_total = kernel_obj._K_column_sums()  # (N,), scalar
-        KY = kernel_obj._apply_K_dense(Y_block.toarray())  # (N, n_y) dense, once
+        K_sum, K_total = kernel_obj._K_column_sums()  # (n,), scalar
+        KY = kernel_obj._apply_K_dense(Y_block.toarray())  # (n, n_y) dense, once
         R_raw = np.asarray(X_block.T @ KY)  # (n_x, n_y) sparse.T @ dense
         ksum_x = np.asarray(X_block.T @ K_sum).ravel()  # (n_x,)
         ksum_y = np.asarray(Y_block.T @ K_sum).ravel()  # (n_y,)
@@ -293,8 +294,8 @@ class DetectorIrregular(Detector):
     Supports two backends:
 
     - ``backend='matrix'`` — :class:`~quadsv.MatrixKernel` (dense or implicit
-      sparse-precision, auto-selected by ``N``). Good up to ~10⁴ spots.
-    - ``backend='nufft'`` — :class:`~quadsv.NUFFTKernel`, ``O(N log N)`` quadratic
+      sparse-precision, auto-selected by ``n``). Good up to ~10⁴ spots.
+    - ``backend='nufft'`` — :class:`~quadsv.NUFFTKernel`, ``O(n log n)`` quadratic
       forms on arbitrary point sets. Recommended for ≥ 10⁴ spots.
 
     The core test statistics are:
@@ -479,7 +480,7 @@ class DetectorIrregular(Detector):
     def _auto_chunk_size(self, budget_bytes: int = 2**28) -> int:
         """Resolve ``chunk_size='auto'`` to a concrete integer.
 
-        Heuristic: each column in a worker batch costs roughly ``4 · N · 8`` bytes
+        Heuristic: each column in a worker batch costs roughly ``4 · n · 8`` bytes
         (dense Z block + ``K @ Z`` scratch + incidentals). Target a per-batch
         footprint of ``budget_bytes`` (default 256 MB) and clip the result to
         ``[16, 512]``.
@@ -805,7 +806,7 @@ class DetectorIrregular(Detector):
         chunk_size : int or ``'auto'``, default ``'auto'``
             Number of features each worker densifies at once (inner batch). ``'auto'``
             targets ~256 MB per batch using :meth:`_auto_chunk_size`, yielding
-            ``chunk_size ≈ clip(16, 512, 256 MB / (4 · N · 8 B))``. Override with an
+            ``chunk_size ≈ clip(16, 512, 256 MB / (4 · n · 8 B))``. Override with an
             integer when memory is tight or you want deterministic batching.
         show_progress : bool, default True
             Show a tqdm progress bar over worker chunks.
@@ -989,9 +990,10 @@ class DetectorIrregular(Detector):
         Under H₀: features are spatially independent.
         Under H₁: significant spatial co-clustering or co-dispersion.
 
-        Different than quadsv.statistics.spatial_r_test, this function always returns R-statistics of
-        all requested feature pairs in the symmetric mode (features_y = None). Thus, for features_x = [A, B, C],
-        the output will contain (A, A), (A, B), (A, C), (B, A), (B, B), (B, C), (C, A), (C, B), (C, C).
+        Unlike :func:`quadsv.statistics.spatial_r_test`, this method always returns R-statistics
+        for all requested feature pairs in the symmetric mode (``features_y=None``). For
+        ``features_x=[A, B, C]``, the output contains
+        ``(A, A), (A, B), (A, C), (B, A), (B, B), (B, C), (C, A), (C, B), (C, C)``.
 
         P-value calculation uses a normal approximation based on Tr(K²) and is not
         configurable through this method. For finer control over the null model,
@@ -1195,7 +1197,7 @@ class DetectorIrregular(Detector):
         The NUFFT Q-test targets the n-point operator ``K``; moments come from
         :meth:`NUFFTKernel.trace` / :meth:`~NUFFTKernel.square_trace` /
         :meth:`~NUFFTKernel.eigenvalues` (all already n-point-scaled by the
-        kernel). No ``N / (ny · nx)`` rescaling at the caller.
+        kernel). No ``n / (ny · nx)`` rescaling at the caller.
         """
         kernel = self.kernel_
         null_params: dict[str, float | np.ndarray] | None = None
