@@ -1,34 +1,48 @@
 """
-Non-uniform FFT (NUFFT) power spectra for spatial omics on irregular grids.
+Non-uniform FFT (NUFFT) spectra, kernel and spatial tests for irregular data
 
 When data sit on a regular grid (e.g., a rasterized Visium slide),
 :func:`quadsv.power_spectrum_2d` computes :math:`|\\hat{x}(k)|^2` with a plain
-2D FFT. For data whose spatial coordinates are **irregular** — e.g., Slide-seq,
-Stereo-seq, or a Visium slide read straight from
-``adata.obsm['spatial']`` without rasterization — we need a non-uniform FFT
-instead. :func:`power_spectrum_2d_nufft` evaluates
+2D FFT. For data whose spatial coordinates are **irregular** — e.g.,
+imaging-based in situ platforms, Slide-seq, or a Visium slide read straight
+from ``adata.obsm['spatial']`` without rasterization — :func:`power_spectrum_2d_nufft`
+evaluates the type-1 NUFFT
 
 .. math::
 
-   \\hat c(k_y, k_x) = \\sum_{j=1}^N c_j \\,
+   \\hat c(k_y, k_x) = \\sum_{j=1}^{n} c_j \\,
        \\exp\\!\\bigl[-i(k_y\\,y_j + k_x\\,x_j)\\bigr]
 
-at the same uniform ``(ny, nx)`` k-space grid that :func:`power_spectrum_2d`
-would produce for a rasterized input of the same physical extent, then returns
-:math:`|\\hat c|^2` with the standard scipy FFT layout (DC at ``[0, 0]``).
-Anything downstream — :func:`quadsv.multisample.radial_bin_spectrum`,
-:class:`quadsv.ComparatorIrregular` — works
-identically.
+on the same uniform ``(ny, nx)`` k-space grid that :func:`power_spectrum_2d`
+would produce for a rasterized input of the same physical extent, and returns
+:math:`|\\hat c|^2` in the scipy FFT layout (DC at ``[0, 0]``). Anything
+downstream — :func:`quadsv.multisample.radial_bin_spectrum`,
+:class:`quadsv.ComparatorIrregular` — works identically.
 
-Per-sample unit handling
-------------------------
+Notation (shared across this module)
+------------------------------------
 
-Samples in different studies may ship coordinates in different units (μm,
-Visium full-resolution pixels, etc.). :func:`power_spectrum_2d_nufft` accepts a
-``unit_scale`` multiplier that converts each sample's coordinate axis to the
-*common* physical unit chosen for ``spacing``. The common frequency grid is
-``1 / (ny·dy)`` by ``1 / (nx·dx)`` cycles per unit length, so spectra from
-slides with different shapes and pixel conventions become directly comparable.
+Dimensions:
+
+- ``n``: number of spots (on the irregular grid).
+- ``(ny, nx)``: internal uniform k-grid dimensions; ``n' = ny · nx``.
+- ``(dy, dx)``: **physical** spacing per k-grid cell, same unit as the spatial coordinates
+  after multiplying ``unit_scale``.
+- ``unit_scale``: multiplier that converts the input coordinates ``S`` to the same unit as
+  ``(dy, dx)`` (e.g., 0.35 if ``S`` are in pixels at 0.35 μm/pixel). Samples from differen slides
+  and platforms may ship coordinates in different units; this parameter harmonizes them onto
+  the same **physical** unit for the internal k-grid and all downstream spectra and tests.
+
+Vectors and matrices:
+
+- ``S``: the ``n × 2`` spatial coordinate matrix of the irregular points, ordered as ``(y, x)``.
+- ``K``: the ``n × n`` translation-invariant kernel at the irregular points.
+- ``K'``: the ``n' × n'`` grid kernel with FFT eigenvalues
+  ``λ(k) = F(K')(k)``.
+- ``U``: the ``n × n'`` type-2 NUFFT evaluation matrix; the band-limited
+  approximation is ``K ≈ (1/n') · U · diag(λ) · Uᴴ``.
+- ``x̂ = Uᴴ x``: type-1 NUFFT of a length-``n`` signal onto the k-grid ``(ny, nx)`` (vectorized).
+
 """
 
 from __future__ import annotations
@@ -37,6 +51,8 @@ import logging
 
 import finufft
 import numpy as np
+import scipy.fft
+import scipy.sparse as sp
 from scipy.stats import chi2, norm
 
 from quadsv.fft import FFTKernel
@@ -101,14 +117,13 @@ def power_spectrum_2d_nufft(
     center_coords: bool = True,
 ) -> np.ndarray:
     """
-    Compute the 2D power spectrum :math:`|\\hat{c}(k)|^2` of one or more non-uniform
-    spatial signals via a type-1 NUFFT.
+    Compute the 2D power spectrum via type-1 NUFFT
 
-    The output has the same ``(ny, n_kx)`` layout as
-    :func:`quadsv.power_spectrum_2d` with ``fft_solver='fft2'`` — DC at
-    ``[0, 0]``, Nyquist at ``[ny/2, nx/2]`` (when dimensions are even) — so the
-    result is a drop-in substitute for the rasterized spectrum in the rest of
-    the pipeline.
+    This function computes the power spectrum :math:`P(k) = |\\hat{c}(k)|^2` of
+    one or more non-uniform spatial signals via a type-1 NUFFT.
+    The output has the same ``(ny, nx)`` layout as
+    :func:`quadsv.fft.power_spectrum_2d` with ``fft_solver='fft2'``: DC at
+    ``[0, 0]``, Nyquist at ``[ny/2, nx/2]`` (when dimensions are even).
 
     Parameters
     ----------
@@ -221,79 +236,106 @@ def power_spectrum_2d_nufft(
 # ---------------------------------------------------------------------------
 
 
-class NUFFTKernel:
+class NUFFTKernel(Kernel):
     """
-    Translation-invariant spatial kernel over **irregular** 2D coordinates,
-    evaluated via a type-1 NUFFT and the FFTKernel eigenvalue spectrum.
+    Spatial kernel over **irregular** 2D coordinates evaluated via NUFFTs.
 
-    Parallels :class:`quadsv.FFTKernel`, which requires a regular grid.
-    ``NUFFTKernel`` lets ``xtKx``-style quadratic forms (the Q-test primitive)
-    and matrix-vector products ``Kz`` run in ``O(N log N + K log K)`` on
-    arbitrary point sets — a 1,000× speed-up over the dense ``MatrixKernel``
-    at N ≳ 10⁴.
+    Parallels :class:`quadsv.fft.FFTKernel` (which requires a regular grid) and
+    implements the :class:`~quadsv.Kernel` interface so it plugs into
+    :func:`quadsv.statistics.spatial_q_test` /
+    :func:`quadsv.statistics.spatial_r_test` the same way.
 
-    The kernel is diagonalized on a common uniform k-grid shared with an
-    internal :class:`FFTKernel`. Quadratic forms use the Parseval identity
+    The band-limited approximation of the ``n × n`` irregular-point operator is
+    ``K ≈ (1/n') · U · diag(λ) · Uᴴ``, where ``U`` is the ``n × n'`` type-2
+    NUFFT matrix and ``λ = F(K')`` is the grid kernel's spectrum. Under this
+    approximation, Parseval's identity gives the fast quadratic form
+    ``xᵀ K x = (1/n') Σ_k λ(k) |x̂(k)|²`` with ``x̂ = Uᴴ x`` (a single type-1 NUFFT).
+    The matrix-vector primitive :meth:`Kx` uses the companion two-shot NUFFT
+    ``K z = (1/n') · U · (λ ⊙ Uᴴ z)`` and serves as
+    the base for the Hutchinson null estimators and the bipartite R-test cross
+    matrix.
 
-    .. math::
-       x^T K x = \\frac{1}{L_y L_x} \\sum_k \\lambda(k)\\,|\\hat x_\\mathrm{NUFFT}(k)|^2
+    :attr:`compute_method` selects which path :func:`quadsv.spatial_q_test` /
+    :func:`quadsv.spatial_r_test` take against this kernel:
 
-    where :math:`\\lambda(k)` is the eigenvalue spectrum precomputed by the
-    internal ``FFTKernel`` and :math:`\\hat x_\\mathrm{NUFFT}` is the type-1
-    non-uniform FFT of the signal at the user-supplied coordinates. The result
-    is exact (up to NUFFT precision ``eps``) on a regular grid and matches the
-    dense Euclidean quadratic form to within the usual torus-boundary-condition
-    band (~2%) on irregular points.
+    - ``'spectral'`` (default): k-space Parseval via :meth:`xtKx` /
+      :meth:`xtKy`; null moments from the analytic N-point-scaled FFT
+      spectrum.
+    - ``'matmul'``: length-``n`` matrix product via :meth:`xtKx_matmul` /
+      :meth:`Kx`; null moments from Hutchinson probes through ``K``.
+
+    Both paths agree to NUFFT precision (``eps``) on a regular grid
+    and to ~1 – 2 % on irregular points.
 
     Parameters
     ----------
     coords : np.ndarray
-        Spot coordinates of shape ``(N, 2)`` in order ``(y, x)``.
+        Spot coordinates of shape ``(n, 2)`` in order ``(y, x)``.
     grid_shape : tuple[int, int], optional
         ``(ny, nx)`` of the internal uniform k-grid. If ``None`` (default),
         auto-inferred from ``coords``: the grid is sized to cover the bounding
-        box and to resolve the sampling Nyquist set by the median nearest-
-        neighbor distance (fully coordinate-driven, kernel-agnostic). Override
-        only when you know you need a finer or coarser grid.
+        box and to resolve the sampling Nyquist set by the median
+        nearest-neighbor distance (fully coordinate-driven, kernel-agnostic).
+        Override only when you know you need a finer or coarser grid.
     spacing : tuple[float, float], optional
         ``(dy, dx)`` physical spacing per k-grid cell (same unit as ``coords``
         after ``unit_scale``). If ``None`` (default), auto-inferred alongside
         ``grid_shape``. When both are supplied, users are responsible for
-        ensuring ``grid_shape * spacing`` covers the coordinate extent.
-    method : str, default 'matern'
-        Kernel method, forwarded to :class:`FFTKernel`.
+        ensuring ``ny · dy``, ``nx · dx`` covers the coordinate extent.
+    method : str, default ``'matern'``
+        Kernel method forwarded to :class:`FFTKernel`. One of ``'gaussian'``,
+        ``'matern'``, ``'moran'``, ``'graph_laplacian'``, ``'car'``.
     unit_scale : float, default 1.0
         Multiplier applied to ``coords`` so they share the same unit as
-        ``spacing`` (e.g., 0.35 if coords are in pixels at 0.35 μm/pixel).
+        ``spacing`` (e.g. ``0.35`` if coords are in pixels at 0.35 μm/pixel).
     oversample : float, default 2.0
-        Auto-grid oversampling factor above the sampling Nyquist. Only used
+        Auto-grid oversampling factor above the sampling Nyquist. Used only
         when ``grid_shape`` / ``spacing`` are auto-derived. Larger values give
         a finer k-grid (more accurate, slower); 2.0 is safe for all tested
         kernels.
     eps : float, default 1e-6
-        NUFFT tolerance.
+        NUFFT tolerance forwarded to finufft.
     workers : int, optional
-        Not currently used (reserved for future finufft parallelism).
+        Forwarded to :mod:`scipy.fft` (used by :meth:`Kx_grid`) and reserved
+        for future finufft parallelism. ``None`` uses the SciPy default.
+    compute_method : {``'spectral'``, ``'matmul'``}, default ``'spectral'``
+        Which of the two paths :func:`quadsv.spatial_q_test` /
+        :func:`quadsv.spatial_r_test` use. Stored on the instance as a mutable
+        attribute so callers can flip it between calls without rebuilding.
     **kwargs
-        Kernel-method-specific parameters (``bandwidth``, ``nu``, ``rho``,
-        ``neighbor_degree``) forwarded to :class:`FFTKernel`.
+        Method-specific kernel hyperparameters (``bandwidth``, ``nu``,
+        ``rho``, ``neighbor_degree``) forwarded to the internal
+        :class:`FFTKernel`.
 
     Attributes
     ----------
     coords : np.ndarray
-        Original coordinates.
+        Original ``(n, 2)`` coordinates.
     n : int
-        Number of spots.
+        Number of spots ``n``.
     grid_shape : tuple[int, int]
-        Internal k-grid shape.
+        Internal k-grid shape ``(ny, nx)``.
     spacing : tuple[float, float]
-        Physical spacing per k-grid cell.
+        Physical spacing per k-grid cell ``(dy, dx)``.
     method : str
-        Kernel method.
+        Kernel method name.
     params : dict
-        Resolved kernel parameters.
+        Resolved kernel hyperparameters (snapshot of the internal FFT kernel).
+    compute_method : str
+        Currently selected NUFFT path — mutable. One of:
+
+        - ``'spectral'`` (default, fast): k-space Parseval via
+          :meth:`xtKx` / :meth:`xtKy`; null moments from the analytic
+          n-point-scaled FFT spectrum.
+        - ``'matmul'``: full matrix product via
+          :meth:`xtKx_matmul` / :meth:`Kx`; null moments estimated by
+          Hutchinson probes.
+
+        Flip at any time between calls to swap paths without rebuilding.
+    workers : int or None
+        scipy.fft worker count used by :meth:`Kx_grid`.
     stores_precision : bool
-        Always ``False`` — NUFFTKernel never holds an N×N matrix.
+        Always ``False`` — NUFFTKernel never holds an ``n × n`` matrix.
     """
 
     _available_kernels = ["gaussian", "matern", "moran", "graph_laplacian", "car"]
@@ -308,11 +350,49 @@ class NUFFTKernel:
         oversample: float = 2.0,
         eps: float = 1e-6,
         workers: int | None = None,
+        compute_method: str = "spectral",
         **kwargs,
     ) -> None:
+        """Construct a translation-invariant kernel over irregular 2D coordinates.
+
+        See the class docstring for a full parameter / attribute reference;
+        in brief:
+
+        Parameters
+        ----------
+        coords : np.ndarray
+            ``(n, 2)`` spot coordinates in ``(y, x)`` order.
+        grid_shape, spacing : tuple or None
+            Internal k-grid shape and per-cell spacing. Both optional;
+            auto-inferred from ``coords`` when either is missing.
+        method : str, default ``'matern'``
+            Kernel method forwarded to the internal :class:`FFTKernel`.
+        unit_scale : float, default 1.0
+            Coord → physical-unit multiplier so ``coords * unit_scale`` is in
+            the same unit as ``spacing``.
+        oversample : float, default 2.0
+            Auto-grid oversampling above the sampling Nyquist.
+        eps : float, default 1e-6
+            NUFFT tolerance.
+        workers : int, optional
+            scipy.fft worker count used by :meth:`Kx_grid`.
+        compute_method : {``'spectral'``, ``'matmul'``}, default ``'spectral'``
+            Initial value for the mutable :attr:`compute_method` attribute
+            that selects the NUFFT path used by
+            :func:`quadsv.spatial_q_test` / :func:`quadsv.spatial_r_test`.
+        **kwargs
+            Method-specific kernel hyperparameters (``bandwidth``, ``nu``,
+            ``rho``, ``neighbor_degree``).
+
+        Raises
+        ------
+        ValueError
+            If ``coords`` has the wrong shape, ``method`` / ``compute_method``
+            is unknown, or ``grid_shape`` / ``spacing`` are invalid.
+        """
         coords = np.asarray(coords, dtype=np.float64)
         if coords.ndim != 2 or coords.shape[1] != 2:
-            raise ValueError(f"coords must be shape (N, 2), got {coords.shape}.")
+            raise ValueError(f"coords must be shape (n, 2), got {coords.shape}.")
         if method not in self._available_kernels:
             raise ValueError(f"method must be one of {self._available_kernels}, got '{method}'.")
 
@@ -349,6 +429,15 @@ class NUFFTKernel:
         self._eps: float = float(eps)
         self.workers: int | None = workers
         self.stores_precision: bool = False
+        if compute_method not in ("spectral", "matmul"):
+            raise ValueError(
+                f"compute_method must be 'spectral' or 'matmul', got {compute_method!r}."
+            )
+        # Public mutable attribute — description lives in the class
+        # docstring's Attributes section so Sphinx AutoAPI picks it up
+        # cleanly. Mutable: flip between 'spectral' / 'matmul' at any time
+        # to swap NUFFT paths without rebuilding the kernel.
+        self.compute_method: str = compute_method
 
         # Internal FFTKernel holds the eigenvalue spectrum on the k-grid. We
         # use fft2 (full spectrum) so the ifftshift trick aligns NUFFT output
@@ -377,111 +466,203 @@ class NUFFTKernel:
     def __repr__(self) -> str:  # pragma: no cover
         return (
             f"<NUFFTKernel method={self.method} n={self.n} "
-            f"grid={self.grid_shape} spacing={self.spacing} params={self.params}>"
+            f"grid={self.grid_shape} spacing={self.spacing} "
+            f"compute_method={self.compute_method!r} params={self.params}>"
         )
 
     def __str__(self) -> str:  # pragma: no cover
         return (
             f"NUFFTKernel\n"
             f"- Method: {self.method}\n"
-            f"- n_spots: {self.n}\n"
+            f"- N spots: {self.n}\n"
             f"- k-grid: {self.grid_shape} at spacing {self.spacing}\n"
+            f"- Compute method: {self.compute_method}\n"
             f"- Params: {self.params}"
         )
 
     # ------------------------------------------------------------------
-    def eigenvalues(self, k: int | None = None, return_full_layout: bool = False) -> np.ndarray:
-        """Return the ``k`` largest eigenvalues of the underlying spectrum.
-
-        Forwards to the internal :class:`FFTKernel`'s ``eigenvalues``. With
-        ``return_full_layout=True``, returns the complete unsorted spectrum in the
-        FFT mode layout (useful for Liu's null approximation).
-        """
-        return self._fft_kernel.eigenvalues(k=k, return_full_layout=return_full_layout)
+    # Cached scaling between the n'-point grid operator K' and the n-point
+    # irregular-point operator K. Under the band-limited approximation
+    # ``K ≈ (1/n') · U · diag(λ) · Uᴴ`` and H₀ with x iid N(0, 1) at n points,
+    # the moments of K scale with ``n/n'`` relative to K'.
+    # ------------------------------------------------------------------
+    @property
+    def _n_over_nprime(self) -> float:
+        ny, nx = self.grid_shape
+        return self.n / (ny * nx)
 
     # ------------------------------------------------------------------
-    def xtKx(self, x: np.ndarray) -> float | np.ndarray:
-        """Quadratic form ``x^T K x`` at the kernel's irregular coordinates.
+    def eigenvalues(self, k: int | None = None, return_full_layout: bool = False) -> np.ndarray:
+        """Eigenvalues of the ``n × n`` irregular-point operator ``K`` (analytic).
+
+        Returns ``fft_kernel.eigenvalues(...) · n / n'``, i.e. the internal
+        FFT-kernel spectrum rescaled to the n-point operator — the analytic
+        Liu spectrum used by both compute paths.
+
+        Parameters
+        ----------
+        k : int, optional
+            Return the top-``k`` sorted descending. ``None`` returns all.
+        return_full_layout : bool, default False
+            If ``True``, return the complete unsorted spectrum in the scipy
+            FFT mode layout (length ``n'``). Useful when the caller wants to
+            weight modes by grid position rather than by magnitude ranking.
+        """
+        raw = self._fft_kernel.eigenvalues(k=k, return_full_layout=return_full_layout)
+        return raw * self._n_over_nprime
+
+    # ------------------------------------------------------------------
+    # Path A primitives — k-space Parseval (default for xtKx / xtKy)
+    # ------------------------------------------------------------------
+    def _nufft_type1(self, x: np.ndarray) -> np.ndarray:
+        """Type-1 NUFFT of ``x`` onto the k-grid at the cached scaled coords.
+
+        Computes ``x̂(k) = Σ_j x_j exp(-i k · r̃_j)`` where ``r̃_j`` are the
+        mean-centered, ``2π/(n·d)``-scaled versions of the input coordinates.
+        Shared primitive for :meth:`xtKx` (takes ``|·|²``), :meth:`xtKy`
+        (complex inner product), :meth:`Kx`, and :meth:`Kx_grid`.
 
         Parameters
         ----------
         x : np.ndarray
-            Signal of shape ``(n,)`` for one feature or ``(n, M)`` for ``M``
-            features sharing the same coordinates.
-
-        Returns
-        -------
-        float or np.ndarray
-            Scalar if ``x`` is 1D, shape ``(M,)`` if ``x`` is 2D.
-
-        Raises
-        ------
-        ValueError
-            If ``x`` has the wrong leading dimension.
-        """
-        if x.shape[0] != self.n:
-            raise ValueError(f"x first dim {x.shape[0]} does not match n={self.n}.")
-        ny, nx = self.grid_shape
-        dy, dx = self.spacing
-
-        power = power_spectrum_2d_nufft(
-            coords=self.coords,
-            values=x,
-            grid_shape=(ny, nx),
-            spacing=(dy, dx),
-            unit_scale=self._unit_scale,
-            eps=self._eps,
-            center_coords=True,
-        )
-        lam = self._fft_kernel.spectrum.reshape(ny, nx)
-
-        if x.ndim == 1:
-            return float(np.sum(lam * power) / (ny * nx))
-        # Batched: power shape (ny, nx, M), reduce along first two axes.
-        weighted = lam[:, :, None] * power
-        return (np.sum(weighted, axis=(0, 1)) / (ny * nx)).astype(np.float64)
-
-    # ------------------------------------------------------------------
-    def Kx(self, z: np.ndarray) -> np.ndarray:
-        """Matrix-vector product ``K x`` at the kernel's irregular coordinates.
-
-        Implemented as type-1 NUFFT → multiply by ``λ(k)`` → type-2 NUFFT.
-        Complexity: ``O(N log N + K log K)`` per feature.
-
-        Parameters
-        ----------
-        z : np.ndarray
-            Input shape ``(n,)`` or ``(n, M)``.
+            ``(n,)`` or ``(n, M)``.
 
         Returns
         -------
         np.ndarray
-            ``K z`` of matching shape.
+            Complex ``(M, ny, nx)`` (always 3-D; ``M=1`` for 1-D input). DC
+            at the array centre (finufft convention); callers that want the
+            scipy-FFT layout must ``ifftshift`` along the last two axes.
+        """
+        if x.shape[0] != self.n:
+            raise ValueError(f"x first dim {x.shape[0]} does not match n={self.n}.")
+        ny, nx = self.grid_shape
+        x_in = x[:, None] if x.ndim == 1 else x
+        c = np.ascontiguousarray(x_in.T.astype(np.complex128))  # (M, N)
+        return finufft.nufft2d1(
+            self._y_scaled,
+            self._x_scaled,
+            c,
+            n_modes=(ny, nx),
+            eps=self._eps,
+            isign=-1,
+        )  # (M, ny, nx)
+
+    def xtKx(self, x: np.ndarray) -> float | np.ndarray:
+        """Quadratic form ``xᵀ K x`` via **k-space Parseval**.
+
+        Implements the default path:
+
+        .. math::
+
+           x^T K x \\;=\\; \\frac{1}{n'} \\sum_k \\lambda(k) \\, |\\hat x(k)|^{2}
+
+        using one type-1 NUFFT of ``x`` and an elementwise Parseval sum.
+        Only the real power spectrum ``|x̂|²`` of shape ``(ny, nx)`` is
+        materialized — no ``ifft2``, no spatial-grid copy of ``x``.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            ``(n,)`` for one feature or ``(n, M)`` for ``M`` features.
+
+        Returns
+        -------
+        float or np.ndarray
+            Scalar if ``x`` is 1-D, shape ``(M,)`` otherwise.
+
+        See Also
+        --------
+        xtKx_matmul : Compute ``xᵀ · Kx`` via the length-``n`` matrix product.
+        """
+        ny, nx = self.grid_shape
+        x_hat_centered = self._nufft_type1(x)  # (M, ny, nx)
+        power = x_hat_centered.real**2 + x_hat_centered.imag**2  # (M, ny, nx)
+        # Spectrum is stored in scipy FFT layout (DC at [0,0]); fftshift → centered
+        # to match the NUFFT output before multiplying.
+        lam = np.fft.fftshift(self._fft_kernel.spectrum.reshape(ny, nx))
+        Q = np.sum(lam[None, :, :] * power, axis=(1, 2)) / (ny * nx)
+        if x.ndim == 1:
+            return float(Q[0])
+        return Q.astype(np.float64)
+
+    def xtKy(self, x: np.ndarray, y: np.ndarray) -> float | np.ndarray:
+        """Bilinear form ``xᵀ K y`` via **cross Parseval**.
+
+        Implements the default path:
+
+        .. math::
+
+           x^T K y \\;=\\; \\frac{1}{n'} \\sum_k \\lambda(k) \\,
+               \\overline{\\hat x(k)}\\, \\hat y(k).
+
+        Paired same-``M`` convention — returns the diagonal of ``Xᵀ K Y``
+        (shape ``(M,)``) for batched inputs, scalar for 1-D inputs. For the
+        bipartite ``(M_x, M_y)`` cross matrix use :meth:`xtKy_matmul` (or
+        build it explicitly via ``X.T @ self.Kx(Y)``).
+
+        Parameters
+        ----------
+        x, y : np.ndarray
+            ``(n,)`` or ``(n, M)`` — must share shape.
+
+        Returns
+        -------
+        float or np.ndarray
+            Scalar for 1-D inputs; ``(M,)`` for batched.
+        """
+        if x.shape[0] != self.n or y.shape[0] != self.n:
+            raise ValueError(
+                f"x, y first dim must equal n={self.n}; got {x.shape[0]}, {y.shape[0]}."
+            )
+        if x.shape != y.shape:
+            raise ValueError(f"x and y must share shape; got {x.shape} vs {y.shape}.")
+        ny, nx = self.grid_shape
+        x_hat = self._nufft_type1(x)  # (M, ny, nx) complex
+        y_hat = self._nufft_type1(y)
+        lam = np.fft.fftshift(self._fft_kernel.spectrum.reshape(ny, nx))
+        cross = np.real(np.conj(x_hat) * y_hat) * lam[None, :, :]
+        R = np.sum(cross, axis=(1, 2)) / (ny * nx)
+        if x.ndim == 1:
+            return float(R[0])
+        return R.astype(np.float64)
+
+    # ------------------------------------------------------------------
+    # Path B primitives — n-point vector via NUFFT round-trip
+    # ------------------------------------------------------------------
+    def Kx(self, z: np.ndarray) -> np.ndarray:
+        """Matrix–vector product ``K z`` at the ``n`` irregular coordinates.
+
+        Implements the band-limited apply
+
+        .. math::
+
+           K z \\;\\approx\\; \\tfrac{1}{n'} \\, U \\bigl(\\lambda \\odot U^{\\mathsf H} z\\bigr),
+
+        evaluated as type-1 NUFFT → elementwise multiply by ``λ(k) / n'`` →
+        type-2 NUFFT. Output length ``n``, same shape as ``z``. Base primitive
+        for :meth:`xtKx_matmul`, :meth:`xtKy_matmul`, the Hutchinson null
+        estimators, and the bipartite R-test in :class:`DetectorIrregular`.
+
+        Parameters
+        ----------
+        z : np.ndarray
+            ``(n,)`` or ``(n, M)``.
+
+        Returns
+        -------
+        np.ndarray
+            Same shape as ``z``.
         """
         if z.shape[0] != self.n:
             raise ValueError(f"z first dim {z.shape[0]} does not match n={self.n}.")
         ny, nx = self.grid_shape
         lam_centred = np.fft.fftshift(self._fft_kernel.spectrum.reshape(ny, nx))
-
         squeeze = z.ndim == 1
-        z_in = z[:, None] if squeeze else z
-        z_complex = np.ascontiguousarray(z_in.T.astype(np.complex128))  # (M, n)
-
-        z_hat = finufft.nufft2d1(
-            self._y_scaled,
-            self._x_scaled,
-            z_complex,
-            n_modes=(ny, nx),
-            eps=self._eps,
-            isign=-1,
-        )  # (M, ny, nx), DC centred
-        # Apply spectrum.
-        if z_hat.ndim == 2:
-            out_k = lam_centred * z_hat / (ny * nx)
-        else:
-            out_k = lam_centred[None, :, :] * z_hat / (ny * nx)
-        out_k = np.ascontiguousarray(out_k.astype(np.complex128))
-
+        z_hat = self._nufft_type1(z)  # (M, ny, nx) complex, DC centred
+        out_k = np.ascontiguousarray(
+            (lam_centred[None, :, :] * z_hat / (ny * nx)).astype(np.complex128)
+        )
         Kz = finufft.nufft2d2(
             self._y_scaled,
             self._x_scaled,
@@ -489,23 +670,176 @@ class NUFFTKernel:
             eps=self._eps,
             isign=+1,
         )  # (M, n)
-        Kz = np.real(Kz).T  # back to (n, M)
-        if squeeze:
-            return Kz[:, 0]
-        return Kz
+        Kz = np.real(Kz).T  # (n, M)
+        return Kz[:, 0] if squeeze else Kz
+
+    def xtKx_matmul(self, x: np.ndarray) -> float | np.ndarray:
+        """Quadratic form ``xᵀ K x`` via **direct matmul**.
+
+        Computes ``Q_B = xᵀ · self.Kx(x)`` end-to-end at the ``n`` irregular
+        points. Sparse-aware on ``x`` (``x.multiply(Kx).sum``). ~2× the NUFFT
+        work of :meth:`xtKx` per feature; agrees with it to NUFFT precision
+        on regular grids and to the torus-BC band (~1–2 %) on irregular ones.
+
+        Parameters
+        ----------
+        x : np.ndarray or scipy.sparse matrix
+            ``(n,)`` or ``(n, M)``.
+
+        Returns
+        -------
+        float or np.ndarray
+            Scalar for 1-D input; ``(M,)`` for batched.
+        """
+        if sp.issparse(x):
+            if x.ndim == 1 or (x.shape[1] == 1 and x.shape[0] == self.n):
+                x_sp = x.reshape(-1, 1)
+                squeeze = True
+            else:
+                x_sp = x
+                squeeze = False
+            Kx_dense = self.Kx(x_sp.toarray())
+            result = np.asarray(x_sp.multiply(Kx_dense).sum(axis=0)).ravel()
+            return float(result[0]) if squeeze else result
+        arr = np.asarray(x, dtype=float)
+        Kx_dense = self.Kx(arr)
+        if arr.ndim == 1:
+            return float(np.dot(arr, Kx_dense))
+        return np.sum(arr * Kx_dense, axis=0).astype(np.float64)
+
+    def xtKy_matmul(self, x: np.ndarray | sp.spmatrix, y: np.ndarray) -> float | np.ndarray:
+        """Bilinear form ``xᵀ K y`` via **direct matmul**.
+
+        Returns the paired ``(M,)`` diagonal of ``Xᵀ K Y`` (sparse-aware on
+        ``x``). For the full ``(M_x, M_y)`` bipartite cross matrix build it
+        explicitly as ``X.T @ self.Kx(Y)`` — that's what
+        :class:`DetectorIrregular` does for ``compute_rstat`` after setting
+        ``kernel.compute_method = 'matmul'``.
+
+        Parameters
+        ----------
+        x, y : np.ndarray or scipy.sparse matrix
+            ``(n,)`` or ``(n, M)``.
+
+        Returns
+        -------
+        float or np.ndarray
+            Scalar for 1-D inputs; ``(M,)`` for batched.
+        """
+        Ky = self.Kx(y)
+        if sp.issparse(x):
+            x_in = x.reshape(-1, 1) if x.ndim == 1 else x
+            Ky_2d = Ky[:, None] if Ky.ndim == 1 else Ky
+            result = np.asarray(x_in.multiply(Ky_2d).sum(axis=0)).ravel()
+            return float(result[0]) if result.size == 1 else result
+        x_arr = np.asarray(x, dtype=float)
+        if x_arr.ndim == 1 and Ky.ndim == 1:
+            return float(np.dot(x_arr, Ky))
+        x_mat = x_arr.reshape(-1, 1) if x_arr.ndim == 1 else x_arr
+        Ky_mat = Ky.reshape(-1, 1) if Ky.ndim == 1 else Ky
+        return np.sum(x_mat * Ky_mat, axis=0).astype(np.float64)
+
+    def Kx_grid(self, x: np.ndarray) -> np.ndarray:
+        """Grid-domain companion of :meth:`Kx` — ``(ny, nx)`` spatial output.
+
+        Whereas :meth:`Kx` returns the length-``n`` apply at the irregular
+        coordinates, :meth:`Kx_grid` returns the apply evaluated on the
+        internal uniform grid. Pipeline: type-1 NUFFT → undo the
+        coordinate-centering phase (needed here because we keep complex
+        coefficients; the square-magnitude and adjoint-round-trip paths of
+        :meth:`xtKx` / :meth:`Kx` absorb it automatically) → multiply by
+        ``λ(k)`` → ``ifftshift`` → ``ifft2`` → real.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            ``(n,)`` or ``(n, M)``.
+
+        Returns
+        -------
+        np.ndarray
+            Real ``(ny, nx)`` or ``(ny, nx, M)`` in the scipy FFT layout (DC
+            at ``[0, 0]``).
+        """
+        ny, nx = self.grid_shape
+        dy, dx = self.spacing
+        squeeze = x.ndim == 1
+        x_hat_centered = self._nufft_type1(x)  # (M, ny, nx), modes ∈ [-n/2, n/2-1]
+        m_y = np.arange(ny) - ny // 2
+        m_x = np.arange(nx) - nx // 2
+        phase = (
+            np.exp(-1j * m_y * self._y_mean * 2.0 * np.pi / (ny * dy))[:, None]
+            * np.exp(-1j * m_x * self._x_mean * 2.0 * np.pi / (nx * dx))[None, :]
+        )
+        # Apply spectrum + undo centering phase in one pass.
+        lam_centred = np.fft.fftshift(self._fft_kernel.spectrum.reshape(ny, nx))
+        weighted = x_hat_centered * phase[None, :, :] * lam_centred[None, :, :]
+        # Shift DC to [0, 0] and inverse-FFT to spatial grid.
+        weighted_shifted = np.fft.ifftshift(weighted, axes=(-2, -1))
+        Kx_grid = np.real(
+            scipy.fft.ifft2(weighted_shifted, axes=(-2, -1), workers=self.workers)
+        )  # (M, ny, nx)
+        out = np.moveaxis(Kx_grid, 0, -1)  # (ny, nx, M)
+        return out[..., 0] if squeeze else out
 
     # ------------------------------------------------------------------
-    def trace(self) -> float:
-        """``trace(K)`` of the effective torus-BC kernel.
+    # Null-moment estimators — analytic (Path A) and Hutchinson (Path B)
+    # ------------------------------------------------------------------
+    def _get_rvs_trace_cache(self, n_probes: int = 15) -> dict:
+        """Cache Hutchinson probes ``v ∈ {±1}^N`` and their ``K v`` images.
 
-        Computed deterministically from the eigenvalue spectrum held by the
-        internal :class:`FFTKernel` (no Hutchinson estimation needed).
+        Used by :meth:`trace` / :meth:`square_trace` with
+        ``method='hutchinson'``. The probes are drawn from a seeded RNG
+        (``default_rng(0)``) so repeated calls return the same values for a
+        given kernel instance, mirroring
+        :meth:`MatrixKernelBase._get_rvs_trace_cache`.
         """
-        return float(self._fft_kernel.trace())
+        cache = getattr(self, "_trace_rvs_cache", None)
+        if cache is not None and cache["n_probes"] == n_probes:
+            return cache
+        rng = np.random.default_rng(0)
+        rvs = rng.choice([-1.0, 1.0], size=(self.n, n_probes)).astype(np.float64)
+        Krvs = self.Kx(rvs)  # (n, n_probes)
+        self._trace_rvs_cache = {"n_probes": n_probes, "rvs": rvs, "Krvs": Krvs}
+        return self._trace_rvs_cache
 
-    def square_trace(self) -> float:
-        """``trace(K²)`` — deterministic, from the eigenvalue spectrum."""
-        return float(self._fft_kernel.square_trace())
+    def trace(self, method: str = "analytic", n_probes: int = 15) -> float:
+        """``trace(K)`` of the ``n × n`` irregular-point operator.
+
+        Parameters
+        ----------
+        method : {``'analytic'``, ``'hutchinson'``}, default ``'analytic'``
+            - ``'analytic'``: ``(n/n') · fft_kernel.trace()``.
+              Exact under the band-limited approximation; zero NUFFT work,
+              no randomness.
+            - ``'hutchinson'``: ``(1/m) Σ_i vᵢᵀ (K vᵢ)`` over
+              ``m = n_probes`` cached ``±1`` probes. Exact in expectation
+              for the NUFFT-applied operator; deterministic per instance
+              because probes are drawn from a seeded RNG.
+        n_probes : int, default 15
+            Number of Hutchinson probes (ignored when ``method='analytic'``).
+        """
+        if method == "analytic":
+            return float(self._fft_kernel.trace() * self._n_over_nprime)
+        if method == "hutchinson":
+            cache = self._get_rvs_trace_cache(n_probes)
+            return float(np.sum(cache["rvs"] * cache["Krvs"]) / cache["n_probes"])
+        raise ValueError(f"method must be 'analytic' or 'hutchinson', got {method!r}.")
+
+    def square_trace(self, method: str = "analytic", n_probes: int = 15) -> float:
+        """``trace(K²)`` of the ``n × n`` irregular-point operator.
+
+        Same parameter semantics as :meth:`trace`.
+
+        - ``'analytic'``: ``(n/n')² · fft_kernel.square_trace()``.
+        - ``'hutchinson'``: ``(1/m) Σ_i ‖K vᵢ‖²`` over the cached probes.
+        """
+        if method == "analytic":
+            return float(self._fft_kernel.square_trace() * self._n_over_nprime**2)
+        if method == "hutchinson":
+            cache = self._get_rvs_trace_cache(n_probes)
+            return float(np.sum(cache["Krvs"] ** 2) / cache["n_probes"])
+        raise ValueError(f"method must be 'analytic' or 'hutchinson', got {method!r}.")
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +850,9 @@ class NUFFTKernel:
 def _standardize_features(X: np.ndarray) -> np.ndarray:
     """Z-score each column (ddof=1), leaving constant columns as zeros.
 
-    Matches the convention of :func:`quadsv.spatial_q_test`.
+    Matches :func:`quadsv.statistics.spatial_q_test`'s convention. Used by the
+    NUFFT dispatch to standardize at the ``n`` irregular points before the
+    type-1 NUFFT.
     """
     mu = X.mean(axis=0, keepdims=True)
     sd = X.std(axis=0, keepdims=True, ddof=1)
@@ -534,92 +870,70 @@ def _q_test_nufft(  # noqa: C901
     is_standardized: bool = False,
 ) -> float | np.ndarray | tuple[float, float] | tuple[np.ndarray, np.ndarray]:
     """
-    Spatial Q-test on irregular 2D coordinates — NUFFT analogue of
-    :func:`quadsv.spatial_q_test`.
+    Spatial Q-test on irregular 2D coordinates.
 
-    Uses the kernel's full eigenvalue spectrum (from the internal
-    :class:`FFTKernel`) and Liu's chi-squared-mixture approximation to the
-    null distribution of ``Q = z^T K z`` where ``z`` is standardized. For
-    Moran's I (which has negative eigenvalues) a normal approximation based on
-    ``trace(K)`` and ``trace(K²)`` is used, matching the FFT path exactly.
+    Two computational paths approximate the same ``xᵀ K x`` on the
+    ``n × n`` irregular-point operator ``K``; which one runs is controlled
+    by :attr:`NUFFTKernel.compute_method` on the kernel instance (mutable):
+
+    - ``'spectral'`` (default) — fast. Computes
+      ``Q = (1/n') Σ_k λ(k) · |ẑ(k)|²`` via one type-1 NUFFT of ``z`` and a
+      Parseval sum (:meth:`NUFFTKernel.xtKx`). Null moments come from the
+      analytic ``n/n'``-scaled FFT spectrum, aligning with the n-point
+      operator's null distribution.
+    - ``'matmul'`` — slower, end-to-end at the ``n`` irregular
+      points. Computes ``Q = zᵀ · self.Kx(z)`` via two NUFFTs + a
+      sparse-aware contraction (:meth:`NUFFTKernel.xtKx_matmul`). Null
+      moments are Hutchinson estimates over cached ``±1`` probes through ``K``.
+
+    Standardization at the ``n`` irregular points is applied internally
+    unless ``is_standardized=True``.
 
     Parameters
     ----------
     Xn : np.ndarray
-        Signal of shape ``(n,)`` or ``(n, M)``. Each column is Z-score
-        standardized internally unless ``is_standardized=True``.
+        ``(n,)`` or ``(n, M)``.
     kernel : NUFFTKernel
-        Pre-constructed NUFFT kernel.
     null_params : dict, optional
-        Pre-computed null parameters from
-        :func:`quadsv.statistics.compute_null_params`. When supplied, the
-        cached ``eigenvalues`` / ``mean_Q`` / ``var_Q`` entries are reused
-        so the spectrum does not need to be re-fetched per feature. Note
-        that the cached entries are assumed to have **already been
-        rescaled** to the N-point operator (i.e., multiplied by
-        ``N / (ny * nx)``) — the on-the-fly path below does this
-        rescaling internally for callers that pass ``None``.
+        Pre-built moments (see :func:`quadsv.compute_null_params`). Read
+        keys depend on the kernel method: ``'mean_Q'`` / ``'var_Q'`` for
+        Moran (CLT path); ``'eigenvalues'`` for everything else (Liu's
+        method).
     return_pval : bool, default True
-        If True, return ``(Q, pval)`` tuple; else just ``Q``.
     is_standardized : bool, default False
-        If True, skip the internal standardization.
 
     Returns
     -------
     Q : float or np.ndarray
-        Test statistic. Scalar if input was 1D, shape ``(M,)`` otherwise.
     pval : float or np.ndarray, optional
-        Tail probability under H₀ — Liu's method for most kernels, normal
-        approximation for Moran's I. Returned only when ``return_pval=True``.
-
-    Raises
-    ------
-    ValueError
-        If ``Xn``'s first dimension does not match ``kernel.n``.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from quadsv import NUFFTKernel, spatial_q_test
-    >>> rng = np.random.default_rng(0)
-    >>> coords = rng.uniform(0, 20, size=(400, 2))
-    >>> kernel = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
-    >>> z = rng.standard_normal(400)
-    >>> Q, pval = spatial_q_test(z, kernel)
-    >>> 0.0 <= pval <= 1.0
-    True
     """
+    compute_method = kernel.compute_method
     Xn = np.asarray(Xn, dtype=float)
-    if Xn.ndim == 1:
-        batched = False
-        X_in = Xn[:, None]
-    elif Xn.ndim == 2:
-        batched = True
-        X_in = Xn
-    else:
-        raise ValueError(f"Xn must be 1D or 2D, got shape {Xn.shape}.")
+    batched = Xn.ndim == 2
+    X_in = Xn if batched else Xn[:, None]
     if X_in.shape[0] != kernel.n:
         raise ValueError(f"Xn first dim {X_in.shape[0]} does not match kernel.n={kernel.n}.")
 
     z = X_in if is_standardized else _standardize_features(X_in)
-    Q_arr = np.atleast_1d(kernel.xtKx(z)).ravel()
+
+    # Compute Q via the requested path.
+    if compute_method == "spectral":
+        Q_arr = np.atleast_1d(kernel.xtKx(z)).ravel()
+    else:
+        Q_arr = np.atleast_1d(kernel.xtKx_matmul(z)).ravel()
 
     if not return_pval:
-        return float(Q_arr[0]) if not batched else Q_arr
+        return Q_arr if batched else float(Q_arr[0])
 
-    # The internal FFTKernel's spectrum sums to ny*nx (its own grid trace); the
-    # NUFFT Q on N irregular points targets an effective N×N operator whose
-    # trace is N * k(0) ≈ N. Rescale eigenvalues by N/(ny*nx) so both Liu's
-    # mixture and the Moran normal approximation see the right moments.
-    scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
-
+    # Null moments — analytic (spectral) vs. Hutchinson (matmul) per user spec.
+    moment_method = "analytic" if compute_method == "spectral" else "hutchinson"
     if kernel.method == "moran":
         if null_params is not None and "mean_Q" in null_params and "var_Q" in null_params:
             mean_Q = float(null_params["mean_Q"])
             var_Q = float(null_params["var_Q"])
         else:
-            mean_Q = kernel.trace() * scale
-            var_Q = 2.0 * kernel.square_trace() * (scale**2)
+            mean_Q = kernel.trace(method=moment_method)
+            var_Q = 2.0 * kernel.square_trace(method=moment_method)
         sigma = float(np.sqrt(var_Q))
         if sigma <= 1e-12:
             pvals = np.ones_like(Q_arr)
@@ -627,6 +941,9 @@ def _q_test_nufft(  # noqa: C901
             z_scores = (Q_arr - mean_Q) / sigma
             pvals = chi2.sf(z_scores**2, df=1)
     else:
+        # Liu's mixture uses the analytic n-point-scaled spectrum in both paths
+        # (the Hutchinson path would need a stochastic spectrum estimator —
+        # out of scope).
         if null_params is not None and "eigenvalues" in null_params:
             sig_evals = np.asarray(null_params["eigenvalues"], dtype=float)
         else:
@@ -635,7 +952,7 @@ def _q_test_nufft(  # noqa: C901
                 raise ValueError(
                     "Kernel has significant negative eigenvalues; Liu's method may be invalid."
                 )
-            sig_evals = evals[evals > 1e-9] * scale
+            sig_evals = evals[evals > 1e-9]
         pvals = np.array([liu_sf(float(q), sig_evals) for q in Q_arr])
 
     if batched:
@@ -652,56 +969,33 @@ def _r_test_nufft(
     is_standardized: bool = False,
 ) -> float | np.ndarray | tuple[float, float] | tuple[np.ndarray, np.ndarray]:
     """
-    Spatial R-test on irregular 2D coordinates — NUFFT analogue of
-    :func:`quadsv.spatial_r_test`.
+    Spatial R-test on irregular 2D coordinates.
 
-    Computes ``R = x^T K y`` and returns a two-sided normal-approximation
-    p-value with null variance ``var_R = trace(K²)``.
+    The path is chosen by :attr:`NUFFTKernel.compute_method` on the kernel:
+
+    - ``'spectral'`` (default) — cross Parseval
+      ``R = (1/n') Σ_k λ(k) · conj(x̂(k)) · ŷ(k)`` via
+      :meth:`NUFFTKernel.xtKy`; analytic
+      ``var_R = (n/n')² · fft_kernel.square_trace()``.
+    - ``'matmul'`` — ``R = Xᵀ · self.Kx(Y)`` (full ``(M_x, M_y)`` cross
+      matrix) with a sparse-aware contraction; Hutchinson
+      ``var_R = kernel.square_trace(method='hutchinson')``.
+
+    Paired same-``M`` inputs get the ``(M,)`` diagonal in ``'spectral'``
+    mode; ``'matmul'`` always returns the full cross matrix (needed by
+    :class:`DetectorIrregular`).
 
     Parameters
     ----------
     Xn, Yn : np.ndarray
-        Signals of shape ``(n,)`` or ``(n, M)``. When both are 2D they must
-        share the same ``M`` (paired columns); the output then has shape
-        ``(M,)``. When shapes differ, returns an ``(M_x, M_y)`` pair matrix.
+        ``(n,)`` or ``(n, M)``.
     kernel : NUFFTKernel
-        Pre-constructed NUFFT kernel.
     null_params : dict, optional
-        Pre-computed null parameters from
-        :func:`quadsv.statistics.compute_null_params`. Only the
-        ``var_R`` entry is consumed here; it is expected to already be
-        rescaled to the N-point operator (``trace(K²) * (N/(ny*nx))²``).
-        If None, this rescaling is done internally from
-        ``kernel.square_trace()``.
+        ``{'var_R': ...}`` in the N-point-operator units.
     return_pval : bool, default True
-        If True, return ``(R, pval)``; else just ``R``.
     is_standardized : bool, default False
-        If True, skip the internal standardization.
-
-    Returns
-    -------
-    R : float or np.ndarray
-    pval : float or np.ndarray, optional
-        Two-sided p-values under the normal approximation.
-
-    Raises
-    ------
-    ValueError
-        If the leading dimensions of ``Xn`` or ``Yn`` don't match ``kernel.n``.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from quadsv import NUFFTKernel, spatial_r_test
-    >>> rng = np.random.default_rng(0)
-    >>> coords = rng.uniform(0, 20, size=(400, 2))
-    >>> kernel = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
-    >>> x = rng.standard_normal(400)
-    >>> y = rng.standard_normal(400)
-    >>> R, pval = spatial_r_test(x, y, kernel)
-    >>> 0.0 <= pval <= 1.0
-    True
     """
+    compute_method = kernel.compute_method
     Xn = np.asarray(Xn, dtype=float)
     Yn = np.asarray(Yn, dtype=float)
     if Xn.ndim == 1:
@@ -717,25 +1011,23 @@ def _r_test_nufft(
     Xz = Xn if is_standardized else _standardize_features(Xn)
     Yz = Yn if is_standardized else _standardize_features(Yn)
 
-    KY = kernel.Kx(Yz)  # (n, M_y)
-    R = Xz.T @ KY  # (M_x, M_y)
+    if compute_method == "spectral" and Xn.shape[1] == Yn.shape[1]:
+        # Path A paired diagonal via cross Parseval.
+        R = np.atleast_1d(kernel.xtKy(Xz, Yz))
+    else:
+        # Full (M_x, M_y) cross matrix via NUFFT round-trip on Y.
+        KY = kernel.Kx(Yz)  # (n, M_y)
+        R = Xz.T @ KY  # (M_x, M_y)
 
     if not return_pval:
         return R.squeeze() if R.size > 1 else float(R)
 
-    # Rescale trace(K²) to the N-point effective operator, matching the
-    # eigenvalue rescaling used by _q_test_nufft.
+    moment_method = "analytic" if compute_method == "spectral" else "hutchinson"
     if null_params is not None and "var_R" in null_params:
         var_R = float(null_params["var_R"])
     else:
-        scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
-        var_R = float(kernel.square_trace()) * (scale**2)
+        var_R = kernel.square_trace(method=moment_method)
     sigma = float(np.sqrt(max(var_R, 1e-30)))
     z_scores = R / sigma
     pvals = 2.0 * norm.sf(np.abs(z_scores))
     return R.squeeze(), pvals.squeeze()
-
-
-# Register NUFFTKernel as a virtual subclass of the Kernel ABC so that
-# isinstance(kernel, Kernel) dispatch in quadsv.statistics picks it up.
-Kernel.register(NUFFTKernel)

@@ -87,9 +87,7 @@ def _qstat_worker(
 
         if use_sparse_fastpath:
             X_batch_sp = X_csc[:, local_slice]
-            Q_batch = np.atleast_1d(
-                kernel_obj.xtKx_standardized(X_batch_sp, b_means, b_stds)
-            )
+            Q_batch = np.atleast_1d(kernel_obj.xtKx_standardized(X_batch_sp, b_means, b_stds))
             # xtKx_standardized already returns 0.0 for std<=0 columns.
             P_batch = (
                 _pvals_from_null(Q_batch, null_params)
@@ -101,9 +99,9 @@ def _qstat_worker(
             X_batch = X_csc[:, local_slice].toarray()
             Z_batch = np.zeros_like(X_batch)
             if np.any(valid_mask):
-                Z_batch[:, valid_mask] = (
-                    X_batch[:, valid_mask] - b_means[valid_mask]
-                ) / b_stds[valid_mask]
+                Z_batch[:, valid_mask] = (X_batch[:, valid_mask] - b_means[valid_mask]) / b_stds[
+                    valid_mask
+                ]
             if return_pval:
                 Q_batch, P_batch = spatial_q_test(
                     Z_batch, kernel_obj, null_params, return_pval=True, is_standardized=True
@@ -254,9 +252,7 @@ def _rstat_worker_chunked(
         Zy = np.zeros_like(Y_dense)
         if np.any(y_valid):
             Zy[:, y_valid] = (Y_dense[:, y_valid] - y_means[y_valid]) / y_stds[y_valid]
-        KZy = (
-            kernel_obj.dot(Zy) if hasattr(kernel_obj, "dot") else np.asarray(kernel_obj @ Zy)
-        )
+        KZy = kernel_obj.dot(Zy) if hasattr(kernel_obj, "dot") else np.asarray(kernel_obj @ Zy)
         X_dense = X_block.toarray()
         Zx = np.zeros_like(X_dense)
         if np.any(x_valid):
@@ -504,9 +500,7 @@ class DetectorIrregular(Detector):
             )
         coords = np.asarray(self.adata.obsm[obsm_key], dtype=np.float64)
         if coords.ndim != 2 or coords.shape[1] != 2:
-            raise ValueError(
-                f"adata.obsm['{obsm_key}'] must be (n_obs, 2), got {coords.shape}."
-            )
+            raise ValueError(f"adata.obsm['{obsm_key}'] must be (n_obs, 2), got {coords.shape}.")
         if coords.shape[0] != self.n:
             raise ValueError(
                 f"coords shape {coords.shape} inconsistent with adata.shape=({self.n}, ...)."
@@ -1194,17 +1188,23 @@ class DetectorIrregular(Detector):
         chunk_size: int,
         show_progress: bool = True,
     ) -> pd.DataFrame:
-        """NUFFT dispatch for :meth:`compute_qstat`. Builds null params once and
-        delegates per-feature work to :func:`quadsv.spatial_q_test`."""
+        """NUFFT dispatch for :meth:`compute_qstat`. Builds null params once
+        (n-point-scaled) and delegates per-feature work to
+        :func:`quadsv.spatial_q_test` on Path A (spectral).
+
+        The NUFFT Q-test targets the n-point operator ``K``; moments come from
+        :meth:`NUFFTKernel.trace` / :meth:`~NUFFTKernel.square_trace` /
+        :meth:`~NUFFTKernel.eigenvalues` (all already n-point-scaled by the
+        kernel). No ``N / (ny · nx)`` rescaling at the caller.
+        """
         kernel = self.kernel_
-        scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
         null_params: dict[str, float | np.ndarray] | None = None
         if return_pval:
             if kernel.method == "moran":
                 null_params = {
                     "method": "clt",
-                    "mean_Q": kernel.trace() * scale,
-                    "var_Q": 2.0 * kernel.square_trace() * (scale**2),
+                    "mean_Q": float(kernel.trace()),
+                    "var_Q": 2.0 * float(kernel.square_trace()),
                 }
             else:
                 full = kernel.eigenvalues(return_full_layout=True)
@@ -1215,7 +1215,7 @@ class DetectorIrregular(Detector):
                     )
                 null_params = {
                     "method": "liu",
-                    "eigenvalues": full[full > 1e-9] * scale,
+                    "eigenvalues": full[full > 1e-9],
                 }
 
         logger.info("Preparing %s features (layer=%s)...", source, layer)
@@ -1229,20 +1229,17 @@ class DetectorIrregular(Detector):
 
         def _batch(batch_idx: np.ndarray) -> list[dict[str, Any]]:
             # Densify one small block at a time; never materialize full X.
+            # Do NOT pre-standardize at irregular points — the NUFFT Q-test
+            # is now defined on the *grid* representation, so grid-space
+            # standardization (done inside _q_test_fft via the NUFFT dispatch)
+            # is what matches the FFT-kernel null distribution.
             block = np.asarray(X_kept[:, batch_idx].todense(), dtype=np.float64)
-            block_std = (block - means[batch_idx][None, :]) / np.where(
-                stds[batch_idx] > 0, stds[batch_idx], 1.0
-            )[None, :]
             if return_pval:
-                Q_arr, P_arr = spatial_q_test(
-                    block_std, kernel, null_params=null_params, is_standardized=True
-                )
+                Q_arr, P_arr = spatial_q_test(block, kernel, null_params=null_params)
                 Q_arr = np.atleast_1d(Q_arr)
                 P_arr = np.atleast_1d(P_arr)
             else:
-                Q_arr = np.atleast_1d(
-                    spatial_q_test(block_std, kernel, return_pval=False, is_standardized=True)
-                )
+                Q_arr = np.atleast_1d(spatial_q_test(block, kernel, return_pval=False))
                 P_arr = np.full_like(Q_arr, np.nan)
             # Reference trace and trace²-based Z for reporting.
             if null_params is not None:
@@ -1297,10 +1294,13 @@ class DetectorIrregular(Detector):
         chunk_size: int,
         show_progress: bool = True,
     ) -> pd.DataFrame:
-        """NUFFT dispatch for :meth:`compute_rstat`."""
+        """NUFFT dispatch for :meth:`compute_rstat`.
+
+        ``var_R`` comes from :meth:`NUFFTKernel.square_trace` (already
+        n-point-scaled analytic default).
+        """
         kernel = self.kernel_
-        scale = kernel.n / (kernel.grid_shape[0] * kernel.grid_shape[1])
-        var_R = float(kernel.square_trace()) * (scale**2) if return_pval else 0.0
+        var_R = float(kernel.square_trace()) if return_pval else 0.0
         null_params = {"var_R": var_R}
 
         if features_x is None and features_y is not None:
@@ -1321,9 +1321,17 @@ class DetectorIrregular(Detector):
 
         logger.info("Testing %d x %d feature pairs via NUFFT...", len(names_kept), len(names_y))
 
-        # Densify the X block once (kept dense in memory for standardization).
-        X_block = np.asarray(X_kept.todense())
-        X_std = (X_block - means_x[None, :]) / np.where(stds_x > 0, stds_x, 1.0)[None, :]
+        # Densify the X block once. Do NOT pre-standardize at irregular points —
+        # the NUFFT R-test standardizes on the grid representation inside
+        # :func:`_r_test_nufft`.
+        X_block = np.asarray(X_kept.todense(), dtype=np.float64)
+
+        # Force the NUFFT kernel onto the matmul path for this call so the
+        # (M_x, M_y) cross matrix comes back rather than the paired diagonal
+        # that the default 'spectral' path emits when M_x == M_y. Restore
+        # whatever the user had set afterwards.
+        _prev_compute_method = kernel.compute_method
+        kernel.compute_method = "matmul"
 
         results: list[dict[str, Any]] = []
         y_chunks = [slice(i, i + chunk_size) for i in range(0, len(names_y), chunk_size)]
@@ -1331,22 +1339,17 @@ class DetectorIrregular(Detector):
             tqdm(y_chunks, desc=f"R (NUFFT, {self.kernel_method_})") if show_progress else y_chunks
         )
         for ysl in y_iter:
-            Y_block = np.asarray(X_y[:, ysl].todense())
-            Y_std = (Y_block - means_y[ysl][None, :]) / np.where(stds_y[ysl] > 0, stds_y[ysl], 1.0)[
-                None, :
-            ]
-            # Use the R-test on the chunk so null-param handling lives in one place.
+            Y_block = np.asarray(X_y[:, ysl].todense(), dtype=np.float64)
             R_chunk = spatial_r_test(
-                X_std,
-                Y_std,
+                X_block,
+                Y_block,
                 kernel,
                 null_params=null_params,
                 return_pval=False,
-                is_standardized=True,
             )
             R_chunk = np.atleast_2d(R_chunk)
-            if R_chunk.shape != (len(names_kept), Y_std.shape[1]):
-                R_chunk = R_chunk.reshape(len(names_kept), Y_std.shape[1])
+            if R_chunk.shape != (len(names_kept), Y_block.shape[1]):
+                R_chunk = R_chunk.reshape(len(names_kept), Y_block.shape[1])
             for i, name_x in enumerate(names_kept):
                 for j, name_y in enumerate(names_y[ysl]):
                     r = float(R_chunk[i, j])
@@ -1356,6 +1359,11 @@ class DetectorIrregular(Detector):
                         row["Z_score"] = z
                         row["P_value"] = float(2.0 * norm.sf(abs(z)))
                     results.append(row)
+        # Restore the user-configured compute_method before returning.
+        kernel.compute_method = _prev_compute_method
+        # Silence "unused" warnings for means_x/_y/stds now that grid-space
+        # standardization is done inside the NUFFT dispatch.
+        del means_x, means_y, stds_x, stds_y
 
         df = pd.DataFrame(results)
         if return_pval:

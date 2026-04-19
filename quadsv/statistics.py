@@ -338,9 +338,7 @@ def spatial_q_test(  # noqa: C901
 
     # Fast path: sparse Xn + unstandardized + kernel exposes xtKx_standardized.
     # Uses the (K·1, 1^T K 1) expansion so sparse Xn never needs densification.
-    use_sparse_fastpath = (
-        is_sparse and not is_standardized and hasattr(kernel, "xtKx_standardized")
-    )
+    use_sparse_fastpath = is_sparse and not is_standardized and hasattr(kernel, "xtKx_standardized")
 
     Q_results = []
     for chunk_idx in iterator:
@@ -368,9 +366,9 @@ def spatial_q_test(  # noqa: C901
                 valid_mask = stds > 1e-12
                 z = np.zeros_like(Xn_chunk)
                 if np.any(valid_mask):
-                    z[:, valid_mask] = (
-                        Xn_chunk[:, valid_mask] - means[valid_mask]
-                    ) / stds[valid_mask]
+                    z[:, valid_mask] = (Xn_chunk[:, valid_mask] - means[valid_mask]) / stds[
+                        valid_mask
+                    ]
 
             if hasattr(kernel, "xtKx"):
                 Q_chunk = kernel.xtKx(z)
