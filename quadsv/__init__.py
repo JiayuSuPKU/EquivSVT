@@ -1,7 +1,5 @@
 """
-quadsv: kernel-based spatial variability / co-expression tests for spatial omics.
-
-The top-level namespace exposes exactly four conceptual layers, nothing else:
+quadsv: kernel-based spatial pattern detection and comparison for spatial omics.
 
 1. **Kernels** — :class:`MatrixKernel` (dense / sparse), :class:`FFTKernel`
    (regular grid), :class:`NUFFTKernel` (irregular 2D coordinates). All three
@@ -16,11 +14,6 @@ The top-level namespace exposes exactly four conceptual layers, nothing else:
 4. **Comparators** — cross-sample pattern comparison:
    :class:`ComparatorIrregular` on a list of AnnData (NUFFT backend);
    :class:`ComparatorGrid` on a list of SpatialData (FFT backend).
-
-Utilities, constants, and internal primitives (Liu's SF, Visium I/O,
-radial binning, etc.) remain accessible under their submodules
-(``quadsv.io_visium``, ``quadsv.statistics``, ``quadsv.fft``, ``quadsv.nufft``,
-``quadsv.multisample``) but are not re-exported at the top level.
 """
 
 import logging
