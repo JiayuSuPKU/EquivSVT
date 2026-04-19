@@ -157,6 +157,9 @@ class TestNUFFTKernelConstruction:
             nu=1.5,
         )
         Q_a, Q_b = k_auto.xtKx(x), k_big.xtKx(x)
+        # 5% band: auto-derived grid (oversample=2 above the sampling Nyquist)
+        # vs a deliberately oversized 256x256 grid; residual is NUFFT eps +
+        # grid discretization on the auto side.
         assert abs(Q_a - Q_b) / abs(Q_b) < 0.05, f"auto vs overkill: {Q_a:.1f} vs {Q_b:.1f}"
 
     def test_partial_override(self):
@@ -204,8 +207,9 @@ class TestNUFFTKernelxtKx:
         )
         sk = MatrixKernel.from_coordinates(coords, method="matern", bandwidth=2.0, nu=1.5)
         # Average over several random x to smooth realization noise. The
-        # relative bias is dominated by torus vs Euclidean boundary conditions
-        # (~2-5% typical), which is the same approximation FFTKernel makes.
+        # 15% budget breaks down as: torus-BC vs Euclidean BC (~2-5%), NUFFT
+        # precision at eps=1e-6 (~1-3%), kernel discretization on the
+        # 64×64 k-grid (~2-5%). Same approximation stack the FFTKernel uses.
         rels = []
         for _ in range(10):
             xi = rng.standard_normal(N)
@@ -225,9 +229,9 @@ class TestNUFFTKernelxtKx:
         np.testing.assert_allclose(Q_batched, Q_loop, rtol=1e-6, atol=1e-9)
 
 
-class TestNUFFTKernelKz:
-    def test_Kz_consistent_with_xtKx(self):
-        """z^T K z computed via z·Kx(z) should match the direct xtKx(z) call."""
+class TestNUFFTKernelKx:
+    def test_Kx_consistent_with_xtKx(self):
+        """x^T K x computed via x·Kx(x) should match the direct xtKx(x) call."""
         ny, nx = 16, 20
         yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
         coords = np.stack([yy.ravel(), xx.ravel()], axis=1).astype(float)
@@ -238,7 +242,7 @@ class TestNUFFTKernelKz:
         assert Kz.shape == (ny * nx,)
         assert abs(float(z @ Kz) - k_nufft.xtKx(z)) < 1e-4
 
-    def test_batched_Kz(self):
+    def test_batched_Kx(self):
         rng = np.random.default_rng(0)
         N, M = 200, 3
         coords = rng.uniform(0, 15, size=(N, 2))
@@ -292,8 +296,8 @@ class TestNUFFTTwoPathsAgree:
         assert abs(Q_a - Q_b) / max(abs(Q_a), 1e-30) < 0.05
 
     def test_spectral_vs_matmul_on_regular_grid(self):
-        """On a regular grid (N = n') the two paths should agree much more
-        tightly — both reduce to the FFT kernel's quadratic form."""
+        """On a regular grid (n = n') both paths reduce to the same FFT —
+        residual is float-precision only (~1e-8 typical)."""
         ny, nx = 16, 16
         yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
         coords = np.stack([yy.ravel(), xx.ravel()], axis=1).astype(float)
@@ -305,11 +309,15 @@ class TestNUFFTTwoPathsAgree:
             bandwidth=2.0,
             nu=1.5,
         )
-        rng = np.random.default_rng(1)
-        x = rng.standard_normal(ny * nx)
-        Q_a = k.xtKx(x)
-        Q_b = k.xtKx_matmul(x)
-        assert abs(Q_a - Q_b) / max(abs(Q_a), 1e-30) < 1e-4
+        # Loop a few seeds to confirm 1e-8 holds reliably, not just for one rng.
+        for seed in range(5):
+            rng = np.random.default_rng(seed)
+            x = rng.standard_normal(ny * nx)
+            Q_a = k.xtKx(x)
+            Q_b = k.xtKx_matmul(x)
+            assert (
+                abs(Q_a - Q_b) / max(abs(Q_a), 1e-30) < 1e-8
+            ), f"seed={seed}: Q_a={Q_a:.6e}, Q_b={Q_b:.6e}"
 
     def test_trace_analytic_vs_hutchinson_agree_on_irregular(self):
         """``trace(method='analytic')`` (Path A null) and
@@ -348,6 +356,34 @@ class TestNUFFTTwoPathsAgree:
         s_ana = k.square_trace(method="analytic")
         s_hut = k.square_trace(method="hutchinson", n_probes=128)
         assert abs(s_ana - s_hut) / max(abs(s_ana), 1e-30) < 0.15
+
+    def test_Kx_grid_round_trip_matches_xtKx(self):
+        """``Kx_grid`` returns ``K x`` on the spatial grid; its inner product
+        with the same grid signal must equal ``xtKx`` algebraically. The
+        residual is bounded by the NUFFT precision ``eps`` (1e-6 default) —
+        both methods run a type-1 NUFFT but ``Kx_grid`` additionally does a
+        phase correction + ``ifft2`` round-trip, so the gap sits at ``eps``
+        rather than float-precision."""
+        ny, nx = 16, 16
+        yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
+        coords = np.stack([yy.ravel(), xx.ravel()], axis=1).astype(float)
+        k = NUFFTKernel(
+            coords,
+            grid_shape=(ny, nx),
+            spacing=(1.0, 1.0),
+            method="matern",
+            bandwidth=2.0,
+            nu=1.5,
+            eps=1e-10,  # push NUFFT precision down so the identity is tight.
+        )
+        rng = np.random.default_rng(3)
+        x = rng.standard_normal(ny * nx)
+        x_grid_signal = x.reshape(ny, nx)
+        Kx_on_grid = k.Kx_grid(x)  # (ny, nx) real
+        assert Kx_on_grid.shape == (ny, nx)
+        q_via_grid = float(np.sum(x_grid_signal * Kx_on_grid))
+        q_direct = float(k.xtKx(x))
+        assert abs(q_via_grid - q_direct) / max(abs(q_direct), 1e-30) < 1e-8
 
 
 class TestSpatialQTestNUFFT:
@@ -490,9 +526,9 @@ class TestDetectorNUFFTBackend:
             det.compute_qstat(n_jobs=1)
 
 
-class TestPhaseBNUFFTUnification:
-    """Phase B: NUFFT Q/R tests accept the canonical kwargs and honor
-    `null_params` without changing results."""
+class TestNUFFTKernelNullParamsRoundTrip:
+    """NUFFT Q/R tests accept the canonical kwargs and honor ``null_params``
+    without changing results."""
 
     def test_qtest_nufft_null_params_round_trip(self):
         from quadsv.nufft import NUFFTKernel

@@ -510,5 +510,66 @@ class TestDetectorIrregularEdgeCases(unittest.TestCase):
         self.assertTrue(len(names) <= n_vars)
 
 
+class TestDetectorIrregularBackendParity(unittest.TestCase):
+    """``backend='matrix'`` and ``backend='nufft'`` target the same underlying
+    Q-statistic but use different null-distribution approximations (Welch
+    from the full matrix spectrum vs. analytic FFT-kernel moments rescaled by
+    ``n/n'``). Exact Q values differ, but the *ranking* of structured vs.
+    noise features should agree."""
+
+    def setUp(self):
+        import anndata
+
+        rng = np.random.default_rng(0)
+        n_spots = 300
+        coords = rng.uniform(0, 20, size=(n_spots, 2))
+        n_genes = 6
+        X = rng.standard_normal((n_spots, n_genes))
+        # g0 carries a clean sine pattern along the y-axis; the rest are iid.
+        X[:, 0] = np.sin(2 * np.pi * coords[:, 0] / 5.0) + 0.3 * rng.standard_normal(n_spots)
+        X = np.maximum(X + 3.0, 0.0)
+
+        self.adata = anndata.AnnData(
+            X=X,
+            var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)]),
+            obsm={"spatial": coords},
+        )
+
+    def test_matrix_vs_nufft_rank_agreement_on_structured_gene(self):
+        """Both backends rank ``g0`` first and agree on the broader Q
+        ordering. Spearman ≥ 0.7: two distinct null approximations + matrix
+        vs. grid operator means exact Q differs, but the *ordering* of a
+        single structured gene against 5 iid noise genes should agree."""
+        from scipy.stats import spearmanr
+
+        det_m = DetectorIrregular(kernel_method="matern", backend="matrix", bandwidth=2.0, nu=1.5)
+        det_m.setup_data(self.adata, min_cells=5)
+        df_m = det_m.compute_qstat(n_jobs=1, show_progress=False)
+
+        det_n = DetectorIrregular(kernel_method="matern", backend="nufft", bandwidth=2.0, nu=1.5)
+        det_n.setup_data(self.adata, min_cells=5)
+        df_n = det_n.compute_qstat(n_jobs=1, show_progress=False)
+
+        # Normalize: the matrix path indexes by Feature; the NUFFT path keeps
+        # it as a column. Re-index both so the test doesn't depend on that.
+        def _by_feature(df):
+            return df.set_index("Feature") if "Feature" in df.columns else df
+
+        df_m = _by_feature(df_m)
+        df_n = _by_feature(df_n)
+
+        # Both are sorted Q descending → first row is the top-ranked gene.
+        self.assertEqual(df_m.index[0], "g0")
+        self.assertEqual(df_n.index[0], "g0")
+        self.assertLess(df_m.loc["g0", "P_value"], 0.05)
+        self.assertLess(df_n.loc["g0", "P_value"], 0.05)
+
+        common = sorted(set(df_m.index) & set(df_n.index))
+        q_m = df_m.loc[common, "Q"].to_numpy()
+        q_n = df_n.loc[common, "Q"].to_numpy()
+        rho, _ = spearmanr(q_m, q_n)
+        self.assertGreaterEqual(rho, 0.7, msg=f"Spearman(Q_matrix, Q_nufft) = {rho:.2f}")
+
+
 if __name__ == "__main__":
     unittest.main()

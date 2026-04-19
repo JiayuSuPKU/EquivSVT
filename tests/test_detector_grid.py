@@ -393,5 +393,55 @@ class TestDetectorGrid(unittest.TestCase):
                 self.assertTrue(all(np.isfinite(df["Q"])))
 
 
+class TestDetectorGridStatistic(unittest.TestCase):
+    """``DetectorGrid.compute_qstat`` is ``spatial_q_test`` on the rasterized
+    data with per-feature z-scoring across the grid. The identity must hold to
+    float-precision (~1e-10) because both paths call the same FFTKernel on
+    the same standardized inputs."""
+
+    def setUp(self):
+        features = np.array([f"g{i}" for i in range(4)])
+        ny, nx = 8, 8
+        rng = np.random.default_rng(0)
+        self.features = features
+        self.ny, self.nx = ny, nx
+        # Structured first feature, noise for the rest — just so Q values
+        # span a useful range for the equality comparison.
+        raster = rng.standard_normal((len(features), ny, nx))
+        yy = np.arange(ny)[:, None]
+        raster[0] += np.sin(2 * np.pi * yy / 4.0)
+        self.raster_data = raster
+        self.mock_da = MockDataArray(raster, features)
+
+        table_X = np.ones((16, len(features)), dtype=float)  # min_count passes
+        self.table = MockTable(table_X, list(features))
+        self.sdata = MockSpatialData("cells", self.table)
+
+    def _setup(self, detector, **kwargs):
+        params = {"bins": "bins", "table_name": "cells", "col_key": "col", "row_key": "row"}
+        params.update(kwargs)
+        return detector.setup_data(self.sdata, **params)
+
+    def test_qstat_matches_raw_fftkernel_spatial_q_test(self):
+        """``DetectorGrid.compute_qstat`` must equal a raw
+        ``spatial_q_test(FFTKernel, z_scored_grid)`` — same FFTKernel, same
+        per-feature grid z-score, so the gap is pure float-precision."""
+        from quadsv.statistics import spatial_q_test
+
+        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+            detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.5)
+            self._setup(detector)
+            df = detector.compute_qstat(n_jobs=1, return_pval=False, show_progress=False)
+
+        # Reproduce the detector's internal prep:
+        # - load (n_feats, ny, nx) raster, move axis to (ny, nx, n_feats),
+        # - let spatial_q_test z-score per feature (is_standardized=False).
+        raster_tyx = np.moveaxis(self.raster_data, 0, -1)  # (ny, nx, n_feats)
+        Q_raw = np.asarray(spatial_q_test(raster_tyx, detector.kernel_, return_pval=False))
+        # ``df`` is sorted by Q desc; align by feature name.
+        Q_from_detector = df.loc[list(self.features), "Q"].to_numpy()
+        np.testing.assert_allclose(Q_from_detector, Q_raw, rtol=1e-10, atol=1e-12)
+
+
 if __name__ == "__main__":
     unittest.main()

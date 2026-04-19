@@ -220,10 +220,10 @@ class TestStatisticalFunctions(unittest.TestCase):
         self.assertAlmostEqual(pval, 1.0, places=8)
 
 
-class TestPhaseBUnification(unittest.TestCase):
-    """Phase B cross-cutting checks: shared signature shape, var_R hand-off,
-    and equivalence of spatial_r_test's public Kx path with the legacy
-    `kernel._K`-based computation."""
+class TestKernelPrimitivesAndNullParams(unittest.TestCase):
+    """Cross-cutting checks: shared signature shape, ``var_R`` hand-off, and
+    equivalence of ``spatial_r_test``'s public ``Kx`` path with the legacy
+    ``kernel._K``-based computation."""
 
     def setUp(self):
         np.random.seed(0)

@@ -466,6 +466,63 @@ class TestFFTVsMatrixKernelComparison(unittest.TestCase):
         rel_error = np.abs(R_fft - R_std) / (np.abs(R_std) + 1e-10)
         assert rel_error < 1e-5, f"R statistic {R_fft:.2f}/{R_std:.2f}, rel error: {rel_error: .2f}"
 
+    # ------------------------------------------------------------------
+    # FFT↔Matrix Q/R parity across all kernel methods.
+    # Gaussian is the easy case (pure dense matmul on the Matrix side).
+    # Matern / Moran / CAR stress different Matrix-path branches and bring
+    # slightly looser tolerances because CAR goes through ``inv(M)`` and Moran
+    # mixes negative eigenvalues with normal p-value approximation.
+    # ------------------------------------------------------------------
+
+    def _q_parity(self, method: str, tol: float, **kwargs):
+        nx, ny = 20, 20
+        _, fft_k, spatial_k = self.create_grid_and_kernels(nx, ny, method=method, **kwargs)
+        rng = np.random.default_rng(0)
+        x_data = rng.standard_normal((ny, nx))
+        Q_fft = spatial_q_test(x_data, fft_k, return_pval=False)
+        Q_std = spatial_q_test_standard(x_data.ravel(), spatial_k, return_pval=False)
+        rel = abs(float(Q_fft) - float(Q_std)) / (abs(float(Q_std)) + 1e-10)
+        assert rel < tol, f"{method} Q parity: fft={Q_fft:.4f} matrix={Q_std:.4f} rel={rel:.2e}"
+
+    def _r_parity(self, method: str, tol: float, **kwargs):
+        nx, ny = 20, 20
+        _, fft_k, spatial_k = self.create_grid_and_kernels(nx, ny, method=method, **kwargs)
+        rng = np.random.default_rng(1)
+        x_data = rng.standard_normal((ny, nx))
+        y_data = rng.standard_normal((ny, nx))
+        R_fft = spatial_r_test(x_data, y_data, fft_k, return_pval=False)
+        R_std = spatial_r_test_standard(
+            x_data.ravel(), y_data.ravel(), spatial_k, return_pval=False
+        )
+        rel = abs(float(R_fft) - float(R_std)) / (abs(float(R_std)) + 1e-10)
+        assert rel < tol, f"{method} R parity: fft={R_fft:.4f} matrix={R_std:.4f} rel={rel:.2e}"
+
+    def test_q_statistic_parity_matern(self):
+        """FFT↔Matrix Q parity for Matern: both paths are dense matmul on the
+        Matrix side, so the gap is pure float-precision (~1e-5)."""
+        self._q_parity("matern", tol=1e-5, bandwidth=2.0, nu=1.5)
+
+    def test_q_statistic_parity_moran(self):
+        """FFT↔Matrix Q parity for Moran: normalized adjacency on both sides,
+        no precision inversion, so ~1e-5 is achievable."""
+        self._q_parity("moran", tol=1e-5, neighbor_degree=1, k_neighbors=4)
+
+    def test_q_statistic_parity_car(self):
+        """FFT↔Matrix Q parity for CAR: looser band (~1e-4) because the Matrix
+        path goes through ``inv(I - ρW)`` — dense BLAS threading introduces
+        ~float64·n^2 noise even on small grids."""
+        self._q_parity("car", tol=1e-4, neighbor_degree=1, k_neighbors=4, rho=0.9)
+
+    def test_r_statistic_parity_matern_and_moran(self):
+        """FFT↔Matrix R parity for Matern and Moran — both tight (~1e-5)."""
+        self._r_parity("matern", tol=1e-5, bandwidth=2.0, nu=1.5)
+        self._r_parity("moran", tol=1e-5, neighbor_degree=1, k_neighbors=4)
+
+    def test_r_statistic_parity_car(self):
+        """FFT↔Matrix R parity for CAR — looser band (~1e-4) per the same
+        ``inv(M)`` threading argument as the Q-stat version."""
+        self._r_parity("car", tol=1e-4, neighbor_degree=1, k_neighbors=4, rho=0.9)
+
     def test_batched_vs_sequential_q(self):
         """Test that batched Q computation matches sequential."""
         nx, ny = 20, 20
@@ -509,9 +566,9 @@ class TestFFTVsMatrixKernelComparison(unittest.TestCase):
         assert np.allclose(R_batch, R_seq, rtol=1e-10)
 
 
-class TestPhaseBFFTUnification(unittest.TestCase):
-    """Phase B: verify FFT tests share the canonical signature and that
-    supplying `null_params` returns the same numbers as the on-the-fly path."""
+class TestFFTKernelNullParamsRoundTrip(unittest.TestCase):
+    """Verify FFT tests share the canonical signature and that supplying
+    ``null_params`` returns the same numbers as the on-the-fly path."""
 
     def setUp(self):
         np.random.seed(0)

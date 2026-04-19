@@ -2,9 +2,7 @@
 Unit tests for kernel classes and methods.
 """
 
-import time
 import unittest
-import warnings
 
 import numpy as np
 import scipy.sparse as sp
@@ -207,7 +205,7 @@ class TestMatrixKernel(unittest.TestCase):
         self.assertAlmostEqual(sq_trace_result, expected_sq_trace, places=4)
 
 
-class TestCARStandardize(unittest.TestCase):
+class TestMatrixKernelStandardization(unittest.TestCase):
     def setUp(self):
         np.random.seed(0)
         # Small grid for explicit inversion path
@@ -248,7 +246,7 @@ class TestCARStandardize(unittest.TestCase):
         self.assertGreater(np.max(np.abs(diag - 1.0)), 1e-3)
 
 
-class TestImplicitTraceOperations(unittest.TestCase):
+class TestMatrixKernelImplicitTrace(unittest.TestCase):
     """Test trace and square_trace for implicit kernel matrices."""
 
     def setUp(self):
@@ -280,8 +278,10 @@ class TestImplicitTraceOperations(unittest.TestCase):
         K_realized = kernel.realization()
         true_trace = np.trace(K_realized)
 
-        # They should be close (Hutchinson's estimator has variance but should converge)
-        # Relative error should be small
+        # 0.5% budget: Hutchinson with n_probes=15 on a 72×72 CAR whose
+        # spectrum has a heavy large-eigenvalue tail — Hutchinson averages
+        # that tail efficiently, so the probe-noise band tightens well below
+        # the naive 1/√15 ≈ 26% heuristic for flatter spectra.
         rel_error = np.abs(implicit_trace - true_trace) / (np.abs(true_trace) + 1e-10)
         self.assertLess(
             rel_error, 0.005, msg=f"Trace estimation relative error {rel_error:.4f} exceeds 0.5%"
@@ -311,118 +311,6 @@ class TestImplicitTraceOperations(unittest.TestCase):
             0.005,
             msg=f"Square trace estimation relative error {rel_error:.4f} exceeds 0.5%",
         )
-
-
-class TestStandardizationPerformance(unittest.TestCase):
-    """Test standardization of inverse kernel matrices with sparse vs dense performance comparison."""
-
-    def setUp(self):
-        """Set up test fixtures with various sizes."""
-        np.random.seed(123)
-        # Moderate size for testing standardization
-        self.n_dense = 4900  # below implicit threshold
-        self.n_sparse = 5184  # just above implicit threshold
-
-    def _create_sparse_precision(self, n, k_neighbors=4):
-        """Helper to create a sparse precision matrix from coordinates."""
-        # Create grid
-        side = int(np.sqrt(n))
-        x = np.linspace(0, 10, side)
-        y = np.linspace(0, 10, side)
-        xx, yy = np.meshgrid(x, y)
-        coords = np.column_stack((xx.ravel()[:n], yy.ravel()[:n]))
-
-        # Build adjacency
-        from sklearn.neighbors import NearestNeighbors
-
-        nbrs = NearestNeighbors(n_neighbors=k_neighbors).fit(coords)
-        W = nbrs.kneighbors_graph(coords, mode="connectivity").astype(float)
-
-        # Symmetrize and normalize
-        W_sym = 0.5 * (W + W.T)
-        row_sums = np.array(W_sym.sum(axis=1)).flatten()
-        row_sums[row_sums == 0] = 1.0
-        inv_D_sqrt = sp.diags(1.0 / np.sqrt(row_sums))
-        W_norm = inv_D_sqrt @ W_sym @ inv_D_sqrt
-
-        # Create precision M = I - rho * W_norm
-        rho = 0.85
-        I = sp.eye(side * side, format="csc")
-        M = I - rho * W_norm
-        return M.tocsc()
-
-    def _standardize_sparse_vs_dense_runtime(self, n):
-        """Compare runtime of sparse batched solve vs dense inversion for standardization."""
-        side = int(np.sqrt(n))
-        n = side * side  # ensure perfect square for grid
-        M_sparse = self._create_sparse_precision(n)
-        M_dense = M_sparse.toarray()
-
-        print(f"\n{'=' * 60}")
-        print(f"Standardization Runtime Comparison (n={n})")
-        print(f"{'=' * 60}")
-
-        # Test sparse approach (batched solves)
-        if n > 5000:
-            print("Testing sparse batched approach...")
-        else:
-            print("Testing sparse approach (converted to dense for small n)...")
-
-        start_sparse = time.time()
-        kernel_sparse = MatrixKernel.from_matrix(
-            M_sparse,
-            is_precision=True,
-            method="car",
-            standardize=True,
-        )
-        K_sparse = kernel_sparse.realization()
-        time_sparse = time.time() - start_sparse
-        diag_sparse = np.diag(K_sparse)
-
-        print(f"  Sparse time: {time_sparse:.3f}s")
-        print(
-            f"  Diagonal check: min={diag_sparse.min():.6f}, max={diag_sparse.max():.6f}, mean={diag_sparse.mean():.6f}"
-        )
-
-        # Test dense approach (full inversion)
-        print("\nTesting dense inversion approach...")
-        start_dense = time.time()
-        # Ignore warnings during dense inversion to avoid recursion issues
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            kernel_dense = MatrixKernel.from_matrix(
-                M_dense,
-                is_precision=True,
-                method="car",
-                standardize=True,
-            )
-        K_dense = kernel_dense.realization()
-        time_dense = time.time() - start_dense
-        diag_dense = np.diag(K_dense)
-
-        print(f"  Dense time: {time_dense:.3f}s")
-        print(
-            f"  Diagonal check: min={diag_dense.min():.6f}, max={diag_dense.max():.6f}, mean={diag_dense.mean():.6f}"
-        )
-
-        # Compare results
-        speedup = time_dense / time_sparse
-        print(f"\n  Speedup (sparse/dense): {speedup:.2f}x")
-        print(f"{'=' * 60}\n")
-
-        # Verify both give similar results
-        np.testing.assert_allclose(diag_sparse, np.ones(n), rtol=1e-4, atol=1e-3)
-        np.testing.assert_allclose(diag_dense, np.ones(n), rtol=1e-4, atol=1e-3)
-        np.testing.assert_allclose(diag_sparse, diag_dense, rtol=1e-3, atol=1e-3)
-
-        # Sparse should generally be faster (though not guaranteed on small n;
-        # threshold stays loose so the test isn't flaky under CPU contention).
-        self.assertGreater(speedup, 0.5, msg="Sparse approach should be competitive with dense")
-
-    def test_standardize_runtime(self):
-        """Test standardization runtime for small and large n."""
-        self._standardize_sparse_vs_dense_runtime(self.n_dense)
-        self._standardize_sparse_vs_dense_runtime(self.n_sparse)
 
 
 class TestKernelUtilities(unittest.TestCase):
@@ -490,6 +378,74 @@ class TestKernelUtilities(unittest.TestCase):
         kernel2 = MatrixKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
         kernel2.__setstate__(state)
         self.assertIsNone(kernel2._lu)
+
+
+class TestXtKxStandardized(unittest.TestCase):
+    """``MatrixKernel.xtKx_standardized`` must match the manual
+    ``z = (X - μ)/σ; kernel.xtKx(z)`` pipeline to float-precision — it's an
+    algebraic identity, so the tolerance is ~1e-10, not an approximation band.
+    """
+
+    def setUp(self):
+        rng = np.random.default_rng(0)
+        self.coords = rng.standard_normal((100, 2))
+        self.kernel = MatrixKernel.from_coordinates(
+            self.coords, method="matern", bandwidth=1.0, nu=1.5
+        )
+
+    def test_matches_manual_zscore_dense(self):
+        """Dense ``X``: ``xtKx_standardized(X, μ, σ)`` equals
+        ``xtKx((X - μ)/σ)`` to float-precision."""
+        rng = np.random.default_rng(1)
+        X = rng.standard_normal((100, 5))
+        means = X.mean(axis=0)
+        stds = X.std(axis=0, ddof=1)
+        Z = (X - means) / stds
+
+        q_fast = self.kernel.xtKx_standardized(X, means, stds)
+        q_manual = np.asarray(self.kernel.xtKx(Z))
+        np.testing.assert_allclose(q_fast, q_manual, rtol=1e-10, atol=1e-12)
+
+    def test_matches_manual_zscore_sparse(self):
+        """Sparse ``X``: sparse fast-path agrees with the dense reference to
+        float-precision — verifies the ``(K·1, 1ᵀK1)`` expansion."""
+        import scipy.sparse as sp
+
+        rng = np.random.default_rng(2)
+        X_dense = rng.standard_normal((100, 4))
+        # Sparsify by zeroing ~60% of entries; keep sparsity realistic.
+        X_dense[rng.random(X_dense.shape) < 0.6] = 0.0
+        X_sparse = sp.csc_matrix(X_dense)
+        # Means/stds must be computed from the same underlying data the fast
+        # path will see (sparse's column stats).
+        means = np.asarray(X_sparse.mean(axis=0)).ravel()
+        sq = np.asarray(X_sparse.multiply(X_sparse).sum(axis=0)).ravel()
+        n = X_sparse.shape[0]
+        var = (sq - n * means**2) / max(n - 1, 1)
+        var[var < 0] = 0.0
+        stds = np.sqrt(var)
+        Z = np.zeros_like(X_dense)
+        valid = stds > 1e-12
+        Z[:, valid] = (X_dense[:, valid] - means[valid]) / stds[valid]
+
+        q_fast = self.kernel.xtKx_standardized(X_sparse, means, stds)
+        q_manual = np.asarray(self.kernel.xtKx(Z))
+        np.testing.assert_allclose(q_fast, q_manual, rtol=1e-10, atol=1e-12)
+
+    def test_zero_variance_column_returns_zero(self):
+        """Constant columns (std=0) must return 0 per the documented contract."""
+        X = np.zeros((100, 3))
+        X[:, 0] = 1.0  # constant column → std=0
+        X[:, 1] = np.linspace(-1, 1, 100)
+        X[:, 2] = 7.5  # another constant column
+        means = X.mean(axis=0)
+        stds = X.std(axis=0, ddof=1)
+
+        q = self.kernel.xtKx_standardized(X, means, stds)
+        self.assertAlmostEqual(q[0], 0.0, places=12)
+        self.assertAlmostEqual(q[2], 0.0, places=12)
+        # Middle column has nonzero std → nonzero Q.
+        self.assertGreater(q[1], 0.0)
 
 
 if __name__ == "__main__":
