@@ -175,29 +175,53 @@ def compute_null_params(
 
     assert method in ["clt", "welch", "liu"], "Method must be 'clt', 'welch', or 'liu'."
 
-    # trace(K²) is the null variance of R = x^T K y and is cheap enough
-    # that we always populate it so the same params dict can feed both
-    # Q-tests and R-tests.
-    tr_K2 = kernel.square_trace()
-    params["var_R"] = float(tr_K2)
+    # `spatial_q_test` standardizes its input as Z = (X − X̄·𝟏) / σ, so the
+    # realized quadratic form is Q = Zᵀ K Z = Xᵀ (H K H) X / σ² with
+    # H = I − 𝟏𝟏ᵀ/n. Null moments are for HKH, NOT raw K. We obtain the
+    # centered traces cheaply from two additional numbers:
+    #   s1 = 𝟏ᵀ K 𝟏,   s2 = ‖K·𝟏‖² = 𝟏ᵀ K² 𝟏
+    # via a single K·𝟏 application (see `Kernel._ones_stats`), giving
+    #   trace(HKH)   = trace(K)  − s1/n
+    #   trace((HKH)²) = trace(K²) − 2·s2/n + s1²/n²
+    # The Q-test statistic is additionally a *ratio* of quadratic forms
+    # (the denominator σ² is a random variable correlated with the
+    # numerator), and its exact variance picks up a finite-n correction
+    # derived from the Dirichlet(1/2, …, 1/2) distribution of Yᵢ²/ΣYⱼ²:
+    #   Var[Q] = 2·[m · trace((HKH)²) − (trace(HKH))²] / (m+2)    m = n−1
+    # The R-test is easier — independence of X, Y gives
+    #   Var[R] = trace((HKH)²)   (exact, no finite-n correction).
+    n = int(kernel.n)
+    # ``kernel.trace()`` / ``kernel.square_trace()`` return the centered
+    # moments ``trace(HKH)`` / ``trace((HKH)²)`` when ``kernel.centering``
+    # is True (the default) — i.e. the moments of the operator actually
+    # applied after z-scoring. The R-test variance is the squared trace
+    # exactly (no finite-n correction, since X⊥Y).
+    tr_HKH = float(kernel.trace())
+    tr_HKH_sq = float(kernel.square_trace())
+    params["var_R"] = tr_HKH_sq
 
     if method == "liu":
-        # Requires eigenvalues
-        # If kernel is implicit/sparse, we might only get top k
+        # ``kernel.eigenvalues`` returns eigvals(HKH) when ``centering`` is
+        # True (FFT / NUFFT zero out the DC mode; MatrixKernel falls back
+        # to raw eigvals with a documented approximation).
         vals = kernel.eigenvalues(k=k_eigen)
-        # Filter numerical noise
+        # Filter numerical noise.
         params["eigenvalues"] = vals[np.abs(vals) > 1e-9]
     else:
-        # Q-test moments
-        tr_K = kernel.trace()
-        params["mean_Q"] = tr_K
-        params["var_Q"] = 2 * tr_K2
+        # Q-test CLT / Welch moments — centered + finite-n corrected.
+        m = max(n - 1, 1)
+        mean_Q = tr_HKH
+        var_Q = 2.0 * (m * tr_HKH_sq - tr_HKH**2) / (m + 2)
+        # Numerical safety: variance must be non-negative.
+        var_Q = max(var_Q, 0.0)
+        params["mean_Q"] = float(mean_Q)
+        params["var_Q"] = float(var_Q)
 
         if method == "welch":
-            # Pre-calculate Welch-Satterthwaite parameters
-            if params["var_Q"] > 0:
-                params["scale_g"] = params["var_Q"] / (2 * params["mean_Q"])
-                params["df_h"] = (2 * params["mean_Q"] ** 2) / params["var_Q"]
+            # Pre-calculate Welch-Satterthwaite parameters.
+            if var_Q > 0 and mean_Q > 0:
+                params["scale_g"] = var_Q / (2.0 * mean_Q)
+                params["df_h"] = (2.0 * mean_Q**2) / var_Q
             else:
                 params["scale_g"] = 1.0
                 params["df_h"] = 1.0
@@ -585,8 +609,10 @@ def spatial_r_test(  # noqa: C901
     if not return_pval:
         return R
 
-    # 3. P-value (Normal Approximation)
-    # R ~ N(0, Tr(K²)).
+    # 3. P-value (Normal Approximation).
+    # Both X, Y are z-scored before R = Zₓᵀ K Zᵧ, so R ~ N(0, trace((HKH)²))
+    # — NOT trace(K²). kernel.square_trace() returns the centered trace by
+    # default (centering=True).
     if null_params is not None and "var_R" in null_params:
         var_R = float(null_params["var_R"])
     else:

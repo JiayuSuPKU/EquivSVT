@@ -231,7 +231,10 @@ class TestKernelPrimitivesAndNullParams(unittest.TestCase):
         y = np.linspace(0, 4, 5)
         xx, yy = np.meshgrid(x, y)
         self.coords = np.column_stack((xx.ravel(), yy.ravel()))
-        self.kernel = MatrixKernel.from_coordinates(self.coords, method="matern")
+        # Use raw (centering=False) so ``kernel.Kx(z) == K @ z`` algebraically
+        # matches what the K·z primitive tests expect. Centered behavior is
+        # covered by the Q-test FPR / power tests in test_kernels.py.
+        self.kernel = MatrixKernel.from_coordinates(self.coords, method="matern", centering=False)
         self.n = self.coords.shape[0]
 
     def test_compute_null_params_populates_var_R(self):

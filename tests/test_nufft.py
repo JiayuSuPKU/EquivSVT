@@ -257,12 +257,12 @@ class TestNUFFTKernelKx:
 
 class TestNUFFTKernelTrace:
     def test_trace_analytic_scales_fftkernel(self):
-        """Default analytic ``trace`` / ``square_trace`` come from the internal
-        FFTKernel's moments rescaled by ``N/n'`` and ``(N/n')²`` respectively —
-        the n-point-operator scaling used by :func:`spatial_q_test`."""
+        """Raw ``trace`` / ``square_trace`` (centering=False) rescale the
+        internal FFTKernel's moments by ``N/n'`` and ``(N/n')²`` — the
+        n-point-operator scaling used by :func:`spatial_q_test`."""
         rng = np.random.default_rng(0)
         coords = rng.uniform(0, 20, size=(400, 2))
-        k = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
+        k = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5, centering=False)
         n_over_nprime = k.n / (k.grid_shape[0] * k.grid_shape[1])
         assert k.trace() == pytest.approx(k._fft_kernel.trace() * n_over_nprime, rel=1e-12)
         assert k.square_trace() == pytest.approx(
@@ -336,7 +336,8 @@ class TestNUFFTTwoPathsAgree:
     def test_trace_analytic_vs_hutchinson_agree_on_regular_grid(self):
         """On a regular grid (N = n') the band-limited approximation is exact,
         so the analytic and Hutchinson estimators share the same population
-        moments — the gap is only probe noise."""
+        moments — the gap is only probe noise. Both estimators act on the
+        raw operator; disable centering to isolate the scaling identity."""
         ny, nx = 16, 16
         yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
         coords = np.stack([yy.ravel(), xx.ravel()], axis=1).astype(float)
@@ -347,6 +348,7 @@ class TestNUFFTTwoPathsAgree:
             method="matern",
             bandwidth=2.0,
             nu=1.5,
+            centering=False,
         )
         t_ana = k.trace(method="analytic")
         t_hut = k.trace(method="hutchinson", n_probes=128)
@@ -375,6 +377,7 @@ class TestNUFFTTwoPathsAgree:
             bandwidth=2.0,
             nu=1.5,
             eps=1e-10,  # push NUFFT precision down so the identity is tight.
+            centering=False,
         )
         rng = np.random.default_rng(3)
         x = rng.standard_normal(ny * nx)
@@ -561,8 +564,83 @@ class TestNUFFTKernelNullParamsRoundTrip:
         x = rng.standard_normal(ny * nx)
         y = rng.standard_normal(ny * nx)
         R_auto, p_auto = spatial_r_test(x, y, k)
-        scale = k.n / (ny * nx)
-        var_R = float(k.square_trace()) * (scale**2)
+        # Since both X, Y are z-scored, var_R = trace((HKH)²). With the
+        # default centering=True kernel, ``k.square_trace()`` returns
+        # exactly that centered trace.
+        var_R = float(k.square_trace())
         R_given, p_given = spatial_r_test(x, y, k, null_params={"var_R": var_R})
         assert abs(R_auto - R_given) < 1e-10
         assert abs(p_auto - p_given) < 1e-10
+
+
+class TestNUFFTKNeighborsAPI:
+    """``NUFFTKernel`` forwards ``k_neighbors`` to its internal ``FFTKernel``
+    — same k-NN semantic as MatrixKernel.
+    """
+
+    def test_k_neighbors_forwarded(self):
+        rng = np.random.default_rng(0)
+        coords = rng.uniform(0, 20, size=(200, 2))
+        k = NUFFTKernel(
+            coords, grid_shape=(32, 32), spacing=(0.6, 0.6), method="moran", k_neighbors=4
+        )
+        assert k.params["neighbor_degree"] == 1
+
+    def test_k_neighbors_for_car(self):
+        rng = np.random.default_rng(0)
+        coords = rng.uniform(0, 20, size=(200, 2))
+        k = NUFFTKernel(
+            coords, grid_shape=(32, 32), spacing=(0.6, 0.6), method="car", k_neighbors=4, rho=0.9
+        )
+        assert k.params["neighbor_degree"] == 1
+        assert k.params["rho"] == 0.9
+
+
+class TestNUFFTEmpiricalNullMoments:
+    """NUFFT graph kernels use z-scored (standardized) probes by default for
+    ``trace`` / ``square_trace`` so the reported null moments match the
+    realized variance of Q after :func:`spatial_q_test`'s z-scoring.
+    Without this, CAR/Moran/graph_laplacian FPR collapsed to 0 under
+    Welch/CLT (Fig 2C of the comparison notebook).
+    """
+
+    def _mk_irregular(self, n=1024, seed=11):
+        from scipy.stats.qmc import PoissonDisk
+
+        L = float(np.sqrt(n / 2))
+        pts = PoissonDisk(d=2, radius=0.25 / L, seed=seed).random(n)
+        return pts * L, L
+
+    def test_centered_trace_strictly_less_than_raw(self):
+        """Default ``trace()`` (centered) is less than raw ``trace(K)`` for
+        graph kernels where the constant-mode eigenvalue is large.
+        """
+        coords, _ = self._mk_irregular()
+        k_raw = NUFFTKernel(
+            coords, method="car", k_neighbors=4, rho=0.9, workers=1, centering=False
+        )
+        k_cen = NUFFTKernel(coords, method="car", k_neighbors=4, rho=0.9, workers=1)
+        assert k_cen.trace() < k_raw.trace()
+
+    def test_welch_fpr_calibrated_on_nufft_car(self):
+        from quadsv.statistics import compute_null_params
+
+        coords, _ = self._mk_irregular()
+        k = NUFFTKernel(coords, method="car", k_neighbors=4, rho=0.9, workers=1)
+        X = np.random.default_rng(0).standard_normal((k.n, 400))
+        params = compute_null_params(k, method="welch")
+        _, pv = spatial_q_test(X, k, null_params=params)
+        fpr = float((np.asarray(pv) < 0.05).mean())
+        # Empirical null moments should land FPR within ±0.03 of nominal 0.05.
+        assert abs(fpr - 0.05) < 0.03, f"NUFFT-CAR welch FPR {fpr} off target"
+
+    def test_clt_fpr_calibrated_on_nufft_moran(self):
+        from quadsv.statistics import compute_null_params
+
+        coords, _ = self._mk_irregular()
+        k = NUFFTKernel(coords, method="moran", k_neighbors=4, workers=1)
+        X = np.random.default_rng(1).standard_normal((k.n, 400))
+        params = compute_null_params(k, method="clt")
+        _, pv = spatial_q_test(X, k, null_params=params)
+        fpr = float((np.asarray(pv) < 0.05).mean())
+        assert abs(fpr - 0.05) < 0.03, f"NUFFT-Moran clt FPR {fpr} off target"

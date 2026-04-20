@@ -24,57 +24,103 @@ class Kernel(ABC):
     Concrete backends:
 
     - :class:`MatrixKernel` — explicit n×n kernel or its sparse precision matrix.
-    - :class:`quadsv.FFTKernel` — grid kernel via its eigenvalue spectrum.
-    - :class:`quadsv.NUFFTKernel` — irregular-point kernel evaluated through a
+    - :class:`quadsv.fft.FFTKernel` — grid kernel via its eigenvalue spectrum.
+    - :class:`quadsv.nufft.NUFFTKernel` — irregular-point kernel evaluated through a
       type-1 / type-2 NUFFT round-trip.
 
     Required interface
     ------------------
     Every concrete kernel exposes:
 
-    - ``n``, ``method``, ``params`` — integer / string / dict attributes.
-    - :meth:`xtKx`, :meth:`xtKy`, :meth:`Kx` — quadratic / bilinear / apply
-      primitives.
-    - :meth:`trace`, :meth:`square_trace` — moments used by the null
-      distribution in :func:`quadsv.spatial_q_test` / :func:`quadsv.spatial_r_test`.
-    - :meth:`eigenvalues` — spectrum used by Liu's chi-squared mixture.
+    - ``n``, ``method``, ``params``, ``centering`` — integer / string /
+      dict / bool attributes.
+    - :meth:`xtKx`, :meth:`xtKy`, :meth:`Kx` — quadratic / bilinear /
+      apply primitives.
 
-    Backend-specific extras live on the subclasses. Notably
-    :class:`MatrixKernel` owns the ``_K`` buffer + LU cache, the
-    ``stores_precision`` flag, :meth:`realization`, and the
-    sparsity-preserving :meth:`MatrixKernel.xtKx_standardized`;
-    :class:`FFTKernel` / :class:`NUFFTKernel` carry grid-specific primitives
-    (FFT spectrum, `Kx_grid`, two-path compute methods, Hutchinson trace
-    estimation, …).
+    .. note::
+
+        The empirical data centering (z-scoring) inside
+        :func:`quadsv.spatial_q_test` / :func:`~quadsv.spatial_r_test`
+        breaks independence across spatial obervations. As a result,
+        the null distribution of the test statistic ``Q = Zᵀ K Z = Xᵀ (H K H) X / σ²``
+        with ``H = I - 𝟏𝟏ᵀ/n`` should inspect the spectrum of a centered kernel ``HKH``.
+        Every :class:`Kernel` carries a ``centering`` flag (default ``True``).
+        Set ``centering=False`` to recover the raw ``K`` moments
+        (useful for diagnostics or theoretical comparison).
+
     """
 
     n: int
     method: str
     params: dict
+    centering: bool
+
+    def __init__(self, *args, centering: bool = True, **kwargs):
+        # Concrete subclasses handle ``n``/``method``/``params`` in their own
+        # __init__; this just sets the centering flag and chains up so an
+        # explicit ``super().__init__(centering=...)`` can flip it. Extra
+        # args/kwargs are ignored here so multiple-inheritance-style init
+        # chains remain safe.
+        self.centering = bool(centering)
+
+    # When ``self.centering`` is True, each of the six public methods
+    # below returns the quantity for the centered operator
+    # ``HKH = (I − 𝟏𝟏ᵀ/n) K (I − 𝟏𝟏ᵀ/n)`` — the operator that actually
+    # acts on z-scored data inside :func:`spatial_q_test` and
+    # :func:`spatial_r_test`. Set ``centering=False`` to expose the raw
+    # ``K`` primitives (diagnostics, comparisons to literature).
 
     @abstractmethod
     def xtKx(self, x):
-        """Quadratic form ``xᵀ K x``."""
+        """``xᵀ K x`` (raw) or ``xᵀ HKH x`` (centered)."""
 
     @abstractmethod
     def xtKy(self, x, y):
-        """Bilinear form ``xᵀ K y``."""
+        """``xᵀ K y`` (raw) or ``xᵀ HKH y`` (centered)."""
 
     @abstractmethod
     def Kx(self, x):
-        """Matrix–vector product ``K x``."""
+        """``K x`` (raw) or ``HKH x`` (centered)."""
 
     @abstractmethod
     def trace(self) -> float:
-        """``trace(K)``."""
+        """``trace(K)`` or ``trace(HKH) = trace(K) - s₁/n``."""
 
     @abstractmethod
     def square_trace(self) -> float:
-        """``trace(K²)``."""
+        """``trace(K²)`` or ``trace((HKH)²) = trace(K²) - 2·s₂/n + s₁²/n²``."""
 
     @abstractmethod
     def eigenvalues(self, k: int | None = None) -> np.ndarray:
-        """Eigenvalues of ``K`` (descending) or top-``k`` if specified."""
+        """Eigenvalues of ``K`` (raw) or ``HKH`` (centered)."""
+
+    # ------------------------------------------------------------------
+    # Optional helpers used by concrete backends. Kept non-abstract so
+    # each kernel can override or ignore them — they exist to factor the
+    # common centering arithmetic, not to constitute an interface.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _center_vec(x: np.ndarray) -> np.ndarray:
+        """``H x`` — subtract the column mean. Works on 1-D or 2-D arrays."""
+        x = np.asarray(x, dtype=float)
+        if x.ndim == 1:
+            return x - x.mean()
+        return x - x.mean(axis=0, keepdims=True)
+
+    def _ones_stats(self) -> tuple[float, float]:
+        """``(s1, s2) = (𝟏ᵀ K 𝟏, ‖K·𝟏‖²)`` via one raw ``K·𝟏`` application.
+
+        Requires a transient ``centering=False`` view — we need the raw
+        ``K·𝟏``, not the centered ``HKH·𝟏 = 0``.
+        """
+        prev = self.centering
+        self.centering = False
+        try:
+            ones = np.ones(self.n, dtype=float)
+            c = np.asarray(self.Kx(ones)).ravel()
+        finally:
+            self.centering = prev
+        return float(c.sum()), float(c @ c)
 
 
 class MatrixKernelBase(Kernel):
@@ -124,7 +170,9 @@ class MatrixKernelBase(Kernel):
     transparently handle both cases; callers should not access ``_K`` directly.
     """
 
-    def __init__(self, n: int, method: str = "gaussian", **kwargs) -> None:
+    def __init__(
+        self, n: int, method: str = "gaussian", *, centering: bool = True, **kwargs
+    ) -> None:
         """
         Initialize the Kernel.
 
@@ -134,9 +182,17 @@ class MatrixKernelBase(Kernel):
             Number of observations.
         method : str, default 'gaussian'
             Kernel method to use.
+        centering : bool, default True
+            If ``True``, :meth:`trace`, :meth:`square_trace`, and
+            :meth:`eigenvalues` return the moments of the centered
+            operator ``HKH`` — the one :func:`spatial_q_test` /
+            :func:`spatial_r_test` actually apply after z-scoring. Set
+            ``False`` to recover the raw ``K`` moments (diagnostic /
+            theoretical comparison only).
         **kwargs : dict
             Additional kernel-specific parameters stored in ``self.params``.
         """
+        super().__init__(centering=centering)
         self.n: int = n
         """Number of observations (samples)."""
         self.method: str = method
@@ -154,7 +210,9 @@ class MatrixKernelBase(Kernel):
         # _K stores the kernel matrix when stores_precision=False and the precision
         # matrix K^{-1} when stores_precision=True (see class Notes).
         self._K = self._build_kernel()
-        self._spectrum = None  # Lazy-evaluated eigenvalues cache (access via eigenvalues())
+        # Lazy per-mode spectrum caches; populated by :meth:`eigenvalues`.
+        self._spectrum_raw: np.ndarray | None = None
+        self._spectrum_centered: np.ndarray | None = None
 
     @abstractmethod
     def _build_kernel(self):
@@ -215,52 +273,120 @@ class MatrixKernelBase(Kernel):
                 return inv(self._K)
         return self._K
 
-    def eigenvalues(self, k: int | None = None) -> np.ndarray:
+    def eigenvalues(self, k: int | None = None) -> np.ndarray:  # noqa: C901
         """
-        Compute the ``k`` largest eigenvalues of the kernel matrix.
+        Eigenvalues of ``K`` or ``HKH`` (according to ``self.centering``).
 
-        Results are cached internally; subsequent calls reuse the cached spectrum
-        when it contains enough values to satisfy the request.
+        Three paths:
+
+        - **Dense ``K``** — form
+          ``HKH = K − 𝟏 r^T − c 𝟏^T + m · 𝟏𝟏^T``
+          in closed form (``r`` / ``c`` = row / col means, ``m`` = grand
+          mean) and call :func:`numpy.linalg.eigvalsh`. Same O(n³) cost
+          as the raw case, no extra memory.
+        - **Sparse explicit ``K``** — wrap ``H K H · v`` as a
+          :class:`scipy.sparse.linalg.LinearOperator` and call
+          :func:`eigsh`. Preserves ``K``'s sparsity — we never densify.
+        - **Implicit precision (sparse ``M = K⁻¹``)** — wrap
+          ``H K H · v = H (M⁻¹ (H v))`` where ``M⁻¹·`` is the cached
+          sparse-LU solve. Same sparsity benefit as the raw-inverse path.
+
+        Results are cached per centering mode; switching ``self.centering``
+        invalidates and recomputes.
 
         Parameters
         ----------
         k : int, optional
-            Number of largest eigenvalues to return. If None, returns all.
+            Number of largest-magnitude eigenvalues to return. If None,
+            returns all (dense) or ``max(6, n − 2)`` (sparse/implicit —
+            limited by what ``eigsh`` can extract).
 
         Returns
         -------
         np.ndarray
-            Eigenvalues sorted in descending order, shape ``(k,)`` or ``(n,)``.
+            Eigenvalues sorted in descending order.
         """
-        if self._spectrum is not None:
-            # check if we have enough cached (spectrum is always descending)
-            if k is None and len(self._spectrum) == self.n:
-                return self._spectrum
-            elif k is not None and len(self._spectrum) >= k:
-                return self._spectrum[:k]
+        # Per-mode cache (raw vs centered spectra differ).
+        cache_key = "_spectrum_centered" if self.centering else "_spectrum_raw"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            if k is None and len(cached) == self.n:
+                return cached
+            if k is not None and len(cached) >= k:
+                return cached[:k]
 
-        k_orig = k  # preserve original before internal modification
+        k_orig = k
+        centered = self.centering
 
         if self.stores_precision:
-            # Implicit case with kernel inverse: Use sparse methods
-            from scipy.sparse.linalg import eigsh
+            # Implicit sparse precision ``M`` — solve systems instead of
+            # densifying. Raw spectrum via ``eigsh(M, which='SM')`` of the
+            # precision (inverted). Centered via an ``HKH`` LinearOperator
+            # backed by the same sparse-LU solver.
+            from scipy.sparse.linalg import LinearOperator, eigsh
 
             k = k if k is not None else max(6, self.n - 2)
-            vals, _ = eigsh(self._K, k=k, which="SM")  # Smallest magnitude of K^-1 = largest of K
-            vals = np.real(1.0 / vals)
+            if not centered:
+                vals, _ = eigsh(self._K, k=k, which="SM")
+                vals = np.real(1.0 / vals)
+            else:
+                with self._lu_lock:
+                    if self._lu is None:
+                        self._lu = splu(self._K.tocsc()) if sp.issparse(self._K) else None
+                lu = self._lu
+
+                def _hkh_matvec(v: np.ndarray) -> np.ndarray:
+                    v_c = v - v.mean()
+                    if lu is not None:
+                        kv = lu.solve(v_c)
+                    else:  # dense precision fallback
+                        kv = lu_solve(lu_factor(self._K), v_c)
+                    return kv - kv.mean()
+
+                op = LinearOperator(shape=(self.n, self.n), matvec=_hkh_matvec, dtype=float)
+                vals, _ = eigsh(op, k=k, which="LM")
+                vals = np.real(vals)
         else:
-            # Handle kernel matrix directly
+            # Explicit ``K`` buffer (dense or sparse).
             if sp.issparse(self._K):
-                from scipy.sparse.linalg import eigsh
+                from scipy.sparse.linalg import LinearOperator, eigsh
 
                 k = k if k is not None else max(6, self.n - 2)
-                vals, _ = eigsh(self._K, k=k, which="LM")
+                if not centered:
+                    vals, _ = eigsh(self._K, k=k, which="LM")
+                else:
+                    K_sparse = self._K
+
+                    def _hkh_matvec(v: np.ndarray) -> np.ndarray:
+                        v_c = v - v.mean()
+                        kv = K_sparse @ v_c
+                        if sp.issparse(kv):
+                            kv = np.asarray(kv.todense()).ravel()
+                        else:
+                            kv = np.asarray(kv).ravel()
+                        return kv - kv.mean()
+
+                    op = LinearOperator(shape=(self.n, self.n), matvec=_hkh_matvec, dtype=float)
+                    vals, _ = eigsh(op, k=k, which="LM")
                 vals = np.real(vals)
             else:
-                vals = np.linalg.eigvalsh(self._K)  # ascending order
+                if not centered:
+                    vals = np.linalg.eigvalsh(self._K)
+                else:
+                    # ``HKH = K − 𝟏rᵀ − c𝟏ᵀ + m·𝟏𝟏ᵀ`` where r = row-mean
+                    # of K, c = col-mean of K, m = grand-mean. Same
+                    # asymptotic cost as eigvalsh(K); no dense HKH copy
+                    # beyond a few n×1 means.
+                    K = self._K
+                    row_mean = K.mean(axis=1, keepdims=True)  # (n, 1)
+                    col_mean = K.mean(axis=0, keepdims=True)  # (1, n)
+                    grand_mean = float(K.mean())
+                    HKH = K - row_mean - col_mean + grand_mean
+                    vals = np.linalg.eigvalsh(HKH)
 
-        self._spectrum = np.sort(vals)[::-1]  # always store descending
-        return self._spectrum if k_orig is None else self._spectrum[:k_orig]
+        spectrum = np.sort(vals)[::-1]  # descending
+        setattr(self, cache_key, spectrum)
+        return spectrum if k_orig is None else spectrum[:k_orig]
 
     # ------------------------------------------------------------------
     # Internal primitive: compute ``K @ x`` as a dense 2D block
@@ -341,7 +467,12 @@ class MatrixKernelBase(Kernel):
         x_2d, squeeze = self._to_2d(x)
         if sp.issparse(x_2d):
             x_2d = x_2d.toarray()
+        # Centered path: HKH x = H · (K · (H x)). Apply H before and after K.
+        if self.centering:
+            x_2d = x_2d - x_2d.mean(axis=0, keepdims=True)
         y = self._apply_K_dense(x_2d)
+        if self.centering:
+            y = y - y.mean(axis=0, keepdims=True)
         return y.ravel() if squeeze else y
 
     def _xtKy_from_Ky(
@@ -399,6 +530,12 @@ class MatrixKernelBase(Kernel):
         squeeze = x_squeeze and y_squeeze
         n_cols = x_2d.shape[1]
         y_dense = y_2d.toarray() if sp.issparse(y_2d) else y_2d
+        # x^T HKH y = (H x)^T K (H y). Densify & center both sides; the
+        # contraction with x is unchanged.
+        if self.centering:
+            x_dense = x_2d.toarray() if sp.issparse(x_2d) else x_2d
+            x_2d = x_dense - x_dense.mean(axis=0, keepdims=True)
+            y_dense = y_dense - y_dense.mean(axis=0, keepdims=True)
         Ky = self._apply_K_dense(y_dense)
         return self._xtKy_from_Ky(x_2d, Ky, 1 if squeeze else n_cols)
 
@@ -421,6 +558,11 @@ class MatrixKernelBase(Kernel):
         x_2d, squeeze = self._to_2d(x)
         n_cols = x_2d.shape[1]
         x_dense = x_2d.toarray() if sp.issparse(x_2d) else x_2d
+        # x^T HKH x = (H x)^T K (H x) — center, then reuse the raw
+        # x^T K x machinery. The contraction is with the centered x.
+        if self.centering:
+            x_dense = x_dense - x_dense.mean(axis=0, keepdims=True)
+            x_2d = x_dense  # dense post-centering; sparse view no longer valid
         Kx = self._apply_K_dense(x_dense)
         return self._xtKy_from_Ky(x_2d, Kx, 1 if squeeze else n_cols)
 
@@ -484,8 +626,16 @@ class MatrixKernelBase(Kernel):
 
         K_sum, K_total = self._K_column_sums()  # K_sum: (n,), K_total: scalar
 
-        # Term 1: x^T K x — reuse xtKx (handles sparse/dense uniformly).
-        q_raw = np.atleast_1d(np.asarray(self.xtKx(x_2d))).astype(float)
+        # Term 1: RAW ``xᵀ K x`` — the expansion in the docstring is in
+        # terms of ``K`` (not ``HKH``), so temporarily bypass the
+        # centering wrapper on :meth:`xtKx`. The final output is still
+        # ``zᵀ K z`` which, since ``z`` is z-scored, equals ``zᵀ HKH z``.
+        prev_centering = self.centering
+        self.centering = False
+        try:
+            q_raw = np.atleast_1d(np.asarray(self.xtKx(x_2d))).astype(float)
+        finally:
+            self.centering = prev_centering
 
         # Term 2: (K·1)^T x → (M,). x^T @ K_sum, preserving x's sparsity.
         if sp.issparse(x_2d):
@@ -542,40 +692,27 @@ class MatrixKernelBase(Kernel):
 
     def trace(self) -> float:
         """
-        Compute the trace of the kernel matrix Tr(K).
+        ``trace(K)`` (or ``trace(HKH) = trace(K) − s₁/n`` when ``centering``).
 
-        For implicit kernels, uses Hutchinson's trick with random ±1 vectors
-        for efficient O(n) estimation instead of O(n³) eigendecomposition.
-
-        Returns
-        -------
-        float
-            Trace of the kernel matrix.
-
-        Notes
-        -----
-        For implicit kernels the result is a stochastic estimate using a fixed
-        ``n_vectors=15`` Hutchinson probes; repeated calls reuse the cached probes
-        so the returned value is deterministic within a given instance.
+        For implicit kernels (precision-stored), the raw trace uses a
+        Hutchinson estimator with cached ``±1`` probes (``n_probes=15``).
         """
         if self.stores_precision:
-            # Trace estimation using Hutchinson's trick
             n_vectors = 15
             cache = self._get_rvs_trace_cache(n_vectors)
-
-            # Hutchinson's estimator is (1/n_vectors) * sum(v_i^T * y_i)
-            rvs = cache["rvs"]
-            Y = cache["Y"]
-            return np.sum(rvs * Y) / n_vectors
-
+            raw = float(np.sum(cache["rvs"] * cache["Y"]) / n_vectors)
         elif sp.issparse(self._K):
-            return self._K.diagonal().sum()
+            raw = float(self._K.diagonal().sum())
         else:
-            return np.trace(self._K)
+            raw = float(np.trace(self._K))
+        if not self.centering:
+            return raw
+        s1, _ = self._ones_stats()
+        return raw - s1 / self.n
 
     def square_trace(self) -> float:
         """
-        Compute the trace of the squared kernel Tr(K²).
+        ``trace(K²)`` (or ``trace((HKH)²) = trace(K²) − 2·s₂/n + s₁²/n²``).
 
         Used for variance estimation in statistical tests. For implicit kernels,
         uses Hutchinson's trick for efficient O(n) estimation.
@@ -591,19 +728,17 @@ class MatrixKernelBase(Kernel):
         ``n_vectors=15`` Hutchinson probes (shared with :meth:`trace`).
         """
         if self.stores_precision:
-            # Trace(K^2) estimation
             n_vectors = 15
             cache = self._get_rvs_trace_cache(n_vectors)
-
-            # Trace(K^2) ~= (1/m) * sum( ||K v_i||^2 )
-            # Since Y = K * rvs, we just need sum(Y^2)
-            Y = cache["Y"]
-            return np.sum(Y**2) / n_vectors
-
+            raw = float(np.sum(cache["Y"] ** 2) / n_vectors)
         elif sp.issparse(self._K):
-            return self._K.power(2).sum()
+            raw = float(self._K.power(2).sum())
         else:
-            return np.sum(self._K**2)
+            raw = float(np.sum(self._K**2))
+        if not self.centering:
+            return raw
+        s1, s2 = self._ones_stats()
+        return max(raw - 2.0 * s2 / self.n + s1**2 / (self.n**2), 0.0)
 
     def _compute_inv_diag(self, M):
         """Compute diagonal of K = M^{-1} using batched solves to save memory.
@@ -767,6 +902,10 @@ class MatrixKernel(MatrixKernelBase):
         if method not in self._available_kernels + ["precomputed"]:
             raise ValueError(f"Unknown kernel method: {method}.")
 
+        # Pop the ``centering`` flag out of kwargs before validating — it
+        # is a Kernel-ABC-level argument, not a per-method hyper-parameter.
+        centering = kwargs.pop("centering", True)
+
         # Update kernel parameters from defaults
         defaults = self._get_default_params(method).copy()
         if kwargs:
@@ -780,7 +919,7 @@ class MatrixKernel(MatrixKernelBase):
         if mode == "coords":
             self._validate_coords_params(n, method, defaults)
 
-        super().__init__(n, method=method, **defaults)
+        super().__init__(n, method=method, centering=centering, **defaults)
 
     @staticmethod
     def _validate_coords_params(n: int, method: str, params: dict) -> None:

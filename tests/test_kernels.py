@@ -98,22 +98,31 @@ class TestMatrixKernel(unittest.TestCase):
         np.testing.assert_array_almost_equal(K, K.T, decimal=10)
 
     def test_xtKx_computation(self):
-        """Test quadratic form computation x^T K x."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        """Raw ``xᵀ K x`` (``centering=False``)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
         x = np.random.randn(self.n)
-
-        # Compute via method
         result = kernel.xtKx(x)
-
-        # Compute directly
         K = kernel.realization()
         expected = x.T @ K @ x
-
         np.testing.assert_almost_equal(result, expected, decimal=10)
+
+    def test_xtKx_centered_matches_H_projection(self):
+        """Default centered ``xtKx`` equals ``(H x)ᵀ K (H x)``."""
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        assert kernel.centering is True
+        x = np.random.randn(self.n)
+        K = kernel.realization()
+        x_c = x - x.mean()
+        expected = x_c.T @ K @ x_c
+        np.testing.assert_almost_equal(kernel.xtKx(x), expected, decimal=10)
 
     def test_xtKx_sparse_input(self):
         """Test quadratic form computation with sparse input."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
 
         # Create sparse and dense versions
         x_dense = np.random.randn(self.n)
@@ -128,7 +137,9 @@ class TestMatrixKernel(unittest.TestCase):
 
     def test_xtKx_sparse_batch(self):
         """Test quadratic form computation with sparse batch input."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
 
         # Create sparse and dense batches
         X_dense = np.random.randn(self.n, 10)
@@ -146,23 +157,63 @@ class TestMatrixKernel(unittest.TestCase):
         self.assertEqual(len(result_dense), 10)
 
     def test_trace_computation(self):
-        """Test trace computation."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
-
-        # Compute via method
+        """Test RAW trace computation (``centering=False``)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
         trace_result = kernel.trace()
-
-        # Compute directly
         K = kernel.realization()
         expected_trace = np.trace(K)
-
         np.testing.assert_almost_equal(trace_result, expected_trace, decimal=10)
 
-    def test_square_trace_computation(self):
-        """Test trace(K^2) computation."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+    def test_centered_eigenvalues_dense_match_HKH_eigvalsh(self):
+        """Centered eigenvalues on dense ``K`` agree with direct ``eigvalsh(HKH)``."""
+        kernel = MatrixKernel(self.coords, method="gaussian", bandwidth=1.0)
+        assert kernel.centering is True
+        K = kernel.realization()
+        n = kernel.n
+        H = np.eye(n) - np.ones((n, n)) / n
+        expected = np.sort(np.linalg.eigvalsh(H @ K @ H))[::-1]
+        got = kernel.eigenvalues()
+        np.testing.assert_allclose(got, expected, rtol=1e-10, atol=1e-10)
 
-        # Compute via method
+    def test_centered_eigenvalues_implicit_sparse_match_dense(self):
+        """Implicit sparse-precision path (CAR) eigenvalues match the dense
+        ``eigvalsh(HKH)`` reference (top-k, since eigsh can't return all).
+        """
+        n_side = 20
+        x = np.linspace(0, 10, n_side)
+        y = np.linspace(0, 10, n_side)
+        xx, yy = np.meshgrid(x, y)
+        coords = np.column_stack((xx.ravel(), yy.ravel()))
+        # Force sparse-implicit representation — use the CAR method which
+        # stores the precision M = I − ρW and solves for K·v on demand.
+        kernel = MatrixKernel(coords, method="car", k_neighbors=4, rho=0.9)
+        # Build reference HKH eigvals directly from the realized K.
+        K = kernel.realization()
+        n = kernel.n
+        H = np.eye(n) - np.ones((n, n)) / n
+        ref_descending = np.sort(np.linalg.eigvalsh(H @ K @ H))[::-1]
+        # Request the top-k eigenvalues.
+        k_eigen = 6
+        got = kernel.eigenvalues(k=k_eigen)
+        np.testing.assert_allclose(got, ref_descending[:k_eigen], rtol=1e-6, atol=1e-8)
+
+    def test_centered_trace_is_raw_minus_constant_mode(self):
+        """Default ``centering=True`` trace equals ``trace(K) − 𝟏ᵀK𝟏/n``."""
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        assert kernel.centering is True
+        K = kernel.realization()
+        raw = np.trace(K)
+        s1 = float(K.sum())  # 𝟏ᵀ K 𝟏
+        expected_centered = raw - s1 / kernel.n
+        np.testing.assert_almost_equal(kernel.trace(), expected_centered, decimal=10)
+
+    def test_square_trace_computation(self):
+        """Test raw trace(K^2) computation (``centering=False``)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
         sq_trace = kernel.square_trace()
 
         # Compute directly
@@ -180,8 +231,16 @@ class TestMatrixKernel(unittest.TestCase):
         xx, yy = np.meshgrid(x, y)
         coords_large = np.column_stack((xx.ravel(), yy.ravel()))
 
-        # Construct the kernel
-        kernel = MatrixKernel(coords_large, mode="coords", method="car", k_neighbors=4, rho=0.9)
+        # Construct the kernel in raw mode — the test compares against
+        # ``x.T @ K @ x`` which is raw (not ``(Hx)ᵀ K (Hx)``).
+        kernel = MatrixKernel(
+            coords_large,
+            mode="coords",
+            method="car",
+            k_neighbors=4,
+            rho=0.9,
+            centering=False,
+        )
         self.assertEqual(kernel.n, n_large)
         self.assertTrue(kernel.stores_precision)  # Should be implicit due to size
 

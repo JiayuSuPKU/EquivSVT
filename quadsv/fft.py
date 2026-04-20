@@ -116,7 +116,7 @@ class FFTKernel(Kernel):
 
     _available_kernels = ["gaussian", "matern", "moran", "graph_laplacian", "car"]
 
-    def __init__(
+    def __init__(  # noqa: C901
         self,
         shape: tuple[int, int],
         spacing: tuple[float, float] = (1.0, 1.0),
@@ -124,6 +124,8 @@ class FFTKernel(Kernel):
         method: str = "matern",
         workers: int | None = None,
         fft_solver: str = "fft2",
+        *,
+        centering: bool = True,
         **kwargs,
     ) -> None:
         """
@@ -152,6 +154,7 @@ class FFTKernel(Kernel):
         >>> kernel = FFTKernel((64, 64), method='gaussian', bandwidth=2.0)
         >>> kernel = FFTKernel((64, 64), topology='hex', method='matern')
         """
+        super().__init__(centering=centering)
         ny, nx = shape
         if ny < 2 or nx < 2:
             raise ValueError(f"Grid dimensions must be >= 2, got ({ny}, {nx})")
@@ -162,6 +165,8 @@ class FFTKernel(Kernel):
         self._dy, self._dx = spacing
         self.n_grid: int = self.ny * self.nx
         """Total number of grid points (``ny * nx``)."""
+        self.n: int = self.n_grid
+        """Alias for ``n_grid`` to satisfy the :class:`~quadsv.kernels.Kernel` interface."""
 
         # FFT solver selection
         if fft_solver not in ("fft2", "rfft2"):
@@ -184,11 +189,17 @@ class FFTKernel(Kernel):
         self.method: str = method
         """Kernel method name."""
 
-        # Update kernel parameters from defaults
+        # Update kernel parameters from defaults. Graph kernels accept an
+        # additional ``k_neighbors`` as a convenience (k-NN semantic): it's
+        # converted to the closest ``neighbor_degree`` (FFT-ring semantic)
+        # based on the grid topology — see _k_neighbors_to_degree below.
         params = self._get_default_params(method).copy()
+        k_neighbors_user = None
         if kwargs:
             for key, value in kwargs.items():
-                if key in params:
+                if key == "k_neighbors" and method in ("moran", "graph_laplacian", "car"):
+                    k_neighbors_user = value
+                elif key in params:
                     params[key] = value
                 else:
                     raise ValueError(f"Unknown parameter '{key}' for method '{method}'")
@@ -205,9 +216,53 @@ class FFTKernel(Kernel):
         else:
             self._min_dist_sq = self._precompute_square_dists()
 
+        # Resolve k_neighbors → neighbor_degree now that the distance grid is built.
+        if k_neighbors_user is not None:
+            if "neighbor_degree" in kwargs:
+                raise ValueError(
+                    "Pass either 'k_neighbors' (k-NN semantic) or "
+                    "'neighbor_degree' (FFT-ring semantic), not both."
+                )
+            self.params["neighbor_degree"] = self._k_neighbors_to_degree(k_neighbors_user)
+
         # 2. Precompute Kernel spectrum
         self.spectrum: np.ndarray = self._compute_eigenvalues()
         """Flattened (row-major) eigenvalues of the kernel matrix, shape ``(n_rfft,)``."""
+
+    def _unique_ring_distances(self) -> np.ndarray:
+        """Tolerance-grouped unique squared distances on the grid.
+
+        Groups numerically-close values into a single "ring" so hex and other
+        irrational-coordinate topologies report physical shells consistently.
+        Returns sorted ascending, starting with 0 (self). Internal helper.
+        """
+        flat = np.sort(self._min_dist_sq.ravel())
+        tol = 1e-6 * max(1.0, float(flat[-1]))
+        # Take the first element of each tolerance-gap-separated group.
+        diffs = np.diff(flat)
+        keep = np.concatenate([[True], diffs > tol])
+        return flat[keep]
+
+    def _k_neighbors_to_degree(self, k_neighbors: int) -> int:
+        """Translate a k-NN-style ``k_neighbors`` into an FFT-ring ``neighbor_degree``.
+
+        Returns the smallest ``neighbor_degree`` whose cumulative count of
+        grid cells (excluding self) is ≥ ``k_neighbors``. Topology-aware via
+        :meth:`_unique_ring_distances`:
+
+        - Square: k=4 → 1 (N/S/E/W), k=8 → 2 (+diagonals), k=12 → 3.
+        - Hex:    k=6 → 1, k=12 → 2, k=18 → 3.
+        """
+        if k_neighbors < 1:
+            raise ValueError(f"k_neighbors must be ≥ 1, got {k_neighbors}")
+        unique_dists = self._unique_ring_distances()
+        tol = 1e-6 * max(1.0, float(unique_dists[-1]))
+        for deg_order in range(1, len(unique_dists)):
+            cutoff_sq = unique_dists[deg_order]
+            count = int((self._min_dist_sq <= cutoff_sq + tol).sum()) - 1
+            if count >= k_neighbors:
+                return deg_order
+        return len(unique_dists) - 1
 
     def _format_params(self) -> str:
         """Format kernel params safely without dumping large arrays/matrices."""
@@ -390,15 +445,21 @@ class FFTKernel(Kernel):
         elif self.method in ["moran", "graph_laplacian", "car"]:
             degree_order = self.params["neighbor_degree"]
 
-            unique_dists = np.unique(self._min_dist_sq)
+            # Tolerance-based ring grouping: hex distances like 1.0 arise from
+            # sqrt(3)/2 products and split into several numerical clusters
+            # (e.g. 0.9999998 and 1.0000003) that are *physically the same
+            # shell*. Without this, degree_order=1 on hex returns only 2 cells
+            # instead of the full 6-neighbour ring.
+            unique_dists = self._unique_ring_distances()
 
             if degree_order < len(unique_dists):
                 cutoff_sq = unique_dists[degree_order]
             else:
                 cutoff_sq = unique_dists[-1]
 
-            # Construct Adjacency Image
-            W_img = (self._min_dist_sq <= cutoff_sq).astype(float)
+            # Inclusive cutoff with tolerance so we catch the whole ring.
+            tol = 1e-6 * max(1.0, float(unique_dists[-1]))
+            W_img = (self._min_dist_sq <= cutoff_sq + tol).astype(float)
             W_img[0, 0] = 0.0
 
             # Row-Normalization Factor
@@ -461,6 +522,11 @@ class FFTKernel(Kernel):
                 f"Data shape ({ny}, {nx}) does not match kernel ({self.ny}, {self.nx})"
             )
 
+        # HKH quadratic form on z-scored input equals raw K on the centered
+        # input; subtracting per-feature mean is cheap on the grid.
+        if self.centering:
+            x = x - x.mean(axis=(0, 1), keepdims=True)
+
         # Transform using selected FFT solver via the shared power-spectrum helper.
         x_power = power_spectrum_2d(x, fft_solver=self.fft_solver, workers=self.workers)
 
@@ -494,6 +560,16 @@ class FFTKernel(Kernel):
         # Unwrap if M=1
         return Q.item() if M == 1 else Q.ravel()
 
+    def _ones_stats(self) -> tuple[float, float]:
+        """Return ``(s1, s2) = (𝟏ᵀ K 𝟏, ‖K·𝟏‖²)`` analytically from the DC mode.
+
+        On a torus the constant vector ``𝟏`` is the ``k = (0, 0)`` Fourier
+        mode, so ``K · 𝟏 = λ₀ · 𝟏`` where ``λ₀ = spectrum[0]`` (DC).
+        ``s1 = λ₀ · n_grid``, ``s2 = λ₀² · n_grid``. Zero FFT work.
+        """
+        lam0 = float(self.spectrum.ravel()[0])
+        return lam0 * self.n_grid, (lam0**2) * self.n_grid
+
     def Kx(self, x: np.ndarray) -> np.ndarray:
         """
         Apply the kernel operator to ``x`` via FFT in O(n log n).
@@ -526,6 +602,12 @@ class FFTKernel(Kernel):
                 f"Data shape ({ny}, {nx}) does not match kernel ({self.ny}, {self.nx})"
             )
 
+        # HKH x = H · (K · (H x)). Subtract per-feature spatial mean both
+        # before and after the FFT round-trip. Equivalent to zeroing the
+        # DC coefficient directly in the frequency domain.
+        if self.centering:
+            x = x - x.mean(axis=(0, 1), keepdims=True)
+
         if self.fft_solver == "fft2":
             x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=self.workers)
             lam = self.spectrum.reshape(ny, nx, 1)
@@ -534,6 +616,9 @@ class FFTKernel(Kernel):
             x_hat = scipy.fft.rfft2(x, axes=(0, 1), workers=self.workers)
             lam = self.spectrum.reshape(ny, nx // 2 + 1, 1)
             out = scipy.fft.irfft2(lam * x_hat, s=(ny, nx), axes=(0, 1), workers=self.workers)
+
+        if self.centering:
+            out = out - out.mean(axis=(0, 1), keepdims=True)
 
         return out[..., 0] if squeeze else out
 
@@ -561,6 +646,10 @@ class FFTKernel(Kernel):
             x = x[..., np.newaxis]
             y = y[..., np.newaxis]
         ny, nx, _ = x.shape
+        # x^T HKH y = (H x)^T K (H y); both sides need centering.
+        if self.centering:
+            x = x - x.mean(axis=(0, 1), keepdims=True)
+            y = y - y.mean(axis=(0, 1), keepdims=True)
         R_sum = _spectral_cross_product(x, y, self, ny, nx)
         R = R_sum / (ny * nx)
         if squeeze:
@@ -569,76 +658,55 @@ class FFTKernel(Kernel):
 
     def eigenvalues(self, k: int | None = None, return_full_layout: bool = False) -> np.ndarray:
         """
-        Get the eigenvalues of the kernel matrix.
+        Eigenvalues of the kernel matrix.
+
+        When ``self.centering`` is True (default) the ``k=(0, 0)`` DC
+        component is zeroed before returning — this is exactly the
+        spectrum of ``HKH`` on a torus, since the constant vector ``𝟏``
+        is the DC Fourier mode. Set ``centering=False`` at construction
+        to recover the raw ``K`` spectrum.
 
         Parameters
         ----------
         k : int, optional
             Number of largest eigenvalues to return. If None, returns all.
         return_full_layout : bool, default False
-            Only for fft_solver='rfft2'.
-            If True, returns eigenvalues in full FFT layout (ny, nx) flattened.
-
-        Returns
-        -------
-        np.ndarray
-            Eigenvalues. If return_full_layout=True, shape is (ny * nx,).
-                If k specified, returns top-k in descending order.
-
-        Notes
-        -----
-        If fft_solver='rfft2', spectrum is stored in rfft2 format, not full FFT format.
-        To convert to full FFT format, use return_full_layout=True.
+            Only for ``fft_solver='rfft2'``. If True, returns eigenvalues
+            in full FFT layout (ny, nx) flattened.
         """
         if self.spectrum is None:
             self.spectrum = self._compute_eigenvalues()
 
-        # Simple logic for fft2 or no full return
+        # Resolve the raw spectrum array (respecting rfft2 vs fft2).
         if (self.fft_solver == "fft2") or (not return_full_layout):
-            if k is None:
-                return self.spectrum
-            else:
-                idx = np.argsort(-self.spectrum)[:k]
-                return self.spectrum[idx]
-
+            spec = self.spectrum
         else:  # fft_solver == 'rfft2' and return_full_layout=True
-            # Convert rfft2 layout to full FFT layout
+            # Convert rfft2 layout to full FFT layout.
             full_fft = np.zeros((self.ny, self.nx), dtype=self.spectrum.dtype)
             rfft_size = self.nx // 2 + 1
             full_fft[:, :rfft_size] = self.spectrum.reshape(self.ny, rfft_size)
-            # Fill in negative frequencies using Hermitian symmetry
             for i in range(self.ny):
                 for j in range(1, rfft_size - 1):
                     full_fft[i, self.nx - j] = full_fft[i, j].conj()
+            spec = full_fft.ravel()
 
-            if k is None:
-                return full_fft.ravel()
-            else:
-                # Return top-k largest eigenvalues
-                idx = np.argsort(-full_fft.ravel())[:k]
-                return full_fft.ravel()[idx]
+        if self.centering:
+            # Drop the constant-mode eigenvalue (DC entry).
+            spec = spec.copy()
+            spec[0] = 0.0
+
+        if k is None:
+            return spec
+        idx = np.argsort(-spec)[:k]
+        return spec[idx]
 
     def trace(self) -> float:
-        """
-        Compute the trace of the kernel matrix.
-
-        Returns
-        -------
-        float
-            Trace of K (sum of eigenvalues).
-        """
-        return np.sum(self.eigenvalues(return_full_layout=True))
+        """``trace(K)`` — sum of eigenvalues (centered or raw)."""
+        return float(np.sum(self.eigenvalues(return_full_layout=True)))
 
     def square_trace(self) -> float:
-        """
-        Compute the trace of the squared kernel matrix.
-
-        Returns
-        -------
-        float
-            Trace of K² (sum of squared eigenvalues).
-        """
-        return np.sum(self.eigenvalues(return_full_layout=True) ** 2)
+        """``trace(K²)`` — sum of squared eigenvalues (centered or raw)."""
+        return float(np.sum(self.eigenvalues(return_full_layout=True) ** 2))
 
 
 def _q_test_fft(  # noqa: C901
@@ -743,51 +811,73 @@ def _q_test_fft(  # noqa: C901
     if not return_pval:
         return Q
 
-    # 3. P-value approximation. Moran's I has negative eigenvalues → Normal (CLT);
-    # every other FFT kernel uses Liu's chi-squared mixture. When `null_params`
-    # is supplied by the caller (detector loops, etc.), reuse its cached
-    # `mean_Q` / `var_Q` / `eigenvalues` so the expensive spectrum traversal
-    # doesn't happen once per feature.
+    # 3. P-value approximation. Dispatch on the user-selected null method
+    # (``null_params['method']``) mirroring the MatrixKernel path in
+    # :func:`quadsv.statistics.spatial_q_test`: any of 'clt' / 'welch' / 'liu'.
+    # Default: CLT for Moran (indefinite K → Welch/Liu degenerate),
+    # Liu for everything else. When `null_params` is supplied the caller's
+    # cached moments are reused so we don't retraverse the spectrum per feature.
+    Q_arr = np.atleast_1d(Q).astype(float).ravel()
 
-    # Use clt approximation (Normal) for Moran's I since it has negative eigenvalues
-    if kernel.method in ["moran"]:
-        # Under null, Q ~ N(mean_Q, var_Q)
+    if null_params is not None and "method" in null_params:
+        null_approx = str(null_params["method"])
+    else:
+        null_approx = "clt" if kernel.method == "moran" else "liu"
+
+    def _get_mean_var() -> tuple[float, float]:
         if null_params is not None and "mean_Q" in null_params and "var_Q" in null_params:
-            mean_Q = float(null_params["mean_Q"])
-            var_Q = float(null_params["var_Q"])
+            return float(null_params["mean_Q"]), float(null_params["var_Q"])
+        # Fall back to compute_null_params so we get H-centered moments
+        # with the finite-n ratio correction — raw trace(K), 2·trace(K²)
+        # would inflate the null variance (see compute_null_params docstring).
+        from quadsv.statistics import compute_null_params
+
+        p = compute_null_params(kernel, method="clt")
+        return float(p["mean_Q"]), float(p["var_Q"])
+
+    if null_approx == "clt":
+        mean_Q, var_Q = _get_mean_var()
+        sigma = float(np.sqrt(var_Q))
+        if sigma <= 1e-12:
+            pvals = np.ones_like(Q_arr)
         else:
-            mean_Q = kernel.trace()
-            var_Q = 2.0 * kernel.square_trace()
+            z_scores = (Q_arr - mean_Q) / sigma
+            pvals = chi2.sf(z_scores**2, df=1)
 
-        if np.ndim(Q) == 0:
-            sigma = np.sqrt(var_Q)
-            z_score = (Q - mean_Q) / sigma if sigma > 1e-12 else 0.0
-            pval = chi2.sf(z_score**2, df=1)
+    elif null_approx == "welch":
+        if null_params is not None and "scale_g" in null_params and "df_h" in null_params:
+            g = float(null_params["scale_g"])
+            h = float(null_params["df_h"])
         else:
-            sigma = np.sqrt(var_Q)
-            z_scores = (Q - mean_Q) / sigma if sigma > 1e-12 else np.zeros_like(Q)
-            pval = chi2.sf(z_scores**2, df=1)
+            mean_Q, var_Q = _get_mean_var()
+            if mean_Q <= 0 or var_Q <= 0:
+                pvals = np.ones_like(Q_arr)
+                g = h = None
+            else:
+                g = var_Q / (2.0 * mean_Q)
+                h = 2.0 * mean_Q**2 / var_Q
+        if g is not None:
+            pvals = chi2.sf(Q_arr / g, df=h)
 
-        return Q, pval
+    elif null_approx == "liu":
+        if null_params is not None and "eigenvalues" in null_params:
+            sig_evals = np.asarray(null_params["eigenvalues"], dtype=float)
+        else:
+            evals = kernel.eigenvalues(return_full_layout=True)
+            if evals.min() < -0.1:
+                raise ValueError(
+                    "Kernel has significant negative eigenvalues; Liu's method may be invalid."
+                )
+            sig_evals = evals[evals > 1e-9]
+        pvals = np.array([liu_sf(float(q), sig_evals) for q in Q_arr])
 
-    # For other kernels, use Liu's method
-    if null_params is not None and "eigenvalues" in null_params:
-        sig_evals = np.asarray(null_params["eigenvalues"], dtype=float)
     else:
-        evals = kernel.eigenvalues(return_full_layout=True)
-        if evals.min() < -0.1:
-            raise ValueError(
-                "Kernel has significant negative eigenvalues; Liu's method may be invalid."
-            )
-        # Filter numerical noise
-        sig_evals = evals[evals > 1e-9]
+        raise ValueError(f"Unknown null approximation method: {null_approx!r}")
 
+    # Unwrap to scalar if the caller passed a 2D grid for a single feature.
     if np.ndim(Q) == 0:
-        pval = liu_sf(Q, sig_evals)
-    else:
-        pval = np.array([liu_sf(q, sig_evals) for q in Q])
-
-    return Q, pval
+        return Q, float(pvals[0])
+    return Q, pvals
 
 
 def _standardize_grid(X: np.ndarray) -> np.ndarray:
@@ -928,11 +1018,13 @@ def _r_test_fft(
         return R
 
     # 3. P-values (Normal Approximation). R is Normal under H₀ with
-    # variance trace(K²); honor a precomputed `var_R` if the caller
-    # supplied null_params.
+    # variance ``trace((HKH)²)`` — NOT ``trace(K²)``, since both X and Y
+    # are z-scored before R = Zₓᵀ K Zᵧ is formed. Honor a precomputed
+    # ``var_R`` if the caller supplied one via ``compute_null_params``.
     if null_params is not None and "var_R" in null_params:
         var_R = float(null_params["var_R"])
     else:
+        # kernel.square_trace() returns trace((HKH)²) by default (centering=True).
         var_R = float(kernel.square_trace())
     sigma = np.sqrt(var_R)
 

@@ -77,7 +77,13 @@ class TestFFTKernelBasics(unittest.TestCase):
         K[d == 0] = 1.0
 
         kernel = FFTKernel(
-            (ny, nx), topology="hex", method="matern", bandwidth=bw, nu=nu, fft_solver="fft2"
+            (ny, nx),
+            topology="hex",
+            method="matern",
+            bandwidth=bw,
+            nu=nu,
+            fft_solver="fft2",
+            centering=False,
         )
         rng = np.random.default_rng(0)
         # Two distinctly anisotropic signals:
@@ -115,9 +121,16 @@ class TestFFTKernelBasics(unittest.TestCase):
         assert np.all(evals >= -1.1) and np.all(evals <= 1.1)
 
     def test_fft_car_kernel(self):
-        """Test CAR (Conditional Autoregressive) kernel initialization and eigenvalues."""
+        """Test CAR (Conditional Autoregressive) RAW eigenvalues (all > 0)."""
         shape = (6, 6)
-        kernel = FFTKernel(shape, method="car", neighbor_degree=1, rho=0.9, fft_solver="fft2")
+        kernel = FFTKernel(
+            shape,
+            method="car",
+            neighbor_degree=1,
+            rho=0.9,
+            fft_solver="fft2",
+            centering=False,
+        )
         evals = kernel.eigenvalues()
         assert len(evals) == 36  # 6 * 6
         assert np.all(np.isreal(evals))
@@ -284,7 +297,11 @@ class TestFFTVsMatrixKernelComparison(unittest.TestCase):
                 else:
                     fft_kwargs.pop(key, None)  # Remove unsupported keys
 
-        fft_kernel = FFTKernel((ny, nx), topology="square", method=method, **fft_kwargs)
+        # Compare RAW K spectra — centering would drop the DC mode on FFT
+        # but not on the dense MatrixKernel, so disable on both sides.
+        fft_kernel = FFTKernel(
+            (ny, nx), topology="square", method=method, centering=False, **fft_kwargs
+        )
 
         # Standard spatial kernel (no periodic boundaries)
         d_torus = compute_torus_distance_matrix(coords, domain_dims=(ny, nx))
@@ -308,13 +325,18 @@ class TestFFTVsMatrixKernelComparison(unittest.TestCase):
             if method == "car":
                 rho = kwargs.get("rho", 0.9)
                 W = np.eye(n) - rho * W
-                spatial_kernel = MatrixKernel.from_matrix(W, method=method, is_precision=True)
+                spatial_kernel = MatrixKernel.from_matrix(
+                    W,
+                    method=method,
+                    is_precision=True,
+                    centering=False,
+                )
             else:  # Moran
-                spatial_kernel = MatrixKernel.from_matrix(W, method=method)
+                spatial_kernel = MatrixKernel.from_matrix(W, method=method, centering=False)
 
         elif method == "gaussian":
             k_torus = np.exp(-(d_torus**2) / (2 * kwargs.get("bandwidth", 1.0) ** 2))
-            spatial_kernel = MatrixKernel.from_matrix(k_torus, method=method)
+            spatial_kernel = MatrixKernel.from_matrix(k_torus, method=method, centering=False)
         elif method == "matern":
             from scipy.special import gamma, kv
 
@@ -325,7 +347,7 @@ class TestFFTVsMatrixKernelComparison(unittest.TestCase):
             fac = (np.sqrt(2 * nu) * d_torus) / bw
             k_torus = (2 ** (1 - nu) / gamma(nu)) * (fac**nu) * kv(nu, fac)
             np.fill_diagonal(k_torus, 1.0)
-            spatial_kernel = MatrixKernel.from_matrix(k_torus, method=method)
+            spatial_kernel = MatrixKernel.from_matrix(k_torus, method=method, centering=False)
 
         return coords, fft_kernel, spatial_kernel
 
@@ -614,6 +636,186 @@ class TestFFTKernelNullParamsRoundTrip(unittest.TestCase):
         q_via_Kx = float(np.sum(z * Kz))
         q_direct = float(self.kernel.xtKx(z))
         np.testing.assert_allclose(q_via_Kx, q_direct, rtol=1e-8, atol=1e-10)
+
+
+class TestFFTKNeighborsAPI(unittest.TestCase):
+    """``FFTKernel`` accepts ``k_neighbors`` for graph kernels and converts
+    to ``neighbor_degree`` based on topology. Matches the MatrixKernel k-NN
+    semantic so users don't have to think in FFT-ring units.
+    """
+
+    def test_square_k_to_degree_mapping(self):
+        """Square grid: k=4 → 1, k=8 → 2, k=12 → 3, k=20 → 4."""
+        for k, expected_deg in [(4, 1), (8, 2), (12, 3), (20, 4)]:
+            k_obj = FFTKernel((32, 32), method="moran", k_neighbors=k)
+            self.assertEqual(
+                k_obj.params["neighbor_degree"],
+                expected_deg,
+                f"k={k} on square should map to neighbor_degree={expected_deg}",
+            )
+
+    def test_hex_k_to_degree_mapping(self):
+        """Hex grid: k=6 → 1 (first ring), k=12 → 2, k=18 → 3.
+
+        This also exercises the tolerance-based ring grouping —
+        hex distances like √3/2 produce numerical clusters that would
+        otherwise split a single physical shell.
+        """
+        for k, expected_deg in [(6, 1), (12, 2), (18, 3)]:
+            k_obj = FFTKernel((32, 32), topology="hex", method="moran", k_neighbors=k)
+            self.assertEqual(
+                k_obj.params["neighbor_degree"],
+                expected_deg,
+                f"k={k} on hex should map to neighbor_degree={expected_deg}",
+            )
+
+    def test_k_neighbors_works_for_all_graph_kernels(self):
+        """``k_neighbors`` is accepted for moran / car / graph_laplacian."""
+        for method in ("moran", "car", "graph_laplacian"):
+            kw = {"k_neighbors": 4}
+            if method == "car":
+                kw["rho"] = 0.8
+            k_obj = FFTKernel((32, 32), method=method, **kw)
+            self.assertEqual(k_obj.params["neighbor_degree"], 1)
+
+    def test_dual_spec_raises(self):
+        """Passing both k_neighbors and neighbor_degree should error."""
+        with self.assertRaises(ValueError):
+            FFTKernel((32, 32), method="moran", k_neighbors=4, neighbor_degree=1)
+
+    def test_k_neighbors_rejected_for_non_graph_kernel(self):
+        """``k_neighbors`` is a graph-only param — Gaussian should reject it."""
+        with self.assertRaises(ValueError):
+            FFTKernel((32, 32), method="gaussian", k_neighbors=4)
+
+    def test_arbitrary_k_rounds_up_to_nearest_full_ring(self):
+        """``k_neighbors=k`` selects the smallest ``neighbor_degree`` whose
+        cumulative count ≥ k. When k falls *inside* a ring (no exact match
+        because square rings have cumulative sizes {4, 8, 12, 20, 24, …}),
+        the translation should round *up* — never select a partial ring.
+
+        Square cumulative sizes: degree 1→4, 2→8, 3→12, 4→20, 5→24, …
+        """
+        # k in (1, 4]  -> 1   (fills the first ring)
+        # k in (4, 8]  -> 2
+        # k in (8, 12] -> 3
+        cases_square = [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (5, 2),
+            (6, 2),
+            (7, 2),
+            (8, 2),
+            (9, 3),
+            (10, 3),
+            (11, 3),
+            (12, 3),
+            (13, 4),
+            (19, 4),
+            (20, 4),
+            (21, 5),
+            (24, 5),
+        ]
+        for k, expected_deg in cases_square:
+            k_obj = FFTKernel((32, 32), method="moran", k_neighbors=k)
+            self.assertEqual(
+                k_obj.params["neighbor_degree"],
+                expected_deg,
+                f"square k={k} → expected deg={expected_deg}, "
+                f"got {k_obj.params['neighbor_degree']}",
+            )
+
+    def test_arbitrary_k_on_hex_rounds_up(self):
+        """Hex cumulative ring sizes: 6, 12, 18, 24, … (hex has 6·d nbrs at
+        degree d). Any k inside a ring should map to the smallest enclosing
+        degree.
+        """
+        cases_hex = [
+            (1, 1),
+            (5, 1),
+            (6, 1),
+            (7, 2),
+            (11, 2),
+            (12, 2),
+            (13, 3),
+            (17, 3),
+            (18, 3),
+        ]
+        for k, expected_deg in cases_hex:
+            k_obj = FFTKernel((32, 32), topology="hex", method="moran", k_neighbors=k)
+            self.assertEqual(
+                k_obj.params["neighbor_degree"],
+                expected_deg,
+                f"hex k={k} → expected deg={expected_deg}",
+            )
+
+    def test_k_zero_and_negative_raise(self):
+        """k_neighbors must be ≥ 1."""
+        for bad in (0, -1, -42):
+            with self.assertRaises(ValueError):
+                FFTKernel((32, 32), method="moran", k_neighbors=bad)
+
+    def test_k_larger_than_grid_clamps(self):
+        """If k exceeds any reachable ring (k > (ny·nx − 1)), clamp to the
+        outermost ring rather than raise — the user just gets "all non-self
+        cells" which is the best the grid can offer.
+        """
+        k_obj = FFTKernel((8, 8), method="moran", k_neighbors=10_000)
+        deg = k_obj.params["neighbor_degree"]
+        # Outermost ring index on an 8×8 torus is bounded by unique distances.
+        rings = k_obj._unique_ring_distances()
+        self.assertEqual(deg, len(rings) - 1)
+        # And the resulting adjacency should cover all non-self cells.
+        cutoff = rings[deg]
+        tol = 1e-6 * max(1.0, float(rings[-1]))
+        n_nbrs = int((k_obj._min_dist_sq <= cutoff + tol).sum()) - 1
+        self.assertEqual(n_nbrs, 8 * 8 - 1)
+
+    def test_same_spectrum_as_explicit_neighbor_degree(self):
+        """``FFTKernel(k_neighbors=4)`` on a square grid must produce the
+        exact same spectrum as ``FFTKernel(neighbor_degree=1)`` — the
+        translation is a pure alias, not a redefinition.
+        """
+        a = FFTKernel((32, 32), method="moran", k_neighbors=4)
+        b = FFTKernel((32, 32), method="moran", neighbor_degree=1)
+        np.testing.assert_allclose(a.spectrum, b.spectrum, atol=1e-12)
+
+
+class TestFFTWelchCltNull(unittest.TestCase):
+    """``_q_test_fft`` now dispatches on ``null_params['method']`` (not just
+    Liu / CLT-for-Moran). Verify welch and clt work for PSD and graph kernels.
+    """
+
+    def setUp(self):
+        from quadsv.statistics import compute_null_params
+
+        self._compute_null_params = compute_null_params
+        self.ny = self.nx = 32
+        np.random.seed(0)
+        self.X = np.random.randn(self.ny, self.nx, 200)
+
+    def _fpr(self, kernel, null_method):
+        params = self._compute_null_params(kernel, method=null_method)
+        _, pv = spatial_q_test(self.X, kernel, null_params=params)
+        return float((np.asarray(pv) < 0.05).mean())
+
+    def test_welch_honored_for_gaussian(self):
+        k = FFTKernel((self.ny, self.nx), method="gaussian", bandwidth=2.5)
+        fpr = self._fpr(k, "welch")
+        self.assertLess(abs(fpr - 0.05), 0.05, f"welch FPR {fpr}")
+
+    def test_clt_honored_for_matern(self):
+        k = FFTKernel((self.ny, self.nx), method="matern", bandwidth=2.5, nu=1.5)
+        fpr = self._fpr(k, "clt")
+        self.assertLess(abs(fpr - 0.05), 0.05, f"clt FPR {fpr}")
+
+    def test_liu_still_works(self):
+        """Liu default path unchanged for PSD kernels."""
+        k = FFTKernel((self.ny, self.nx), method="matern", bandwidth=2.5, nu=1.5)
+        fpr = self._fpr(k, "liu")
+        self.assertLess(abs(fpr - 0.05), 0.05, f"liu FPR {fpr}")
 
 
 if __name__ == "__main__":
