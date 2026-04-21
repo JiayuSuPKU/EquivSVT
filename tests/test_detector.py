@@ -201,10 +201,15 @@ class TestDetectorIrregular(unittest.TestCase):
         self.assertEqual(detector.kernel_method_, "car")
 
     def test_build_kernel_from_obsp_car_standardize(self):
-        """Precomputed CAR path with standardize should yield unit diagonal when realized (small n)."""
+        """Precomputed CAR with standardize → raw K has unit diagonal.
+
+        We flip ``detector.kernel_.centering = False`` so ``realization()``
+        returns raw ``K`` (not ``HKH``) for this diagonal check — the
+        standardize contract is a property of ``K`` itself.
+        """
         detector = DetectorIrregular(kernel_method="car", rho=0.9, standardize=True)
         detector.setup_data(self.adata, obsp_key="connectivities", is_distance=False, min_cells=5)
-        # Realize and check diagonal ~ 1
+        detector.kernel_.centering = False
         K = detector.kernel_.realization()
         diag = np.diag(K)
         np.testing.assert_allclose(diag, np.ones_like(diag), rtol=1e-5, atol=1e-3)

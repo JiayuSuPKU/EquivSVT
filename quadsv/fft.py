@@ -823,6 +823,11 @@ def _q_test_fft(  # noqa: C901
         null_approx = str(null_params["method"])
     else:
         null_approx = "clt" if kernel.method == "moran" else "liu"
+    if kernel.method == "moran" and null_approx != "clt":
+        raise ValueError(
+            f"Moran's I kernel is indefinite; only null_method='clt' is "
+            f"supported for the Q-test. Got method={null_approx!r}."
+        )
 
     def _get_mean_var() -> tuple[float, float]:
         if null_params is not None and "mean_Q" in null_params and "var_Q" in null_params:

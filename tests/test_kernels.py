@@ -34,68 +34,95 @@ class TestMatrixKernel(unittest.TestCase):
         self.assertEqual(kernel.params["bandwidth"], 1.5)
 
     def test_gaussian_kernel(self):
-        """Test Gaussian RBF kernel construction."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        """Gaussian RBF — raw K properties (symmetric, unit diagonal)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
         self.assertFalse(kernel.stores_precision)
-
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
-
-        # Kernel should be symmetric
         np.testing.assert_array_almost_equal(K, K.T, decimal=10)
-
-        # Diagonal should be 1
         np.testing.assert_array_almost_equal(np.diag(K), np.ones(self.n))
 
     def test_matern_kernel(self):
-        """Test Matérn kernel construction."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="matern", bandwidth=1.0, nu=1.5)
+        """Matern — raw K properties (symmetric, unit diagonal)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="matern", bandwidth=1.0, nu=1.5, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
         self.assertFalse(kernel.stores_precision)
-
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
-
-        # Kernel should be symmetric
         np.testing.assert_array_almost_equal(K, K.T, decimal=10)
-
-        # Diagonal should be 1
         np.testing.assert_array_almost_equal(np.diag(K), np.ones(self.n))
 
     def test_moran_kernel(self):
-        """Test Moran's I adjacency kernel construction."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="moran", k_neighbors=4)
+        """Moran adjacency — raw K sparsity."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="moran", k_neighbors=4, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
         self.assertFalse(kernel.stores_precision)
-
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
-
-        # Should be sparse-like (many zeros)
-        # Convert to dense if sparse to avoid efficiency warning
         K_dense = K.toarray() if hasattr(K, "toarray") else K
         self.assertGreater(np.sum(K_dense == 0), self.n)
 
     def test_graph_laplacian_kernel(self):
-        """Test Graph Laplacian kernel construction."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="graph_laplacian", k_neighbors=4)
+        """Graph Laplacian — construction and shape."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="graph_laplacian", k_neighbors=4, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
         self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
 
     def test_car_explicit(self):
-        """Test CAR kernel in explicit mode (small N)."""
-        kernel = MatrixKernel(self.coords, mode="coords", method="car", k_neighbors=4, rho=0.9)
+        """CAR (small N, explicit mode) — raw K symmetry."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="car", k_neighbors=4, rho=0.9, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.stores_precision)  # Small N, should be explicit
-
+        self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
-
-        # Should be symmetric
         np.testing.assert_array_almost_equal(K, K.T, decimal=10)
+
+    def test_realization_respects_centering(self):
+        """``realization()`` returns raw K with centering=False, HKH with True."""
+        k_raw = MatrixKernel(self.coords, method="gaussian", bandwidth=1.0, centering=False)
+        k_cen = MatrixKernel(self.coords, method="gaussian", bandwidth=1.0)
+        assert k_cen.centering is True
+        K = k_raw.realization()
+        n = k_raw.n
+        H = np.eye(n) - np.ones((n, n)) / n
+        np.testing.assert_allclose(k_cen.realization(), H @ K @ H, atol=1e-12)
+
+    def test_xtKx_standardized_invariant_under_centering(self):
+        """``xtKx_standardized`` returns the same values for centering=True
+        and centering=False — z has mean 0 by construction so Hz = z and
+        z^T K z = z^T HKH z identically.
+        """
+        rng = np.random.default_rng(0)
+        X_raw = rng.poisson(lam=2.0, size=(self.n, 5)).astype(float)
+        X_sparse = sp.csr_matrix(X_raw)
+        means = X_raw.mean(axis=0)
+        stds = X_raw.std(axis=0, ddof=1)
+
+        k_raw = MatrixKernel(self.coords, method="matern", bandwidth=1.5, centering=False)
+        k_cen = MatrixKernel(self.coords, method="matern", bandwidth=1.5, centering=True)
+
+        q_raw = k_raw.xtKx_standardized(X_sparse, means, stds)
+        q_cen = k_cen.xtKx_standardized(X_sparse, means, stds)
+        np.testing.assert_allclose(q_cen, q_raw, rtol=1e-12)
+
+        # And both match the explicit ``z^T K z`` (same as ``z^T HKH z``).
+        Z = (X_raw - means) / stds
+        K = k_raw.realization()
+        q_explicit = np.einsum("ij,ik,kj->j", Z, K, Z)
+        np.testing.assert_allclose(q_cen, q_explicit, rtol=1e-12)
 
     def test_xtKx_computation(self):
         """Raw ``xᵀ K x`` (``centering=False``)."""
@@ -276,32 +303,38 @@ class TestMatrixKernelStandardization(unittest.TestCase):
         self.n = self.coords.shape[0]
 
     def test_standardize_explicit_diagonal(self):
-        """Diagonal of realized K should be ~1 when standardize is True."""
+        """Diagonal of RAW K should be ~1 when standardize=True (centering=False).
+
+        Raw ``realization()`` exposes ``K`` itself; its unit-diagonal is the
+        standardize contract. Centered ``realization()`` returns ``HKH`` —
+        diagonal is structurally sub-unity (constant-mode projected out).
+        """
         kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
             rho=0.85,
             standardize=True,
+            centering=False,
         )
-        self.assertFalse(kernel.stores_precision)  # small N explicit path
+        self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         diag = np.diag(K)
         self.assertEqual(K.shape, (self.n, self.n))
         np.testing.assert_allclose(diag, np.ones_like(diag), rtol=1e-5, atol=1e-3)
 
     def test_no_standardize_diagonal_not_unity(self):
-        """Without standardize, diagonal need not be exactly 1."""
+        """Without standardize, raw-K diagonal need not be exactly 1."""
         kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
             rho=0.85,
             standardize=False,
+            centering=False,
         )
         K = kernel.realization()
         diag = np.diag(K)
-        # Check that there's at least some deviation from 1
         self.assertGreater(np.max(np.abs(diag - 1.0)), 1e-3)
 
 
@@ -402,14 +435,20 @@ class TestKernelUtilities(unittest.TestCase):
         self.assertIn("Method: gaussian", str_out)
 
     def test_from_matrix_precomputed_and_inverse(self):
-        """from_matrix should support precomputed kernels and precision matrices."""
+        """from_matrix should support precomputed kernels and precision matrices.
+
+        Uses ``centering=False`` since the test checks ``realization() == K``
+        (raw buffer) rather than the centered operator ``HKH``.
+        """
         K = np.array([[2.0, -1.0], [-1.0, 2.0]])
-        kernel_pre = MatrixKernel.from_matrix(K, is_precision=False)
+        kernel_pre = MatrixKernel.from_matrix(K, is_precision=False, centering=False)
         np.testing.assert_allclose(kernel_pre.realization(), K, rtol=1e-12)
 
         # Singular precision triggers pseudo-inverse path
         M = np.array([[1.0, 0.0], [0.0, 0.0]])
-        kernel_inv = MatrixKernel.from_matrix(M, is_precision=True, method="car", standardize=True)
+        kernel_inv = MatrixKernel.from_matrix(
+            M, is_precision=True, method="car", standardize=True, centering=False
+        )
         K_inv = kernel_inv.realization()
         self.assertEqual(K_inv.shape, (2, 2))
         self.assertTrue(np.allclose(K_inv, K_inv.T, rtol=1e-12))

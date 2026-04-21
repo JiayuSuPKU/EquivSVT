@@ -257,30 +257,26 @@ class TestNUFFTKernelKx:
 
 class TestNUFFTKernelTrace:
     def test_trace_analytic_scales_fftkernel(self):
-        """Raw ``trace`` / ``square_trace`` (centering=False) rescale the
-        internal FFTKernel's moments by ``N/n'`` and ``(N/n')²`` — the
-        n-point-operator scaling used by :func:`spatial_q_test`."""
-        rng = np.random.default_rng(0)
-        coords = rng.uniform(0, 20, size=(400, 2))
-        k = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5, centering=False)
-        n_over_nprime = k.n / (k.grid_shape[0] * k.grid_shape[1])
-        assert k.trace() == pytest.approx(k._fft_kernel.trace() * n_over_nprime, rel=1e-12)
-        assert k.square_trace() == pytest.approx(
-            k._fft_kernel.square_trace() * n_over_nprime**2, rel=1e-12
-        )
+        """Raw analytic moments (centering=False) under the n-point operator.
 
-    def test_trace_hutchinson_matches_analytic(self):
-        """Hutchinson-estimated moments should agree with the analytic scaling
-        within the probe-noise band on a typical NUFFT kernel."""
+        - ``trace(K_n) = (n/n') · T_1`` always (diagonal of ``G=UᴴU`` is
+          exactly ``n``, independent of coord arrangement).
+        - ``trace(K_n²) = (n²/n'²) · λᵀ Ψ λ`` with ``Ψ_{k,k'} = |φ(k'-k)|²``
+          — the Toeplitz identity; on a regular grid that coincides with
+          the k-grid this reduces to ``(n/n')² · S_2``. Compared against
+          the ``'empirical'`` probe-based estimator as a sanity check.
+        """
         rng = np.random.default_rng(0)
         coords = rng.uniform(0, 20, size=(400, 2))
-        k = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
-        t_ana = k.trace(method="analytic")
-        t_hut = k.trace(method="hutchinson", n_probes=64)
-        assert abs(t_ana - t_hut) / abs(t_ana) < 0.25
-        s_ana = k.square_trace(method="analytic")
-        s_hut = k.square_trace(method="hutchinson", n_probes=64)
-        assert abs(s_ana - s_hut) / abs(s_ana) < 0.25
+        k_raw = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5, centering=False)
+        n_over_nprime = k_raw.n / (k_raw.grid_shape[0] * k_raw.grid_shape[1])
+        # Mean trace identity is exact for any coord arrangement.
+        assert k_raw.trace() == pytest.approx(k_raw._fft_kernel.trace() * n_over_nprime, rel=1e-12)
+        # Square trace analytic against empirical (centered, n_probes=128).
+        k_cen = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
+        s_ana = k_cen.square_trace(method="analytic")
+        s_emp = k_cen.square_trace(method="empirical", n_probes=128)
+        assert abs(s_ana - s_emp) / abs(s_emp) < 0.20
 
 
 class TestNUFFTTwoPathsAgree:
@@ -319,45 +315,19 @@ class TestNUFFTTwoPathsAgree:
                 abs(Q_a - Q_b) / max(abs(Q_a), 1e-30) < 1e-8
             ), f"seed={seed}: Q_a={Q_a:.6e}, Q_b={Q_b:.6e}"
 
-    def test_trace_analytic_vs_hutchinson_agree_on_irregular(self):
-        """``trace(method='analytic')`` (Path A null) and
-        ``trace(method='hutchinson')`` (Path B null) should agree within the
-        Hutchinson probe noise on an irregular-coord kernel."""
+    def test_trace_analytic_vs_empirical_agree_on_irregular(self):
+        """``trace(method='analytic')`` and ``trace(method='empirical')``
+        should agree within the empirical probe noise on an irregular-coord
+        kernel (centered, so both paths apply)."""
         rng = np.random.default_rng(0)
         coords = rng.uniform(0, 20, size=(500, 2))
         k = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
         t_ana = k.trace(method="analytic")
-        t_hut = k.trace(method="hutchinson", n_probes=128)
-        assert abs(t_ana - t_hut) / max(abs(t_ana), 1e-30) < 0.2
+        t_emp = k.trace(method="empirical", n_probes=128)
+        assert abs(t_ana - t_emp) / max(abs(t_ana), 1e-30) < 0.2
         s_ana = k.square_trace(method="analytic")
-        s_hut = k.square_trace(method="hutchinson", n_probes=128)
-        assert abs(s_ana - s_hut) / max(abs(s_ana), 1e-30) < 0.2
-
-    def test_trace_analytic_vs_hutchinson_agree_on_regular_grid(self):
-        """On a regular grid (N = n') the band-limited approximation is exact,
-        so the analytic and Hutchinson estimators share the same population
-        moments — the gap is only probe noise. Both estimators act on the
-        raw operator; disable centering to isolate the scaling identity."""
-        ny, nx = 16, 16
-        yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
-        coords = np.stack([yy.ravel(), xx.ravel()], axis=1).astype(float)
-        k = NUFFTKernel(
-            coords,
-            grid_shape=(ny, nx),
-            spacing=(1.0, 1.0),
-            method="matern",
-            bandwidth=2.0,
-            nu=1.5,
-            centering=False,
-        )
-        t_ana = k.trace(method="analytic")
-        t_hut = k.trace(method="hutchinson", n_probes=128)
-        # On a regular grid the torus-BC band is gone; 15 % probe-noise band
-        # is a comfortable bound for n_probes=128.
-        assert abs(t_ana - t_hut) / max(abs(t_ana), 1e-30) < 0.15
-        s_ana = k.square_trace(method="analytic")
-        s_hut = k.square_trace(method="hutchinson", n_probes=128)
-        assert abs(s_ana - s_hut) / max(abs(s_ana), 1e-30) < 0.15
+        s_emp = k.square_trace(method="empirical", n_probes=128)
+        assert abs(s_ana - s_emp) / max(abs(s_ana), 1e-30) < 0.2
 
     def test_Kx_grid_round_trip_matches_xtKx(self):
         """``Kx_grid`` returns ``K x`` on the spatial grid; its inner product

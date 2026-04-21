@@ -48,6 +48,7 @@ Vectors and matrices:
 from __future__ import annotations
 
 import logging
+import warnings
 
 import finufft
 import numpy as np
@@ -251,21 +252,17 @@ class NUFFTKernel(Kernel):
     approximation, Parseval's identity gives the fast quadratic form
     ``xᵀ K x = (1/n') Σ_k λ(k) |x̂(k)|²`` with ``x̂ = Uᴴ x`` (a single type-1 NUFFT).
     The matrix-vector primitive :meth:`Kx` uses the companion two-shot NUFFT
-    ``K z = (1/n') · U · (λ ⊙ Uᴴ z)`` and serves as
-    the base for the Hutchinson null estimators and the bipartite R-test cross
-    matrix.
+    ``K z = (1/n') · U · (λ ⊙ Uᴴ z)`` and backs the KPM spectral-density
+    estimator and the bipartite R-test cross matrix.
 
-    :attr:`compute_method` selects which path :func:`quadsv.spatial_q_test` /
-    :func:`quadsv.spatial_r_test` take against this kernel:
-
-    - ``'spectral'`` (default): k-space Parseval via :meth:`xtKx` /
-      :meth:`xtKy`; null moments from the analytic n-point-scaled FFT
-      spectrum.
-    - ``'matmul'``: length-``n`` matrix product via :meth:`xtKx_matmul` /
-      :meth:`Kx`; null moments from Hutchinson probes through ``K``.
-
-    Both paths agree to NUFFT precision (``eps``) on a regular grid
-    and to ~1 – 2 % on irregular points.
+    :func:`quadsv.spatial_q_test` always uses the k-space Parseval path
+    (:meth:`xtKx`); :func:`quadsv.spatial_r_test` dispatches on shape —
+    paired diagonal for ``M_x == M_y`` via :meth:`xtKy`, full ``(M_x, M_y)``
+    cross matrix via :meth:`Kx` otherwise. The matmul counterparts
+    (:meth:`xtKx_matmul` / :meth:`xtKy_matmul`) are exposed for callers that
+    want to compute the same form directly at the ``n`` irregular points —
+    they agree with the spectral path to NUFFT precision (``eps``) on both
+    regular and irregular coordinates.
 
     Parameters
     ----------
@@ -298,10 +295,6 @@ class NUFFTKernel(Kernel):
     workers : int, optional
         Forwarded to :mod:`scipy.fft` (used by :meth:`Kx_grid`) and reserved
         for future finufft parallelism. ``None`` uses the SciPy default.
-    compute_method : {``'spectral'``, ``'matmul'``}, default ``'spectral'``
-        Which of the two paths :func:`quadsv.spatial_q_test` /
-        :func:`quadsv.spatial_r_test` use. Stored on the instance as a mutable
-        attribute so callers can flip it between calls without rebuilding.
     **kwargs
         Method-specific kernel hyperparameters (``bandwidth``, ``nu``,
         ``rho``, ``neighbor_degree``) forwarded to the internal
@@ -321,17 +314,6 @@ class NUFFTKernel(Kernel):
         Kernel method name.
     params : dict
         Resolved kernel hyperparameters (snapshot of the internal FFT kernel).
-    compute_method : str
-        Currently selected NUFFT path — mutable. One of:
-
-        - ``'spectral'`` (default, fast): k-space Parseval via
-          :meth:`xtKx` / :meth:`xtKy`; null moments from the analytic
-          n-point-scaled FFT spectrum.
-        - ``'matmul'``: full matrix product via
-          :meth:`xtKx_matmul` / :meth:`Kx`; null moments estimated by
-          Hutchinson probes.
-
-        Flip at any time between calls to swap paths without rebuilding.
     workers : int or None
         scipy.fft worker count used by :meth:`Kx_grid`.
     stores_precision : bool
@@ -350,7 +332,6 @@ class NUFFTKernel(Kernel):
         oversample: float = 2.0,
         eps: float = 1e-6,
         workers: int | None = None,
-        compute_method: str = "spectral",
         *,
         centering: bool = True,
         **kwargs,
@@ -378,10 +359,6 @@ class NUFFTKernel(Kernel):
             NUFFT tolerance.
         workers : int, optional
             scipy.fft worker count used by :meth:`Kx_grid`.
-        compute_method : {``'spectral'``, ``'matmul'``}, default ``'spectral'``
-            Initial value for the mutable :attr:`compute_method` attribute
-            that selects the NUFFT path used by
-            :func:`quadsv.spatial_q_test` / :func:`quadsv.spatial_r_test`.
         **kwargs
             Method-specific kernel hyperparameters (``bandwidth``, ``nu``,
             ``rho``, ``neighbor_degree``).
@@ -389,8 +366,8 @@ class NUFFTKernel(Kernel):
         Raises
         ------
         ValueError
-            If ``coords`` has the wrong shape, ``method`` / ``compute_method``
-            is unknown, or ``grid_shape`` / ``spacing`` are invalid.
+            If ``coords`` has the wrong shape, ``method`` is unknown, or
+            ``grid_shape`` / ``spacing`` are invalid.
         """
         coords = np.asarray(coords, dtype=np.float64)
         if coords.ndim != 2 or coords.shape[1] != 2:
@@ -432,15 +409,6 @@ class NUFFTKernel(Kernel):
         self._eps: float = float(eps)
         self.workers: int | None = workers
         self.stores_precision: bool = False
-        if compute_method not in ("spectral", "matmul"):
-            raise ValueError(
-                f"compute_method must be 'spectral' or 'matmul', got {compute_method!r}."
-            )
-        # Public mutable attribute — description lives in the class
-        # docstring's Attributes section so Sphinx AutoAPI picks it up
-        # cleanly. Mutable: flip between 'spectral' / 'matmul' at any time
-        # to swap NUFFT paths without rebuilding the kernel.
-        self.compute_method: str = compute_method
 
         # Internal FFTKernel holds the eigenvalue spectrum on the k-grid. We
         # use fft2 (full spectrum) so the ifftshift trick aligns NUFFT output
@@ -474,7 +442,7 @@ class NUFFTKernel(Kernel):
         return (
             f"<NUFFTKernel method={self.method} n={self.n} "
             f"grid={self.grid_shape} spacing={self.spacing} "
-            f"compute_method={self.compute_method!r} params={self.params}>"
+            f"params={self.params}>"
         )
 
     def __str__(self) -> str:  # pragma: no cover
@@ -483,46 +451,342 @@ class NUFFTKernel(Kernel):
             f"- Method: {self.method}\n"
             f"- Number of spots: {self.n}\n"
             f"- k-grid: {self.grid_shape} at spacing {self.spacing}\n"
-            f"- Compute method: {self.compute_method}\n"
             f"- Params: {self.params}"
         )
 
     # ------------------------------------------------------------------
-    # Cached scaling between the n'-point grid operator K' and the n-point
-    # irregular-point operator K. Under the band-limited approximation
-    # ``K ≈ (1/n') · U · diag(λ) · Uᴴ`` and H₀ with x iid N(0, 1) at n points,
-    # the moments of K scale with ``n/n'`` relative to K'.
-    # ------------------------------------------------------------------
-    @property
-    def _n_over_nprime(self) -> float:
-        ny, nx = self.grid_shape
-        return self.n / (ny * nx)
+    _TOEPLITZ_R_THRESHOLD: int = 2000
+    _TOEPLITZ_LAM_TOL: float = 1e-5
+    _KPM_DEGREE: int = 60
+    _KPM_N_PROBES: int = 30
 
-    # ------------------------------------------------------------------
+    def _coord_phi(self) -> np.ndarray:
+        """Coord-density function ``φ(k)`` on k-grid (DC at [0, 0]).
+
+        ``φ(Δ) = (1/n) · Σ_i exp(-iΔ·y_i)`` — one type-1 NUFFT of the
+        all-ones vector. Symmetrized so ``φ[k] = conj(φ[-k mod N])``
+        holds exactly (fixes Nyquist self-conjugate bins that NUFFT
+        samples as complex on even-length grids; needed for strict
+        Hermiticity of the induced ``G_{k,k'} = n·φ(k'-k)``).
+        Cached on the instance (coord-only).
+        """
+        cache = getattr(self, "_phi_cache", None)
+        if cache is not None:
+            return cache
+        ones = np.ones(self.n, dtype=float)
+        phi_hat_centered = self._nufft_type1(ones).squeeze()  # finufft DC-centered
+        phi = np.fft.ifftshift(phi_hat_centered) / self.n  # DC at [0, 0]
+        ny, nx = phi.shape
+        ii = np.arange(ny)[:, None]
+        jj = np.arange(nx)[None, :]
+        phi = 0.5 * (phi + np.conj(phi[(-ii) % ny, (-jj) % nx]))
+        self._phi_cache = phi
+        return phi
+
+    def _eigvals_toeplitz_M(self, lam_tol: float | None = None) -> np.ndarray | None:
+        """Full-spectrum eigenvalues via the reduced Toeplitz-``G`` matrix.
+
+        Uses the identity (for PSD ``Λ``) that non-zero eigvals of
+        ``K_n = (1/n') U Λ Uᴴ`` equal non-zero eigvals of
+        ``M = (1/n') Λ^{1/2} G Λ^{1/2}`` with ``G_{k,k'} = n·φ(k'-k)``
+        (Toeplitz in k-space, built once from ``_coord_phi``). Truncate
+        ``Λ`` to its support — pick the ``r`` modes with
+        ``|λ(k)| > lam_tol · max|λ|`` — form the dense ``r × r`` ``M_r``
+        by indexed ``φ`` lookups, ``eigvalsh``.
+
+        For ``centering=True`` we apply the rank-1 shift
+        ``G → G_H = G − (1/n) · (Uᴴ𝟏)(Uᴴ𝟏)ᴴ = G − n · conj(φ) φᵀ``,
+        which accounts for the y-space ``H = I − 𝟏𝟏ᵀ/n`` projection
+        ((HU)ᴴ(HU) = UᴴHU = G − (1/n)(Uᴴ𝟏)(Uᴴ𝟏)ᴴ).
+
+        Returns ``None`` when the formula doesn't apply cleanly:
+
+        - Indefinite ``Λ`` (``moran``, anti-phase eigenmodes) — the
+          signed square root makes ``M`` non-Hermitian.
+        - Broad spectrum with ``r > _TOEPLITZ_R_THRESHOLD`` — dense
+          ``r × r`` eigvalsh would be slower than the KPM fallback.
+
+        Returns
+        -------
+        np.ndarray or None
+            Eigenvalues (descending), or ``None`` if the KPM fallback
+            should be used instead.
+        """
+        lam = self._fft_kernel.spectrum.reshape(self.grid_shape)
+        if lam.min() < -1e-3 * float(np.abs(lam).max()):
+            return None  # indefinite
+
+        lam_flat = lam.ravel()
+        lam_max = float(np.abs(lam_flat).max())
+        if lam_max == 0:
+            return np.zeros(self.n)
+
+        tol_rel = self._TOEPLITZ_LAM_TOL if lam_tol is None else float(lam_tol)
+        mask_flat = np.abs(lam_flat) > tol_rel * lam_max
+        r = int(mask_flat.sum())
+        if r > self._TOEPLITZ_R_THRESHOLD:
+            return None  # too broad — KPM is cheaper
+
+        ny, nx = self.grid_shape
+        nprime = ny * nx
+        mask = mask_flat.reshape(ny, nx)
+        iy, ix = np.where(mask)
+        lam_r_sqrt = np.sqrt(np.maximum(lam_flat[mask_flat], 0.0))
+
+        phi = self._coord_phi()
+        dy = (iy[None, :] - iy[:, None]) % ny
+        dx = (ix[None, :] - ix[:, None]) % nx
+        G_r = self.n * phi[dy, dx]
+        if self.centering:
+            # (HU)ᴴ(HU) = G − (1/n)(Uᴴ𝟏)(Uᴴ𝟏)ᴴ = G − n · conj(φ_r) φ_rᵀ.
+            # Rank-1 outer product on the restricted mode set.
+            phi_r = phi[iy, ix]
+            G_r = G_r - self.n * np.outer(np.conj(phi_r), phi_r)
+        M_r = (lam_r_sqrt[:, None] * G_r * lam_r_sqrt[None, :]) / nprime
+        M_r = 0.5 * (M_r + M_r.conj().T)
+
+        vals = np.linalg.eigvalsh(M_r)
+        vals = np.real(vals)
+        # For PSD λ the operator ``K_n = (1/n') U Λ Uᴴ`` and ``HKH`` are
+        # both PSD — any negative eigenvalue from ``eigvalsh`` is pure
+        # finite-precision noise on the near-null subspace. Clip to 0.
+        vals = np.maximum(vals, 0.0)
+        return np.sort(vals)[::-1]
+
+    def _eigvals_kpm(  # noqa: C901
+        self,
+        n_samples: int | None = None,
+        degree: int | None = None,
+        n_probes: int | None = None,
+        rng_seed: int = 0,
+    ) -> np.ndarray:
+        """Approximate full spectrum via the Kernel Polynomial Method (KPM).
+
+        Uses only :meth:`Kx` matvecs — no dense ``n × n`` work. Flow:
+
+        1. Estimate spectral bounds ``[a, b]`` by ``eigsh(which='LA')`` /
+           ``eigsh(which='SA')`` on the :meth:`Kx` LinearOperator (one
+           call each, a few matvecs apiece).
+        2. Rescale the operator to ``T = (K − (a+b)/2 · I) · 2/(b−a)`` so
+           its spectrum lives in ``(−1, 1)``.
+        3. Chebyshev moments ``μ_p = (1/n) · trace(T_p(T))`` for
+           ``p = 0..D`` via stochastic trace estimation with Rademacher
+           probes and the three-term recurrence
+           ``T_{p+1}(T)v = 2T·T_p(T)v − T_{p-1}(T)v`` — ``D`` degree,
+           ``S`` probes, total ``O(D · S · matvec)``.
+        4. Apply Jackson kernel damping to suppress the Gibbs ringing that
+           polynomial truncation introduces.
+        5. Reconstruct the density
+           ``ρ(x) = (1/(π √(1−x²))) · (μ_0 + 2 Σ_{p≥1} g_p μ_p T_p(x))``
+           on a fine ``x``-grid, clip negatives, renormalize.
+        6. Quantile-sample ``n_samples`` values from ``ρ`` and rescale
+           back to the original spectrum range.
+
+        Sets ``self._last_spectrum_from_kpm = True`` so downstream
+        consumers (Liu's method) can emit a tail-accuracy warning.
+
+        Parameters
+        ----------
+        n_samples : int, optional
+            Number of eigenvalue samples to return (default ``self.n``).
+        degree : int, optional
+            Polynomial degree ``D`` (default ``_KPM_DEGREE`` = 60).
+        n_probes : int, optional
+            Hutchinson probe count (default ``_KPM_N_PROBES`` = 30).
+        rng_seed : int, default 0
+            Seed for reproducibility.
+
+        Returns
+        -------
+        np.ndarray
+            ``(n_samples,)`` descending, with ``mean × n_samples ≈ trace``.
+        """
+        from scipy.sparse.linalg import LinearOperator, eigsh
+
+        n = self.n
+        if n_samples is None:
+            n_samples = n
+        if degree is None:
+            degree = self._KPM_DEGREE
+        if n_probes is None:
+            n_probes = self._KPM_N_PROBES
+
+        def _matvec(v: np.ndarray) -> np.ndarray:
+            return np.asarray(self.Kx(np.asarray(v, dtype=float)))
+
+        op = LinearOperator(shape=(n, n), matvec=_matvec, dtype=float)
+        # Spectral bound via Lanczos ``which='LM'`` (robust even when
+        # eigenvalues pile up at zero, which happens for ``HKH`` and
+        # rank-deficient PSD kernels). Fallback to the Frobenius bound
+        # ``|λ|_max ≤ √trace(K²)`` if Lanczos fails.
+        try:
+            lm = float(eigsh(op, k=1, which="LM", return_eigenvectors=False, maxiter=500)[0])
+            lam_bound = abs(lm)
+        except Exception:
+            lam_bound = float(np.sqrt(max(self.square_trace(method="analytic"), 0.0)))
+        if lam_bound <= 1e-12:
+            self._last_spectrum_from_kpm = True
+            return np.zeros(n_samples)
+        # PSD detection — if the kernel method is known-PSD by construction
+        # (gaussian/matern/car) OR the FFT spectrum is numerically PSD
+        # (graph_laplacian with rho stabilizer), both ``K_n`` and ``HKH``
+        # are PSD, so eigenvalues live in ``[0, lam_bound]``. Using
+        # ``a = 0`` doubles the KPM k-space resolution compared to a
+        # symmetric ``[-b, +b]`` bound and prevents spurious negative
+        # samples from Jackson leakage. For indefinite kernels (Moran),
+        # eigenvalues span both signs — use the symmetric bound.
+        psd_methods = ("gaussian", "matern", "car", "graph_laplacian")
+        grid_lam = self._fft_kernel.spectrum
+        lam_range = float(np.abs(grid_lam).max())
+        is_psd = self.method in psd_methods and (
+            float(grid_lam.min()) >= -1e-3 * max(lam_range, 1.0)
+        )
+        pad = 0.02 * lam_bound
+        if is_psd:
+            a, b = -pad, lam_bound + pad
+        else:
+            a, b = -lam_bound - pad, lam_bound + pad
+        shift = 0.5 * (a + b)
+        scale = 2.0 / (b - a)
+
+        def apply_T(v: np.ndarray) -> np.ndarray:
+            """Scaled operator T = (K − shift·I) · scale."""
+            return scale * (_matvec(v) - shift * v)
+
+        # Chebyshev moments via Hutchinson.
+        rng = np.random.default_rng(rng_seed)
+        mu = np.zeros(degree + 1)
+        for _ in range(n_probes):
+            r = rng.choice([-1.0, 1.0], size=n).astype(float)
+            t_prev = r  # T_0(T)·r = r
+            t_curr = apply_T(r)  # T_1(T)·r
+            mu[0] += np.dot(r, t_prev)
+            mu[1] += np.dot(r, t_curr)
+            for p in range(2, degree + 1):
+                t_next = 2.0 * apply_T(t_curr) - t_prev
+                mu[p] += np.dot(r, t_next)
+                t_prev, t_curr = t_curr, t_next
+        mu /= n * n_probes
+
+        # Jackson kernel damping.
+        x_J = np.pi / (degree + 1)
+        p_arr = np.arange(degree + 1)
+        g = ((degree - p_arr + 1) * np.cos(p_arr * x_J) + np.sin(p_arr * x_J) / np.tan(x_J)) / (
+            degree + 1
+        )
+        mu_damped = mu * g
+
+        # Reconstruct density on fine grid (avoid the ±1 singularities).
+        n_grid = 4 * max(n_samples, 512)
+        xs = np.linspace(-1 + 1e-4, 1 - 1e-4, n_grid)
+        T_vals = np.empty((degree + 1, n_grid))
+        T_vals[0] = 1.0
+        if degree >= 1:
+            T_vals[1] = xs
+        for p in range(2, degree + 1):
+            T_vals[p] = 2 * xs * T_vals[p - 1] - T_vals[p - 2]
+        density = mu_damped[0] * T_vals[0]
+        if degree >= 1:
+            density = density + 2.0 * np.sum(mu_damped[1:, None] * T_vals[1:], axis=0)
+        density = density / (np.pi * np.sqrt(1.0 - xs**2))
+        density = np.maximum(density, 0.0)
+        # np.trapezoid (numpy ≥ 2); falls back for older numpy.
+        _trapz = getattr(np, "trapezoid", None) or np.trapz  # type: ignore[attr-defined]
+        mass = _trapz(density, xs)
+        if mass <= 0:
+            return np.zeros(n_samples)
+        density /= mass
+
+        # Quantile sample. CDF via cumulative trapezoid.
+        cdf = np.concatenate([[0.0], np.cumsum(0.5 * (density[:-1] + density[1:]) * np.diff(xs))])
+        cdf /= cdf[-1]
+        q = (np.arange(n_samples) + 0.5) / n_samples
+        x_samples = np.interp(q, cdf, xs)
+        eigvals = x_samples / scale + shift
+        if is_psd:
+            # Clip Jackson-leakage residual negatives to 0. Magnitude is
+            # O(Jackson-window width × max|λ|) — a few percent of lam_bound.
+            eigvals = np.maximum(eigvals, 0.0)
+
+        self._last_spectrum_from_kpm = True
+        return np.sort(eigvals)[::-1]
+
     def eigenvalues(self, k: int | None = None, return_full_layout: bool = False) -> np.ndarray:
         """Eigenvalues of the ``n × n`` irregular-point operator.
 
-        Under the band-limited approximation the spectrum equals
-        ``fft_kernel.eigenvalues(...) · n / n'``. When ``self.centering``
-        is True, the DC (constant-mode) entry is dropped — that's the
-        ``HKH`` spectrum ready for Liu's chi-squared mixture on z-scored
-        data.
+        Returns the spectrum of the realized operator ``K_n`` (raw) or
+        ``H K_n H`` (centered) at the irregular coordinates — **not** the
+        internal FFT-grid spectrum. Purely matrix-free: no dense
+        ``n × n`` construction.
+
+        Three paths:
+
+        - **``k`` given — Lanczos top-k.** Wrap :meth:`Kx` as a
+          :class:`~scipy.sparse.linalg.LinearOperator` and call
+          :func:`~scipy.sparse.linalg.eigsh(which='LM')` for the top
+          ``k`` eigenvalues by magnitude. Cost: ``O(k × nufft)``. Not
+          cached (could be called with different ``k``).
+        - **``k=None`` — Toeplitz-M (analytic, preferred).** See
+          :meth:`_eigvals_toeplitz_M`. Applies when ``Λ`` is PSD,
+          ``centering=False``, and the support size
+          ``r = #{k : |λ(k)| > 10⁻⁵ · max|λ|}`` is below
+          ``_TOEPLITZ_R_THRESHOLD`` (default 2000). Exact to NUFFT
+          ``eps``; cost dominated by ``O(r³)`` eigvalsh on a dense
+          ``r × r`` reduced matrix.
+        - **``k=None`` — KPM fallback.** Kernel Polynomial Method with
+          stochastic trace estimation (see :meth:`_eigvals_kpm`).
+          ``O(D · S · nufft)`` total, ``D ≈ 60``, ``S ≈ 30``. Returns
+          a quantile-sampled approximation of the density; sets
+          ``self._last_spectrum_from_kpm = True`` so downstream Liu
+          consumers can warn on tail accuracy.
+
+        Cached per ``centering`` mode for the full-spectrum paths.
+
+        Parameters
+        ----------
+        k : int, optional
+            Top-``k`` eigenvalues by magnitude (Lanczos). ``None``
+            returns the full spectrum (Toeplitz-M / KPM).
+        return_full_layout : bool, default False
+            Kept for API compatibility with :meth:`FFTKernel.eigenvalues`;
+            ignored.
+
+        Returns
+        -------
+        np.ndarray
+            Eigenvalues in descending order. Length ``k`` when ``k`` is
+            given, ``n`` for the full-spectrum paths.
         """
-        # Internal FFTKernel is built with centering=False, so this is the
-        # raw grid spectrum. Scale by n/n' to get the n-point-operator view.
-        spec = (
-            self._fft_kernel.eigenvalues(k=None, return_full_layout=return_full_layout)
-            * self._n_over_nprime
-        )
-        if self.centering:
-            spec = spec.copy()
-            # DC is the (0, 0) grid mode — index 0 in both full-fft2 layout
-            # and rfft2 full-layout reconstruction.
-            spec[0] = 0.0
-        if k is None:
-            return spec
-        idx = np.argsort(-spec)[:k]
-        return spec[idx]
+        del return_full_layout  # kept only for API compatibility
+        cache_key = "_spectrum_centered" if self.centering else "_spectrum_raw"
+        n = self.n
+
+        # Top-k: Lanczos. Not cached.
+        if k is not None:
+            from scipy.sparse.linalg import LinearOperator, eigsh
+
+            def _matvec(v: np.ndarray) -> np.ndarray:
+                return np.asarray(self.Kx(np.asarray(v, dtype=float)))
+
+            op = LinearOperator(shape=(n, n), matvec=_matvec, dtype=float)
+            k_req = min(int(k), n - 2)
+            vals, _ = eigsh(op, k=k_req, which="LM")
+            return np.sort(np.real(vals))[::-1]
+
+        # Full spectrum — cached.
+        cached = getattr(self, cache_key, None)
+        if cached is not None and len(cached) == n:
+            return cached
+
+        toep = self._eigvals_toeplitz_M()
+        if toep is not None:
+            pad = max(0, n - len(toep))
+            spectrum = np.concatenate([toep, np.zeros(pad)]) if pad else toep[:n]
+        else:
+            spectrum = self._eigvals_kpm(n_samples=n)
+
+        setattr(self, cache_key, spectrum)
+        return spectrum
 
     # ------------------------------------------------------------------
     # Path A primitives — k-space Parseval (default for xtKx / xtKy)
@@ -668,8 +932,8 @@ class NUFFTKernel(Kernel):
 
         evaluated as type-1 NUFFT → elementwise multiply by ``λ(k) / n'`` →
         type-2 NUFFT. Output length ``n``, same shape as ``z``. Base primitive
-        for :meth:`xtKx_matmul`, :meth:`xtKy_matmul`, the Hutchinson null
-        estimators, and the bipartite R-test in :class:`DetectorIrregular`.
+        for :meth:`xtKx_matmul`, :meth:`xtKy_matmul`, the KPM spectral-density
+        estimator, and the bipartite R-test in :class:`DetectorIrregular`.
 
         Parameters
         ----------
@@ -751,8 +1015,8 @@ class NUFFTKernel(Kernel):
         Returns the paired ``(M,)`` diagonal of ``Xᵀ K Y`` (sparse-aware on
         ``x``). For the full ``(M_x, M_y)`` bipartite cross matrix build it
         explicitly as ``X.T @ self.Kx(Y)`` — that's what
-        :class:`DetectorIrregular` does for ``compute_rstat`` after setting
-        ``kernel.compute_method = 'matmul'``.
+        :class:`DetectorIrregular` does for ``compute_rstat`` when the two
+        feature blocks have different widths.
 
         Parameters
         ----------
@@ -821,42 +1085,74 @@ class NUFFTKernel(Kernel):
         return out[..., 0] if squeeze else out
 
     # ------------------------------------------------------------------
-    # Null-moment estimators — analytic (Path A) and Hutchinson (Path B)
+    # Null-moment estimators — analytic Toeplitz formula and z-scored-probe
+    # empirical estimator (for Dirichlet-ratio-sensitive kernels).
     # ------------------------------------------------------------------
-    def _get_rvs_trace_cache(self, n_probes: int = 15) -> dict:
-        """Cache Hutchinson probes ``v ∈ {±1}^n`` and their ``K v`` images.
+    def _coord_power_spectrum(self) -> np.ndarray:
+        """``|φ(k)|²`` on the k-grid in scipy-FFT (DC-at-[0,0]) layout.
 
-        Used by :meth:`trace` / :meth:`square_trace` with
-        ``method='hutchinson'``. The probes are drawn from a seeded RNG
-        (``default_rng(0)``) so repeated calls return the same values for a
-        given kernel instance, mirroring
-        :meth:`MatrixKernelBase._get_rvs_trace_cache`.
+        Uses the cached (symmetrized) ``φ`` from :meth:`_coord_phi`. The
+        magnitude-square is coord-only, independent of the kernel method
+        and spectrum. Feeds the exact analytic ``trace(K²)`` formula
+        ``trace(K_n²) = (n²/n'²) · Σ_{k,k'} λ(k) λ(k') |φ(k'-k)|²``,
+        which reduces to ``(n/n')² · Σ_k λ(k)²`` when coords lie on the
+        k-grid (then ``|φ|² = δ``).
+
+        Returns
+        -------
+        np.ndarray
+            ``(ny, nx)`` real, non-negative, with ``|φ(0)|² = 1`` at
+            ``[0, 0]`` (DC-at-origin layout).
         """
-        cache = getattr(self, "_trace_rvs_cache", None)
-        if cache is not None and cache["n_probes"] == n_probes:
+        cache = getattr(self, "_phi2_cache", None)
+        if cache is not None:
             return cache
-        rng = np.random.default_rng(0)
-        rvs = rng.choice([-1.0, 1.0], size=(self.n, n_probes)).astype(np.float64)
-        Krvs = self.Kx(rvs)  # (n, n_probes)
-        self._trace_rvs_cache = {"n_probes": n_probes, "rvs": rvs, "Krvs": Krvs}
-        return self._trace_rvs_cache
+        phi2 = np.abs(self._coord_phi()) ** 2
+        self._phi2_cache = phi2
+        return phi2
 
     def _default_moment_method(self) -> str:
-        """Default raw-trace estimator for this kernel.
+        """Default moment estimator.
 
-        ``trace()`` / ``square_trace()`` return RAW moments of the operator
-        ``K ≈ (1/n') · U · diag(λ) · Uᴴ``. For smooth kernels the analytic
-        path ``(n/n') · fft_kernel.trace()`` is exact under the band-limit.
-        For graph kernels (Moran/CAR/graph_laplacian) the raw trace from
-        the FFT-grid spectrum doesn't match the realized smeared operator,
-        so we default to Hutchinson (``±1`` probes through the full NUFFT
-        round-trip) — an honest estimate of ``trace(K)`` for the as-applied
-        operator. The *centered* moments ``trace(HKH)`` / ``trace((HKH)²)``
-        used by :func:`spatial_q_test` live on :meth:`_centered_traces`,
-        which for graph kernels samples ``Q`` on z-scored probes directly.
+        ``'analytic'`` for raw-moment queries — ``trace(K) = (n/n')·Σλ``
+        (exact) and ``trace(K²) = (n²/n'²)·λᵀΨλ`` (Toeplitz FFT
+        convolution, exact to NUFFT band-limit precision).
+
+        **Exceptions** — ``car`` / ``graph_laplacian`` / ``moran`` under
+        ``centering=True`` default to ``'empirical'``. Two distinct
+        failure modes:
+
+        - ``car`` / ``graph_laplacian`` have **broad spectral support**
+          (polynomial decay, but far slower than Matern/Gaussian — e.g.
+          CAR ρ=0.9 spans factor 20 from peak to tail, Matern bw=3
+          spans factor 10⁶). Broad support means a larger fraction of
+          the trace lives in the tail, so the spectral IPR
+          ``r_eff = (Σλ)²/Σλ²`` is much larger than for smooth kernels,
+          and ``mean²/(m·sq) → 1`` as ``r_eff → n``. The downstream
+          Dirichlet(1/2) ratio ``Var[Q] = 2·(m·sq − mean²)/(m+2)``
+          amplifies any relative error in ``sq`` by a factor
+          ``1/(1 − mean²/(m·sq))`` — about 13× for CAR and 23× for
+          graph_laplacian at practical settings. The analytic ``sq``
+          itself is accurate to ~1–4 % (NUFFT band-limit residual), but
+          that bias becomes a 20–80 % ``Var[Q]`` bias after amplification.
+          Empirical probes measure ``Var[Q]`` directly from the sample
+          variance of ``Q`` on z-scored probes and invert through the
+          same ratio, so the amplification cancels by construction.
+        - ``moran`` has indefinite ``Λ`` (mixed signs on the k-grid,
+          ``Σλ ≈ 0`` by construction). The Toeplitz quadratic form
+          ``λᵀΨλ`` becomes a delicate cancellation between sign-opposite
+          pairs; FFT convolution loses enough precision that the
+          analytic result can flip sign (observed values ≈ 0 at
+          ``n = 1024`` vs an empirical-ground-truth of ``∼ 16``).
+          Empirical bypasses the cancellation.
+
+        Callers who want the analytic path anyway can pass
+        ``method='analytic'`` explicitly, and optionally
+        ``compute_null_params(..., dirichlet_correction=False)`` to drop
+        the ratio correction (a conservative upper bound on ``Var[Q]``).
         """
-        if self.method in ("moran", "graph_laplacian", "car"):
-            return "hutchinson"
+        if self.centering and self.method in ("car", "graph_laplacian", "moran"):
+            return "empirical"
         return "analytic"
 
     def _get_centered_probe_cache(self, n_probes: int = 100) -> dict:
@@ -883,73 +1179,99 @@ class NUFFTKernel(Kernel):
         self._centered_probe_cache = {"n_probes": n_probes, "Q": Q_probes}
         return self._centered_probe_cache
 
-    def trace(self, method: str | None = None, n_probes: int = 15) -> float:
-        """``trace(K)`` (raw) or ``trace(HKH)`` (centered) of the operator.
+    def trace(self, method: str | None = None, n_probes: int | None = None) -> float:
+        """``trace(K)`` (raw) or ``trace(HKH)`` (centered).
 
         Parameters
         ----------
-        method : {``'analytic'``, ``'hutchinson'``, ``None``}
-            - ``None`` (default): auto-select — ``'hutchinson'`` for graph
-              kernels (the NUFFT spreading operator ``U`` distorts the raw
-              FFT-grid spectrum) and ``'analytic'`` for smooth kernels.
-            - ``'analytic'``: ``(n/n') · fft_kernel.trace()`` (with that
-              FFTKernel in ``centering=False`` mode).
-            - ``'hutchinson'``: ``(1/m) Σᵢ vᵢᵀ (K vᵢ)`` over ``±1`` probes.
-        n_probes : int, default 15
-            Number of Hutchinson probes when that path is used.
+        method : {``'analytic'``, ``'empirical'``, ``None``}, optional
+            - ``None`` (default): see :meth:`_default_moment_method`.
+            - ``'analytic'``: ``(n/n') · Σ_k λ(k)``. Exact —
+              ``G_{kk} = n`` regardless of coord arrangement. Adjusts by
+              ``-s₁/n`` when ``centering=True`` (``s₁ = 𝟏ᵀ K 𝟏``).
+            - ``'empirical'``: sample mean of ``Q = zᵀ K z`` over
+              ``n_probes`` z-scored standard-normal probes. A direct
+              Monte-Carlo estimate of ``trace(HKH)``; requires
+              ``centering=True``.
+        n_probes : int, optional
+            Probe count for ``'empirical'`` (default 100). Ignored by
+            ``'analytic'``.
 
-        When ``self.centering`` is True the return is
-        ``trace(HKH) = E[Q]`` under the null, estimated directly on
-        z-scored probes for graph kernels (where the spreading operator
-        also matters) and via ``raw − s₁/n`` otherwise.
+        Returns
+        -------
+        float
         """
-        if self.centering and self.method in ("moran", "graph_laplacian", "car"):
-            # Empirical path: sample Q on z-scored probes — captures both
-            # H-centering and the U-spreading effect in one estimator.
-            cache = self._get_centered_probe_cache(100)
-            return float(cache["Q"].mean())
         if method is None:
             method = self._default_moment_method()
-        if method == "analytic":
-            raw = float(self._fft_kernel.trace() * self._n_over_nprime)
-        elif method == "hutchinson":
-            cache = self._get_rvs_trace_cache(n_probes)
-            raw = float(np.sum(cache["rvs"] * cache["Krvs"]) / cache["n_probes"])
-        else:
-            raise ValueError(f"method must be 'analytic' or 'hutchinson', got {method!r}.")
+        if method == "empirical":
+            if not self.centering:
+                raise ValueError("'empirical' requires centering=True.")
+            cache = self._get_centered_probe_cache(n_probes if n_probes else 100)
+            return float(cache["Q"].mean())
+        if method != "analytic":
+            raise ValueError(f"method must be 'analytic' or 'empirical', got {method!r}.")
+        # trace(K_n) = (n/n') · trace(K_grid) — exact because the diagonal
+        # of G = UᴴU is n for any coord arrangement.
+        ny, nx = self.grid_shape
+        raw = float(self._fft_kernel.trace() * self.n / (ny * nx))
         if not self.centering:
             return raw
         s1, _ = self._ones_stats()
         return raw - s1 / self.n
 
-    def square_trace(self, method: str | None = None, n_probes: int = 15) -> float:
+    def square_trace(self, method: str | None = None, n_probes: int | None = None) -> float:
         """``trace(K²)`` (raw) or ``trace((HKH)²)`` (centered).
 
-        Same ``method`` semantics as :meth:`trace`. For graph kernels
-        under centering we invert the Dirichlet(1/2) ratio correction
-        to recover ``trace((HKH)²)`` from the empirical null variance
-        of ``Q`` on z-scored probes — this preserves the "one abstraction"
-        interface while propagating the finite-sample information needed
-        by :func:`compute_null_params`.
+        Parameters
+        ----------
+        method : {``'analytic'``, ``'empirical'``, ``None``}, optional
+            - ``None`` (default): see :meth:`_default_moment_method`.
+            - ``'analytic'``: ``(n²/n'²) · λᵀ Ψ λ`` with Toeplitz
+              ``Ψ_{k,k'} = |φ(k'-k)|²``, evaluated by circular FFT
+              convolution of ``|φ|²`` with ``λ`` in ``O(n' log n')``.
+              ``φ(k) = (1/n) Σ_i exp(-ik·y_i)`` comes from one type-1
+              NUFFT of the ones vector. On a regular grid where coords
+              coincide with the k-grid, ``|φ|² = δ`` and the formula
+              collapses to ``(n/n')² · Σ_k λ(k)²``. Adjusts by
+              ``-2·s₂/n + s₁²/n²`` when ``centering=True``.
+            - ``'empirical'``: inverts the Dirichlet(1/2) ratio
+              ``Var[Q] = 2·(m·trace((HKH)²) − trace(HKH)²)/(m+2)`` on
+              the same probe cache as :meth:`trace` to recover
+              ``trace((HKH)²)`` from the probe variance of ``Q``.
+              Requires ``centering=True``.
+        n_probes : int, optional
+            Probe count for ``'empirical'`` (default 100).
+
+        Returns
+        -------
+        float
         """
-        if self.centering and self.method in ("moran", "graph_laplacian", "car"):
-            cache = self._get_centered_probe_cache(100)
+        if method is None:
+            method = self._default_moment_method()
+        if method == "empirical":
+            if not self.centering:
+                raise ValueError("'empirical' requires centering=True.")
+            cache = self._get_centered_probe_cache(n_probes if n_probes else 100)
             Q = cache["Q"]
             tr_HKH = float(Q.mean())
             var_Q_emp = float(Q.var(ddof=1))
             m = max(int(self.n) - 1, 1)
-            # Invert ``Var[Q] = 2·(m·trace((HKH)²) − tr_HKH²) / (m+2)``.
             tr_HKH_sq = (var_Q_emp * (m + 2) / 2.0 + tr_HKH**2) / m
             return max(tr_HKH_sq, 0.0)
-        if method is None:
-            method = self._default_moment_method()
-        if method == "analytic":
-            raw = float(self._fft_kernel.square_trace() * self._n_over_nprime**2)
-        elif method == "hutchinson":
-            cache = self._get_rvs_trace_cache(n_probes)
-            raw = float(np.sum(cache["Krvs"] ** 2) / cache["n_probes"])
-        else:
-            raise ValueError(f"method must be 'analytic' or 'hutchinson', got {method!r}.")
+        if method != "analytic":
+            raise ValueError(f"method must be 'analytic' or 'empirical', got {method!r}.")
+        ny, nx = self.grid_shape
+        nprime = ny * nx
+        lam = self._fft_kernel.spectrum.reshape(ny, nx)
+        phi2 = self._coord_power_spectrum()
+        lam_f = np.fft.fft2(lam)
+        phi2_f = np.fft.fft2(phi2)
+        conv = np.fft.ifft2(lam_f * phi2_f).real  # (|φ|² ⋆ λ)(k)
+        raw = (self.n**2 / nprime**2) * float(np.sum(lam * conv))
+        # ``trace(K²) = Σᵢ μᵢ² ≥ 0`` for any real symmetric ``K``. Negative
+        # values here are FFT-cancellation noise on indefinite ``Λ``
+        # (e.g. Moran), not a valid result — clip to zero.
+        raw = max(raw, 0.0)
         if not self.centering:
             return raw
         s1, s2 = self._ones_stats()
@@ -986,19 +1308,17 @@ def _q_test_nufft(  # noqa: C901
     """
     Spatial Q-test on irregular 2D coordinates.
 
-    Two computational paths approximate the same ``xᵀ K x`` on the
-    ``n × n`` irregular-point operator ``K``; which one runs is controlled
-    by :attr:`NUFFTKernel.compute_method` on the kernel instance (mutable):
+    Computes ``Q = xᵀ K x`` via the k-space Parseval identity
+    ``Q = (1/n') Σ_k λ(k) · |ẑ(k)|²`` (one type-1 NUFFT of ``z`` + a
+    Parseval sum; see :meth:`NUFFTKernel.xtKx`). The length-``n`` matmul
+    counterpart :meth:`NUFFTKernel.xtKx_matmul` computes the same form to
+    NUFFT precision and is exposed for callers that prefer the direct
+    round-trip; :func:`spatial_q_test` always uses the spectral path.
 
-    - ``'spectral'`` (default) — fast. Computes
-      ``Q = (1/n') Σ_k λ(k) · |ẑ(k)|²`` via one type-1 NUFFT of ``z`` and a
-      Parseval sum (:meth:`NUFFTKernel.xtKx`). Null moments come from the
-      analytic ``n/n'``-scaled FFT spectrum, aligning with the n-point
-      operator's null distribution.
-    - ``'matmul'`` — slower, end-to-end at the ``n`` irregular
-      points. Computes ``Q = zᵀ · self.Kx(z)`` via two NUFFTs + a
-      sparse-aware contraction (:meth:`NUFFTKernel.xtKx_matmul`). Null
-      moments are Hutchinson estimates over cached ``±1`` probes through ``K``.
+    Null moments route through :func:`quadsv.statistics.compute_null_params`,
+    which on graph kernels defaults to the empirical moment estimator over
+    ``HKH``-centered probes (see :meth:`NUFFTKernel.trace` /
+    :meth:`NUFFTKernel.square_trace`).
 
     Standardization at the ``n`` irregular points is applied internally
     unless ``is_standardized=True``.
@@ -1021,7 +1341,6 @@ def _q_test_nufft(  # noqa: C901
     Q : float or np.ndarray
     pval : float or np.ndarray, optional
     """
-    compute_method = kernel.compute_method
     Xn = np.asarray(Xn, dtype=float)
     batched = Xn.ndim == 2
     X_in = Xn if batched else Xn[:, None]
@@ -1030,11 +1349,10 @@ def _q_test_nufft(  # noqa: C901
 
     z = X_in if is_standardized else _standardize_features(X_in)
 
-    # Compute Q via the requested path.
-    if compute_method == "spectral":
-        Q_arr = np.atleast_1d(kernel.xtKx(z)).ravel()
-    else:
-        Q_arr = np.atleast_1d(kernel.xtKx_matmul(z)).ravel()
+    # Spectral Parseval path — agrees with xtKx_matmul to NUFFT precision
+    # (verified on both regular and irregular grids). Keeping only one path
+    # here avoids a stateful switch on the kernel object.
+    Q_arr = np.atleast_1d(kernel.xtKx(z)).ravel()
 
     if not return_pval:
         return Q_arr if batched else float(Q_arr[0])
@@ -1048,6 +1366,11 @@ def _q_test_nufft(  # noqa: C901
         null_approx = str(null_params["method"])
     else:
         null_approx = "clt" if kernel.method == "moran" else "liu"
+    if kernel.method == "moran" and null_approx != "clt":
+        raise ValueError(
+            f"Moran's I kernel is indefinite; only null_method='clt' is "
+            f"supported for the Q-test. Got method={null_approx!r}."
+        )
 
     def _get_mean_var() -> tuple[float, float]:
         """Mean/var of Q under H0 — from user-supplied params or recompute."""
@@ -1093,6 +1416,18 @@ def _q_test_nufft(  # noqa: C901
             sig_evals = np.asarray(null_params["eigenvalues"], dtype=float)
         else:
             evals = kernel.eigenvalues(return_full_layout=True)
+            if getattr(kernel, "_last_spectrum_from_kpm", False):
+                warnings.warn(
+                    "Liu's method p-value uses a KPM-reconstructed spectrum "
+                    "for this NUFFTKernel (Toeplitz-M fallback not available "
+                    "for centered/indefinite or broad-spectrum cases). The "
+                    "density is Jackson-damped with finite polynomial degree, "
+                    "so p-values in the extreme tail (p ≲ 1e-3) may carry a "
+                    "few-percent systematic error from the moment-matching. "
+                    "Use 'welch' for a moment-only alternative, or increase "
+                    "NUFFTKernel._KPM_DEGREE / _KPM_N_PROBES for more accuracy.",
+                    stacklevel=2,
+                )
             if evals.min() < -0.1:
                 raise ValueError(
                     "Kernel has significant negative eigenvalues; Liu's method may be invalid."
@@ -1119,19 +1454,18 @@ def _r_test_nufft(
     """
     Spatial R-test on irregular 2D coordinates.
 
-    The path is chosen by :attr:`NUFFTKernel.compute_method` on the kernel:
+    Dispatches purely on the input shape:
 
-    - ``'spectral'`` (default) — cross Parseval
-      ``R = (1/n') Σ_k λ(k) · conj(x̂(k)) · ŷ(k)`` via
-      :meth:`NUFFTKernel.xtKy`; analytic
-      ``var_R = (n/n')² · fft_kernel.square_trace()``.
-    - ``'matmul'`` — ``R = Xᵀ · self.Kx(Y)`` (full ``(M_x, M_y)`` cross
-      matrix) with a sparse-aware contraction; Hutchinson
-      ``var_R = kernel.square_trace(method='hutchinson')``.
+    - Paired (``M_x == M_y``) — returns the ``(M,)`` diagonal of
+      ``Xᵀ K Y`` via cross Parseval
+      ``R = (1/n') Σ_k λ(k) · conj(x̂(k)) · ŷ(k)`` (one pair of
+      type-1 NUFFTs; see :meth:`NUFFTKernel.xtKy`).
+    - Bipartite (``M_x != M_y``) — returns the full ``(M_x, M_y)`` cross
+      matrix via ``Xᵀ · self.Kx(Y)``.
 
-    Paired same-``M`` inputs get the ``(M,)`` diagonal in ``'spectral'``
-    mode; ``'matmul'`` always returns the full cross matrix (needed by
-    :class:`DetectorIrregular`).
+    In either case ``var_R = kernel.square_trace()`` (the default
+    ``centering=True`` returns ``trace((HKH)²)``, which is exactly
+    ``Var[Xᵀ K Y]`` on z-scored inputs).
 
     Parameters
     ----------
@@ -1143,7 +1477,6 @@ def _r_test_nufft(
     return_pval : bool, default True
     is_standardized : bool, default False
     """
-    compute_method = kernel.compute_method
     Xn = np.asarray(Xn, dtype=float)
     Yn = np.asarray(Yn, dtype=float)
     if Xn.ndim == 1:
@@ -1159,11 +1492,11 @@ def _r_test_nufft(
     Xz = Xn if is_standardized else _standardize_features(Xn)
     Yz = Yn if is_standardized else _standardize_features(Yn)
 
-    if compute_method == "spectral" and Xn.shape[1] == Yn.shape[1]:
-        # Path A paired diagonal via cross Parseval.
+    if Xn.shape[1] == Yn.shape[1]:
+        # Paired diagonal via cross Parseval — one type-1 NUFFT per column.
         R = np.atleast_1d(kernel.xtKy(Xz, Yz))
     else:
-        # Full (M_x, M_y) cross matrix via NUFFT round-trip on Y.
+        # Bipartite (M_x, M_y) cross matrix via NUFFT round-trip on Y.
         KY = kernel.Kx(Yz)  # (n, M_y)
         R = Xz.T @ KY  # (M_x, M_y)
 

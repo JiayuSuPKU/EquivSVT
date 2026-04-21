@@ -251,27 +251,44 @@ class MatrixKernelBase(Kernel):
             f"- Params: {self._format_params()}"
         )
 
-    def realization(self) -> np.ndarray:
+    def realization(self) -> np.ndarray | sp.spmatrix:
         """
-        Return the realized (n, n) kernel matrix.
+        Return the realized ``(n, n)`` kernel matrix.
 
-        Returns
-        -------
-        np.ndarray
-            Dense (n, n) kernel matrix.
+        When ``self.centering`` is False, returns ``K`` as stored (dense
+        ndarray or sparse matrix). When ``self.centering`` is True,
+        returns the centered operator ``HKH`` with ``H = I − 𝟏𝟏ᵀ/n`` —
+        the operator that :meth:`xtKx` / :meth:`Kx` / :meth:`trace` /
+        :meth:`eigenvalues` all actually apply. ``HKH`` is dense even
+        when ``K`` is sparse (each row gets a column-mean subtracted), so
+        the centered path always materializes a dense result.
 
         Notes
         -----
         If ``stores_precision`` is True, this forces expensive dense inversion of the
         precision matrix. Prefer :meth:`xtKx` and :meth:`trace` for implicit kernels.
         """
+        # 1) Resolve the raw kernel matrix.
         if self.stores_precision:
             # _K is M = K^-1. We need to invert it.
             if sp.issparse(self._K):
-                return inv(self._K.toarray())
+                K = inv(self._K.toarray())
             else:
-                return inv(self._K)
-        return self._K
+                K = inv(self._K)
+        else:
+            K = self._K
+
+        if not self.centering:
+            return K
+
+        # 2) Centered view: HKH = K − 𝟏rᵀ − c𝟏ᵀ + m·𝟏𝟏ᵀ, where
+        #    r = row-mean(K), c = col-mean(K), m = grand-mean(K). Always
+        #    dense output (row-mean subtraction destroys sparsity).
+        K_dense = K.toarray() if sp.issparse(K) else np.asarray(K)
+        row_mean = K_dense.mean(axis=1, keepdims=True)
+        col_mean = K_dense.mean(axis=0, keepdims=True)
+        grand_mean = float(K_dense.mean())
+        return K_dense - row_mean - col_mean + grand_mean
 
     def eigenvalues(self, k: int | None = None) -> np.ndarray:  # noqa: C901
         """
@@ -594,11 +611,13 @@ class MatrixKernelBase(Kernel):
         Compute ``z^T K z`` where ``z = (x - means) / stds`` *without* densifying
         sparse ``x``.
 
-        Uses the expansion
-        ``z^T K z = (x^T K x - 2 μ (K·1)^T x + μ² (1^T K 1)) / σ²``
-        and the cached row sums of ``K`` to compute every term sparse-aware.
-        This is the fast path for standardizing large sparse feature matrices
-        (e.g. scRNA-seq counts) before a Q-test.
+        Sparse-aware expansion using the raw-``K`` primitives::
+
+            z^T K z = (x^T K x - 2·μ·(K·𝟏)^T·x + μ²·(𝟏^T K 𝟏)) / σ²
+
+        and the cached row sums of ``K``. This is the fast path for
+        standardizing large sparse feature matrices (e.g. scRNA-seq counts)
+        before a Q-test.
 
         Parameters
         ----------
@@ -626,16 +645,12 @@ class MatrixKernelBase(Kernel):
 
         K_sum, K_total = self._K_column_sums()  # K_sum: (n,), K_total: scalar
 
-        # Term 1: RAW ``xᵀ K x`` — the expansion in the docstring is in
-        # terms of ``K`` (not ``HKH``), so temporarily bypass the
-        # centering wrapper on :meth:`xtKx`. The final output is still
-        # ``zᵀ K z`` which, since ``z`` is z-scored, equals ``zᵀ HKH z``.
-        prev_centering = self.centering
-        self.centering = False
-        try:
-            q_raw = np.atleast_1d(np.asarray(self.xtKx(x_2d))).astype(float)
-        finally:
-            self.centering = prev_centering
+        # Term 1: RAW ``x^T K x``. Apply K via the dense primitive directly
+        # (skips the public :meth:`xtKx` centering wrapper), then contract
+        # through :meth:`_xtKy_from_Ky` which preserves x's sparsity.
+        x_dense = x_2d.toarray() if sp.issparse(x_2d) else x_2d
+        Kx_dense = self._apply_K_dense(x_dense)
+        q_raw = np.atleast_1d(np.asarray(self._xtKy_from_Ky(x_2d, Kx_dense, n_cols))).astype(float)
 
         # Term 2: (K·1)^T x → (M,). x^T @ K_sum, preserving x's sparsity.
         if sp.issparse(x_2d):

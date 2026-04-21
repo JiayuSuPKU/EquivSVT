@@ -106,9 +106,12 @@ def liu_sf(
 
 
 def compute_null_params(
-    kernel: Kernel, method: str = "welch", k_eigen: int | None = None
+    kernel: Kernel,
+    method: str = "welch",
+    k_eigen: int | None = None,
+    dirichlet_correction: bool = True,
 ) -> dict[str, float | np.ndarray]:
-    """
+    r"""
     Pre-compute null distribution parameters for spatial tests.
 
     Call this ONCE before running parallel tests on thousands of features.
@@ -131,6 +134,13 @@ def compute_null_params(
     k_eigen : int, optional
         Number of top eigenvalues to compute if method='liu' and kernel is sparse.
         If None, computes all available eigenvalues.
+    dirichlet_correction : bool, default True
+        When ``True``: use the finite-``n`` Dirichlet(1/2) ratio
+        ``Var[Q] = 2 · (m · trace((HKH)²) − trace(HKH)²) / (m+2)`` with
+        ``m = n−1``. When ``False``: drop the ``mean²`` term to the
+        large-``n`` limit ``Var[Q] = 2 · trace((HKH)²)``, a monotonic
+        upper bound that slightly overestimates ``Var[Q]`` at finite
+        ``n``. See **Notes** for the derivation.
 
     Returns
     -------
@@ -170,32 +180,59 @@ def compute_null_params(
     >>> params = compute_null_params(kernel, method='welch')
     >>> Q, pval = spatial_q_test(data, kernel, null_params=params)
     >>> R, r_pval = spatial_r_test(x, y, kernel, null_params=params)
+
+    Notes
+    -----
+    :func:`spatial_q_test` standardizes its input as
+    :math:`Z = (X - \bar{X}\,\mathbf{1}) / \sigma`, so the realized
+    quadratic form is
+
+    .. math::
+
+        Q \;=\; Z^{\top} K Z \;=\; X^{\top}\, H K H\, X / \sigma^{2},
+        \qquad H = I - \mathbf{1}\mathbf{1}^{\top} / n.
+
+    Null moments are therefore for the double-centered operator
+    :math:`\tilde{K} = H K H`, not raw :math:`K`. :math:`Q` is
+    additionally a *ratio* of quadratic forms — the denominator
+    :math:`\sigma^{2} = X^{\top} H X / (n-1)` is a random variable
+    correlated with the numerator. ``dirichlet_correction=True`` applies
+    the finite-:math:`n` correction derived from the Dirichlet(1/2)
+    distribution of :math:`Y_i = X_i^{2} / \sum_j X_j^{2}`:
+
+    .. math::
+
+        \mathrm{Var}[Q] \;=\; \frac{2 \bigl[\, m \cdot \mathrm{tr}(\tilde K^{2})
+            - \mathrm{tr}(\tilde K)^{2} \,\bigr]}{m + 2},
+            \qquad m = n - 1.
+
+    With ``dirichlet_correction=False`` the finite term drops
+    out and :math:`\mathrm{Var}[Q] = 2\,\mathrm{tr}(\tilde K^{2})` (large-:math:`n` limit).
     """
     params = {"method": method}
 
     assert method in ["clt", "welch", "liu"], "Method must be 'clt', 'welch', or 'liu'."
 
-    # `spatial_q_test` standardizes its input as Z = (X − X̄·𝟏) / σ, so the
-    # realized quadratic form is Q = Zᵀ K Z = Xᵀ (H K H) X / σ² with
-    # H = I − 𝟏𝟏ᵀ/n. Null moments are for HKH, NOT raw K. We obtain the
-    # centered traces cheaply from two additional numbers:
+    # Moran's I kernel is indefinite (non-PSD) — its eigenvalues span both
+    # signs, and its trace is ≈ 0 by construction. Welch / Liu are both
+    # PSD-assuming moment-matching schemes (Welch needs ``mean_Q > 0``;
+    # Liu fits a shifted χ² to a Σλ·χ²₁ mixture that only makes sense when
+    # the λ are non-negative). Force ``'clt'`` for Moran — a direct Normal
+    # approximation on the CLT-limit distribution of the standardized Q —
+    # across all three backends.
+    kernel_method = getattr(kernel, "method", None)
+    if kernel_method == "moran" and method != "clt":
+        raise ValueError(
+            f"Moran's I kernel is indefinite; only null_method='clt' is "
+            f"supported for the Q-test. Got method={method!r}."
+        )
+
+    # Centered traces can be computed cheaply from two additional numbers:
     #   s1 = 𝟏ᵀ K 𝟏,   s2 = ‖K·𝟏‖² = 𝟏ᵀ K² 𝟏
     # via a single K·𝟏 application (see `Kernel._ones_stats`), giving
     #   trace(HKH)   = trace(K)  − s1/n
     #   trace((HKH)²) = trace(K²) − 2·s2/n + s1²/n²
-    # The Q-test statistic is additionally a *ratio* of quadratic forms
-    # (the denominator σ² is a random variable correlated with the
-    # numerator), and its exact variance picks up a finite-n correction
-    # derived from the Dirichlet(1/2, …, 1/2) distribution of Yᵢ²/ΣYⱼ²:
-    #   Var[Q] = 2·[m · trace((HKH)²) − (trace(HKH))²] / (m+2)    m = n−1
-    # The R-test is easier — independence of X, Y gives
-    #   Var[R] = trace((HKH)²)   (exact, no finite-n correction).
     n = int(kernel.n)
-    # ``kernel.trace()`` / ``kernel.square_trace()`` return the centered
-    # moments ``trace(HKH)`` / ``trace((HKH)²)`` when ``kernel.centering``
-    # is True (the default) — i.e. the moments of the operator actually
-    # applied after z-scoring. The R-test variance is the squared trace
-    # exactly (no finite-n correction, since X⊥Y).
     tr_HKH = float(kernel.trace())
     tr_HKH_sq = float(kernel.square_trace())
     params["var_R"] = tr_HKH_sq
@@ -208,12 +245,16 @@ def compute_null_params(
         # Filter numerical noise.
         params["eigenvalues"] = vals[np.abs(vals) > 1e-9]
     else:
-        # Q-test CLT / Welch moments — centered + finite-n corrected.
-        m = max(n - 1, 1)
+        # Q-test CLT / Welch moments.
         mean_Q = tr_HKH
-        var_Q = 2.0 * (m * tr_HKH_sq - tr_HKH**2) / (m + 2)
-        # Numerical safety: variance must be non-negative.
-        var_Q = max(var_Q, 0.0)
+        if dirichlet_correction:
+            m = max(n - 1, 1)
+            var_Q = 2.0 * (m * tr_HKH_sq - tr_HKH**2) / (m + 2)
+        else:
+            # Large-n limit — drops the (m·sq − mean²) cancellation that
+            # amplifies ``sq``-errors for broad-spectrum PSD kernels.
+            var_Q = 2.0 * tr_HKH_sq
+        var_Q = max(var_Q, 0.0)  # numerical safety
         params["mean_Q"] = float(mean_Q)
         params["var_Q"] = float(var_Q)
 
@@ -416,16 +457,24 @@ def spatial_q_test(  # noqa: C901
         return Q
 
     # 3. Compute P-value (Vectorized)
+    kernel_method = getattr(kernel, "method", None)
     if null_params is None:
         if not hasattr(kernel, "square_trace"):
             raise ValueError("If params is None, kernel must be a Kernel object.")
-        null_params = compute_null_params(kernel, method="welch")
-        null_approx_method = "welch"
+        # Moran is indefinite — Welch/Liu degenerate, auto-pick CLT.
+        default_method = "clt" if kernel_method == "moran" else "welch"
+        null_params = compute_null_params(kernel, method=default_method)
+        null_approx_method = default_method
     else:
         null_approx_method = null_params.get("method", "welch")
         # Ensure params exist
         if len(null_params) == 1 and hasattr(kernel, "square_trace"):
             null_params.update(compute_null_params(kernel, method=null_approx_method))
+    if kernel_method == "moran" and null_approx_method != "clt":
+        raise ValueError(
+            f"Moran's I kernel is indefinite; only null_method='clt' is "
+            f"supported for the Q-test. Got method={null_approx_method!r}."
+        )
 
     # P-value logic
     if null_approx_method == "clt":

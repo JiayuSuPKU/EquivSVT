@@ -12,8 +12,8 @@ from tqdm import tqdm
 
 from quadsv._detector_base import Detector
 from quadsv.kernels import Kernel, MatrixKernel
-from quadsv.nufft import NUFFTKernel
-from quadsv.statistics import compute_null_params, spatial_q_test, spatial_r_test
+from quadsv.nufft import NUFFTKernel, _standardize_features
+from quadsv.statistics import compute_null_params, spatial_q_test
 from quadsv.utils import _apply_bh_correction
 
 __all__ = ["Detector", "DetectorIrregular"]
@@ -1323,35 +1323,28 @@ class DetectorIrregular(Detector):
 
         logger.info("Testing %d x %d feature pairs via NUFFT...", len(names_kept), len(names_y))
 
-        # Densify the X block once. Do NOT pre-standardize at irregular points —
-        # the NUFFT R-test standardizes on the grid representation inside
-        # :func:`_r_test_nufft`.
+        # Densify + z-score the X block once; the NUFFT bipartite R path is
+        # ``Xzᵀ · kernel.Kx(Yz)``. We bypass :func:`spatial_r_test` here so
+        # we always get the full ``(M_x, M_y)`` cross matrix regardless of
+        # whether ``M_x == M_y`` (the shape-based dispatch in
+        # :func:`_r_test_nufft` would otherwise return a paired diagonal in
+        # the coincident case).
         X_block = np.asarray(X_kept.todense(), dtype=np.float64)
-
-        # Force the NUFFT kernel onto the matmul path for this call so the
-        # (M_x, M_y) cross matrix comes back rather than the paired diagonal
-        # that the default 'spectral' path emits when M_x == M_y. Restore
-        # whatever the user had set afterwards.
-        _prev_compute_method = kernel.compute_method
-        kernel.compute_method = "matmul"
+        Xz = _standardize_features(X_block)
 
         results: list[dict[str, Any]] = []
         y_chunks = [slice(i, i + chunk_size) for i in range(0, len(names_y), chunk_size)]
         y_iter = (
             tqdm(y_chunks, desc=f"R (NUFFT, {self.kernel_method_})") if show_progress else y_chunks
         )
+        # Silence pyflakes about ``null_params`` now that we bypass the
+        # dispatch helper; ``var_R`` below is the authoritative source.
+        del null_params
         for ysl in y_iter:
             Y_block = np.asarray(X_y[:, ysl].todense(), dtype=np.float64)
-            R_chunk = spatial_r_test(
-                X_block,
-                Y_block,
-                kernel,
-                null_params=null_params,
-                return_pval=False,
-            )
-            R_chunk = np.atleast_2d(R_chunk)
-            if R_chunk.shape != (len(names_kept), Y_block.shape[1]):
-                R_chunk = R_chunk.reshape(len(names_kept), Y_block.shape[1])
+            Yz = _standardize_features(Y_block)
+            KY = kernel.Kx(Yz)  # (n, M_y)
+            R_chunk = Xz.T @ KY  # (M_x, M_y)
             for i, name_x in enumerate(names_kept):
                 for j, name_y in enumerate(names_y[ysl]):
                     r = float(R_chunk[i, j])
@@ -1361,8 +1354,6 @@ class DetectorIrregular(Detector):
                         row["Z_score"] = z
                         row["P_value"] = float(2.0 * norm.sf(abs(z)))
                     results.append(row)
-        # Restore the user-configured compute_method before returning.
-        kernel.compute_method = _prev_compute_method
         # Silence "unused" warnings for means_x/_y/stds now that grid-space
         # standardization is done inside the NUFFT dispatch.
         del means_x, means_y, stds_x, stds_y
