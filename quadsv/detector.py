@@ -155,11 +155,21 @@ def _pvals_from_null(Q: np.ndarray, null_params: dict) -> np.ndarray:
         z = (Q - mu) / np.sqrt(var)
         return _chi2.sf(z**2, df=1)
     if method == "liu":
-        from quadsv.statistics import _DELTA, liu_sf
+        from quadsv.statistics import (
+            _liu_apply,
+            _liu_prepare_from_cumulants,
+        )
 
-        lambs = np.asarray(null_params["eigenvalues"], dtype=float)
-        lambs = lambs[np.abs(lambs) > _DELTA]
-        return np.array([liu_sf(float(q), lambs) for q in Q])
+        coef = null_params.get("liu_coef")
+        if coef is None:
+            if "cumulants" not in null_params:
+                raise ValueError(
+                    "null_params with method='liu' must contain either "
+                    "'liu_coef' (preferred) or 'cumulants'. Build via "
+                    "compute_null_params(kernel, method='liu')."
+                )
+            coef = _liu_prepare_from_cumulants(null_params["cumulants"])
+        return np.atleast_1d(_liu_apply(np.asarray(Q, dtype=float), coef))
     return np.ones_like(Q, dtype=float)
 
 
@@ -1202,23 +1212,12 @@ class DetectorIrregular(Detector):
         kernel = self.kernel_
         null_params: dict[str, float | np.ndarray] | None = None
         if return_pval:
-            if kernel.method == "moran":
-                null_params = {
-                    "method": "clt",
-                    "mean_Q": float(kernel.trace()),
-                    "var_Q": 2.0 * float(kernel.square_trace()),
-                }
-            else:
-                full = kernel.eigenvalues(return_full_layout=True)
-                if full.min() < -0.1:
-                    raise ValueError(
-                        "Kernel has significant negative eigenvalues; "
-                        "Liu's method may be invalid."
-                    )
-                null_params = {
-                    "method": "liu",
-                    "eigenvalues": full[full > 1e-9],
-                }
+            # Delegate to compute_null_params — it auto-falls back to
+            # Hutchinson-cumulant Liu when the NUFFT spectrum is
+            # unavailable (broad support / indefinite Λ). Moran is
+            # indefinite → CLT enforced there.
+            nm = "clt" if kernel.method == "moran" else "liu"
+            null_params = compute_null_params(kernel, method=nm)
 
         logger.info("Preparing %s features (layer=%s)...", source, layer)
         X_kept, names_kept, means, stds = self._prepare_features_nufft(source, features, layer)
@@ -1245,13 +1244,20 @@ class DetectorIrregular(Detector):
                 P_arr = np.full_like(Q_arr, np.nan)
             # Reference trace and trace²-based Z for reporting.
             if null_params is not None:
-                if "eigenvalues" in null_params:
-                    evals = np.asarray(null_params["eigenvalues"], dtype=float)
-                    trK = float(evals.sum())
-                    varQ = 2.0 * float((evals**2).sum())
-                else:
+                # Compute Z-score from the cached moments — prefer the
+                # explicit ``mean_Q/var_Q`` (CLT/Welch path), else
+                # ``cumulants`` (Liu path, ``c_1``/``c_2`` = trace/sq).
+                # Any other config yields Z_score=nan (no reference
+                # moments available).
+                if "mean_Q" in null_params and "var_Q" in null_params:
                     trK = float(null_params["mean_Q"])
                     varQ = float(null_params["var_Q"])
+                elif "cumulants" in null_params:
+                    c = null_params["cumulants"]
+                    trK = float(c[1])
+                    varQ = 2.0 * float(c[2])
+                else:
+                    trK, varQ = 0.0, 0.0
                 sigma = float(np.sqrt(varQ)) if varQ > 0 else 0.0
                 Z_arr = (Q_arr - trK) / sigma if sigma > 0 else np.zeros_like(Q_arr)
             else:

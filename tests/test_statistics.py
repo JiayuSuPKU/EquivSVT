@@ -189,11 +189,26 @@ class TestStatisticalFunctions(unittest.TestCase):
         self.assertIn("var_Q", params)
 
     def test_compute_null_params_liu(self):
-        """Test compute_null_params with Liu approximation and top-k eigenvalues."""
+        """Liu always yields cached cumulants + liu_coef.
+
+        The full-spectrum path is internal — ``compute_null_params``
+        only exposes the four spectral cumulants ``c_1..c_4`` and the
+        derived shifted-χ² fit ``liu_coef`` (consumed by
+        :func:`spatial_q_test`).
+        """
         params = compute_null_params(self.kernel, method="liu", k_eigen=5)
         self.assertEqual(params["method"], "liu")
-        self.assertIn("eigenvalues", params)
-        self.assertLessEqual(len(params["eigenvalues"]), 5)
+        # Cumulants: {1,2,3,4} → float.
+        self.assertIn("cumulants", params)
+        self.assertEqual(set(params["cumulants"].keys()), {1, 2, 3, 4})
+        # Liu coefficients: shifted-χ² fit.
+        self.assertIn("liu_coef", params)
+        self.assertEqual(
+            set(params["liu_coef"].keys()),
+            {"mu_Q", "sigma_Q", "mu_x", "sigma_x", "dof_x", "delta_x"},
+        )
+        # Raw spectrum is NO LONGER exposed.
+        self.assertNotIn("eigenvalues", params)
 
     def test_spatial_q_test_kernel_matrix_requires_params(self):
         """Kernel matrices without params should raise when null_params is None."""

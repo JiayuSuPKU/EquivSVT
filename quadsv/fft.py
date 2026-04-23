@@ -10,7 +10,6 @@ from scipy.special import gamma, kv
 from scipy.stats import chi2, norm
 
 from quadsv.kernels import Kernel
-from quadsv.statistics import liu_sf
 
 __all__ = ["FFTKernel", "power_spectrum_2d"]
 
@@ -874,16 +873,33 @@ def _q_test_fft(  # noqa: C901
             pvals = chi2.sf(Q_arr / g, df=h)
 
     elif null_approx == "liu":
-        if null_params is not None and "eigenvalues" in null_params:
-            sig_evals = np.asarray(null_params["eigenvalues"], dtype=float)
-        else:
+        from quadsv.statistics import _liu_apply, _liu_prepare, _liu_prepare_from_cumulants
+
+        # Dirichlet(1/2) variance correction: pass ``n`` so ``sigma_Q``
+        # uses ``2·(m·c_2 − c_1²)/(m+2)`` rather than the large-n limit
+        # ``2·c_2``. Matters on broad-spectrum PSD kernels where
+        # ``c_1² ≈ m·c_2`` (e.g. CAR on a dense regular grid).
+        n_kernel = int(kernel.n)
+        coef = None if null_params is None else null_params.get("liu_coef")
+        if coef is None and null_params is not None and "cumulants" in null_params:
+            coef = _liu_prepare_from_cumulants(null_params["cumulants"], n=n_kernel)
+        if coef is None:
+            # No cached coef and no user-supplied cumulants — auto-build
+            # from the kernel's own full spectrum (cheap for FFT: O(n)).
+            if null_params is not None and null_params.keys() - {"method"}:
+                raise ValueError(
+                    "null_params with method='liu' must contain either "
+                    "'liu_coef' (preferred) or 'cumulants'. Build via "
+                    "compute_null_params(kernel, method='liu')."
+                )
             evals = kernel.eigenvalues(return_full_layout=True)
             if evals.min() < -0.1:
                 raise ValueError(
                     "Kernel has significant negative eigenvalues; Liu's method may be invalid."
                 )
             sig_evals = evals[evals > 1e-9]
-        pvals = np.array([liu_sf(float(q), sig_evals) for q in Q_arr])
+            coef = _liu_prepare(sig_evals, n=n_kernel)
+        pvals = np.atleast_1d(_liu_apply(Q_arr, coef))
 
     else:
         raise ValueError(f"Unknown null approximation method: {null_approx!r}")

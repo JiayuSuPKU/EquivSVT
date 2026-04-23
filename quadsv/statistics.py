@@ -12,58 +12,56 @@ __all__ = ["liu_sf", "compute_null_params", "spatial_q_test", "spatial_r_test"]
 _DELTA = 1e-10
 
 
-def liu_sf(
-    t: float | np.ndarray,
-    lambs: np.ndarray,
-    dofs: np.ndarray | None = None,
-    deltas: np.ndarray | None = None,
+def _liu_prepare_from_cumulants(
+    c: dict[int, float],
     kurtosis: bool = False,
-) -> float | np.ndarray:
-    """
-    Liu approximation to linear combination of noncentral chi-squared variables.
+    n: int | None = None,
+) -> dict[str, float]:
+    r"""Pure-math core: Liu shifted-chi² fit from cumulants ``c_1..c_4``.
 
-    Approximates the tail probability Pr(Q > t) for a weighted sum of
-    noncentral chi-squared random variables. This is the default p-value
-    computation method when exact kernel eigenvalues are known.
+    Called by both :func:`_liu_prepare` (from an explicit eigenvalue
+    spectrum) and :func:`_hutchinson_cumulants` (from probe estimates),
+    so the shifted-chi² algebra lives in one place. The input ``c`` is a
+    mapping ``{1: c_1, 2: c_2, 3: c_3, 4: c_4}`` with
+    ``c_p = trace(K^p)`` (any contributions from non-unit ``dofs`` /
+    non-zero ``deltas`` must already be folded into these sums).
 
     Parameters
     ----------
-    t : float or np.ndarray
-        Test statistic value(s). Can be scalar or array.
-    lambs : np.ndarray
-        Eigenvalues of the kernel matrix, shape (n_evals,).
-    dofs : np.ndarray, optional
-        Degrees of freedom for each eigenvalue. Default: ones (chi-squared).
-    deltas : np.ndarray, optional
-        Non-centrality parameters. Default: zeros (central chi-squared).
+    c : dict[int, float]
+        Spectral cumulants ``{1: c_1, 2: c_2, 3: c_3, 4: c_4}``.
     kurtosis : bool, default False
-        If True, uses kurtosis-based approximation for edge case.
+        Use the kurtosis-based edge-case approximation when Liu's
+        discriminant ``s_1² − s_2`` is non-positive.
+    n : int, optional
+        Sample size. When provided, ``sigma_Q`` is set from the
+        finite-:math:`n` Dirichlet(1/2) variance
+        ``Var[Q] = 2·(m·c_2 − c_1²)/(m+2)`` with ``m = n-1`` — matching
+        the ``dirichlet_correction=True`` branch of
+        :func:`compute_null_params`. Without ``n`` (default) the
+        large-:math:`n` limit ``sigma_Q = sqrt(2·c_2)`` is used, which
+        overestimates ``Var[Q]`` when the spectrum is broad
+        (:math:`c_1^2 \approx m \cdot c_2`) — e.g. CAR on a dense grid —
+        and collapses Liu's tail probability to zero. Passing
+        ``n = kernel.n`` recovers the Welch variance.
 
     Returns
-    -------
-    float or np.ndarray
-        Tail probability Pr(Q > t). Same shape as input `t`.
+    --------
+    dict[str, float]
+        Liu coefficients for the shifted-chi² approximation, with keys:
 
-    Notes
-    -----
-    Uses moment-based approximation with chi-squared mixture distribution.
-    Numerically stable for a wide range of eigenvalue spectra.
+        - ``'mu_Q'`` : float — the mean of the original Q statistic.
+        - ``'sigma_Q'`` : float — the standard deviation of the original Q
+          statistic (with optional finite-``n`` Dirichlet(1/2) correction).
+        - ``'mu_x'`` : float — the mean of the fitted shifted-χ² variable X.
+        - ``'sigma_x'`` : float — the standard deviation of X.
+        - ``'dof_x'`` : float — the degrees of freedom of X.
+        - ``'delta_x'`` : float — the non-centrality parameter of X.
+
+    Consumers (e.g. :func:`spatial_q_test`) read only these coefficients
+    for the final p-value calculation; the input cumulants are not
+    needed beyond this point.
     """
-    if dofs is None:
-        dofs = np.ones_like(lambs)
-    if deltas is None:
-        deltas = np.zeros_like(lambs)
-
-    t = np.asarray(t, float)
-    lambs = np.asarray(lambs, float)
-    dofs = np.asarray(dofs, float)
-    deltas = np.asarray(deltas, float)
-
-    # Calculate moments of weights
-    lambs_pow = {i: lambs**i for i in range(1, 5)}
-
-    c = {i: np.sum(lambs_pow[i] * dofs) + i * np.sum(lambs_pow[i] * deltas) for i in range(1, 5)}
-
     s1 = c[3] / (np.sqrt(c[2]) ** 3 + _DELTA)
     s2 = c[4] / (c[2] ** 2 + _DELTA)
 
@@ -71,38 +69,290 @@ def liu_sf(
     if s12 > s2:
         denom = s1 - np.sqrt(s12 - s2)
         if abs(denom) < _DELTA:
-            # Catastrophic cancellation; fall back to kurtosis path
-            delta_x = 0
-            a = 1 / (np.sqrt(s2) + _DELTA)
-            dof_x = 1 / (s2 + _DELTA)
+            # Catastrophic cancellation — fall back to the kurtosis path.
+            delta_x = 0.0
+            dof_x = 1.0 / (s2 + _DELTA)
         else:
-            a = 1 / denom
+            a = 1.0 / denom
             delta_x = s1 * a**3 - a**2
-            dof_x = a**2 - 2 * delta_x
+            dof_x = a**2 - 2.0 * delta_x
     else:
-        delta_x = 0
+        delta_x = 0.0
         if kurtosis:
-            a = 1 / (np.sqrt(s2) + _DELTA)
-            dof_x = 1 / (s2 + _DELTA)
+            dof_x = 1.0 / (s2 + _DELTA)
         else:
-            a = 1 / (s1 + _DELTA)
-            dof_x = 1 / (s12 + _DELTA)
-    # Ensure valid chi-squared parameters
+            dof_x = 1.0 / (s12 + _DELTA)
     dof_x = max(dof_x, _DELTA)
     delta_x = max(delta_x, 0.0)
 
-    mu_q = c[1]
-    sigma_q = np.sqrt(2 * c[2])
+    # sigma_Q: Dirichlet(1/2)-corrected for the z-scored ratio Q when n
+    # is provided. See :func:`compute_null_params` Notes for the full
+    # derivation of ``Var[Q] = 2·(m·c_2 − c_1²)/(m+2)``.
+    if n is not None and n >= 2:
+        m = n - 1
+        var_Q = 2.0 * max(m * c[2] - c[1] ** 2, 0.0) / (m + 2)
+    else:
+        var_Q = 2.0 * c[2]
 
-    mu_x = dof_x + delta_x
-    sigma_x = np.sqrt(2 * (dof_x + 2 * delta_x))
+    return {
+        "mu_Q": float(c[1]),
+        "sigma_Q": float(np.sqrt(max(var_Q, 0.0))),
+        "mu_x": float(dof_x + delta_x),
+        "sigma_x": float(np.sqrt(2 * (dof_x + 2 * delta_x))),
+        "dof_x": float(dof_x),
+        "delta_x": float(delta_x),
+    }
 
-    t_star = (t - mu_q) / (sigma_q + _DELTA)
-    tfinal = t_star * sigma_x + mu_x
 
-    q = ncx2.sf(tfinal, dof_x, np.maximum(delta_x, 1e-9))
+def _liu_prepare(
+    lambs: np.ndarray,
+    dofs: np.ndarray | None = None,
+    deltas: np.ndarray | None = None,
+    kurtosis: bool = False,
+    n: int | None = None,
+) -> dict[str, float]:
+    """Precompute Liu coefficients from the kernel eigenvalue spectrum.
 
-    return q
+    Thin wrapper — builds ``c_1..c_4`` from the weighted eigenvalues and
+    calls :func:`_liu_prepare_from_cumulants`.
+
+    Parameters
+    ----------
+    lambs : np.ndarray
+        Eigenvalues of ``K``, shape ``(n_evals,)``.
+    dofs, deltas : np.ndarray, optional
+        Per-eigenvalue degrees of freedom and non-centrality parameters.
+        Default to central chi-squared (ones, zeros).
+    kurtosis : bool, default False
+        Use the kurtosis-based edge-case approximation.
+    n : int, optional
+        Sample size for the Dirichlet(1/2) variance correction. See
+        :func:`_liu_prepare_from_cumulants` for details.
+    """
+    lambs = np.asarray(lambs, dtype=float)
+    if dofs is None:
+        dofs = np.ones_like(lambs)
+    else:
+        dofs = np.asarray(dofs, dtype=float)
+    if deltas is None:
+        deltas = np.zeros_like(lambs)
+    else:
+        deltas = np.asarray(deltas, dtype=float)
+    lambs_pow = {i: lambs**i for i in range(1, 5)}
+    c = {
+        i: float(np.sum(lambs_pow[i] * dofs) + i * np.sum(lambs_pow[i] * deltas))
+        for i in range(1, 5)
+    }
+    return _liu_prepare_from_cumulants(c, kurtosis=kurtosis, n=n)
+
+
+def _hutchinson_cumulants(
+    kernel: Kernel,
+    n_probes: int = 60,
+    rng_seed: int = 0,
+    use_analytic_c12: bool = True,
+) -> dict[int, float]:
+    r"""Estimate ``c_p = tr(K^p)``, ``p = 1..4`` using random probes.
+
+    General probe form. For iid ``v`` with ``E[vvᵀ] = I``:
+    :math:`c_p = \mathbb{E}[\mathbf{v}^\top \mathbf{K}^p \mathbf{v}]`.
+    Two matvecs per probe yield
+    :math:`\mathbf{u}_s = \mathbf{K}\mathbf{v}_s` and
+    :math:`\mathbf{w}_s = \mathbf{K}^2 \mathbf{v}_s`, from which
+    all four cumulants fall out as inner products:
+
+    .. math::
+
+        \hat c_1 &= \tfrac{1}{m}\textstyle\sum_s \mathbf{v}_s^\top \mathbf{u}_s,
+        &\hat c_2 &= \tfrac{1}{m}\textstyle\sum_s \|\mathbf{u}_s\|^2, \\
+        \hat c_3 &= \tfrac{1}{m}\textstyle\sum_s \mathbf{u}_s^\top \mathbf{w}_s,
+        &\hat c_4 &= \tfrac{1}{m}\textstyle\sum_s \|\mathbf{w}_s\|^2.
+
+    Here we use **iid Rademacher** probes (``±1`` with equal probability),
+    which has strictly smaller variance on :math:`v^\top A v` than
+    :math:`\mathcal{N}(0, I)` probes at fixed probe count:
+
+    .. math::
+
+        \mathrm{Var}_{\text{Rad}}[v^\top A v] &= 2 \sum_{i \neq j} A_{ij}^2
+        = 2\bigl(\|A\|_F^2 - \|\mathrm{diag}(A)\|^2\bigr), \\
+        \mathrm{Var}_{\mathcal{N}}[v^\top A v] &= 2 \|A\|_F^2.
+
+    ``K`` centering is inherited from :meth:`~quadsv.kernels.Kernel.Kx`
+    (which applies ``H`` on both sides whenever ``centering=True``).
+    Analytic substitutions listed below all read from backend-specific
+    :meth:`trace` / :meth:`square_trace` methods that already embed the
+    centering correction (``-s₁/n`` for ``c_1``; ``-2·s₂/n + s₁²/n²`` for ``c_2``).
+
+    Backend-specific fast paths
+    ---------------------------
+
+    *FFTKernel* — **full spectrum always, all four cumulants analytic**
+        ``c_p = Σ_k λ̃(k)^p`` is computed analytically using the ``n`` Fourier
+        modes (``O(n)``) cached from :meth:`~quadsv.fft.FFTKernel.eigenvalues`.
+
+    *MatrixKernel / NUFFTKernel — ``use_analytic_c12=True``* (default)
+        ``c_1`` from :meth:`trace`, ``c_2`` from :meth:`square_trace`
+        (both exact: diagonal-sum / Frobenius² on ``MatrixKernel``,
+        coord-invariant ``(n/n')·Σλ`` / doubled-grid linear-conv
+        ``λᵀΨλ`` on ``NUFFTKernel``). ``c_3``, ``c_4`` always come from
+        the Rademacher probe estimator (closed-form formula are often
+        too expensive).
+
+    *MatrixKernel with ``stores_precision=True``* (CAR, Graph Laplacian)
+        The stored object is the precision :math:`K^{-1}`, and the
+        kernel's :meth:`trace` / :meth:`square_trace` are themselves
+        Hutchinson estimators (``±1`` Rademacher probes through an LU
+        solve on the precision). We forward the current ``n_probes`` so
+        the precision-side Hutchinson budget tracks this caller's
+        budget; ``c_3`` / ``c_4`` use our Rademacher probes as usual.
+
+    *``use_analytic_c12=False``*
+        All four cumulants from the same Rademacher probes — useful for
+        diagnostics or when the analytic paths are known to be
+        unreliable.
+
+    Parameters
+    ----------
+    kernel : Kernel
+        Must expose ``Kx(v)``. ``FFTKernel`` takes the fast path above.
+    n_probes : int, default 60
+        Probe count for the ``c_3`` / ``c_4`` estimator — also forwarded
+        to :meth:`trace` / :meth:`square_trace` on precision-stored
+        ``MatrixKernel``. ``m=60`` lands Liu p-values within ``~5%`` of
+        the eigenvalue-exact baseline; ``m=120`` within ``~0.2%``. Cost
+        scales as ``2·n_probes`` kernel matvecs (plus the same count of
+        LU solves when precision-stored).
+    rng_seed : int, default 0
+        Seed for reproducible probe draws.
+    use_analytic_c12 : bool, default True
+        If ``True`` (default), substitute analytic ``c_1`` / ``c_2`` on
+        ``MatrixKernel`` / ``NUFFTKernel`` as described above; on
+        ``FFTKernel`` the full-spectrum fast path runs regardless.
+        Set ``False`` to force the pure-probe estimator (still skips
+        ``FFTKernel``'s fast path).
+
+    Returns
+    -------
+    dict[int, float]
+        ``{1: c_1, 2: c_2, 3: c_3, 4: c_4}`` of the input kernel ``K``.
+    """
+    # ------------------------------------------------------------------
+    # FFTKernel fast path — full spectrum is O(n) and exact for all c_p.
+    # ------------------------------------------------------------------
+    from quadsv.fft import FFTKernel  # lazy to avoid circular import
+
+    if isinstance(kernel, FFTKernel):
+        # ``return_full_layout=True`` unpacks the rfft2 half-spectrum to
+        # the full ``ny·nx`` layout and zeroes the DC bin when
+        # ``centering=True`` (see FFTKernel.eigenvalues docstring).
+        lam = np.asarray(kernel.eigenvalues(return_full_layout=True), dtype=float)
+        sig = lam[np.abs(lam) > _DELTA]
+        return {p: float(np.sum(sig**p)) for p in (1, 2, 3, 4)}
+
+    # ------------------------------------------------------------------
+    # General path — probe c_3, c_4; analytic / Hutchinson-via-trace
+    # for c_1, c_2 depending on the backend.
+    # ------------------------------------------------------------------
+    rng = np.random.default_rng(rng_seed)
+    V_flat = rng.choice(np.array([-1.0, 1.0]), size=(int(kernel.n), int(n_probes)))
+
+    def _apply(x_flat: np.ndarray) -> np.ndarray:
+        return np.asarray(kernel.Kx(x_flat))
+
+    U = _apply(V_flat)
+    W = _apply(U)
+    c1_probe = float(np.mean(np.sum(V_flat * U, axis=0)))
+    c2_probe = float(np.mean(np.sum(U * U, axis=0)))
+    c3 = float(np.mean(np.sum(U * W, axis=0)))
+    c4 = float(np.mean(np.sum(W * W, axis=0)))
+
+    c1, c2 = c1_probe, c2_probe
+    if use_analytic_c12 and hasattr(kernel, "trace") and hasattr(kernel, "square_trace"):
+        is_precision_stored = bool(getattr(kernel, "stores_precision", False))
+        try:
+            if is_precision_stored:
+                # MatrixKernel with stored precision: ``trace`` /
+                # ``square_trace`` are themselves Hutchinson estimators
+                # through an LU solve. Forward ``n_probes`` so the
+                # internal cache uses our probe budget.
+                c1 = float(kernel.trace(n_probes=n_probes))
+                c2 = float(kernel.square_trace(n_probes=n_probes))
+            else:
+                # Analytic paths. All three backends (MatrixKernel
+                # non-precision, FFTKernel, NUFFTKernel) return
+                # deterministic analytic cumulants from a no-arg call.
+                c1 = float(kernel.trace())
+                c2 = float(kernel.square_trace())
+        except (ValueError, NotImplementedError):
+            # Any analytic path that refuses (e.g. indefinite-Λ
+            # cancellation) silently falls back to probe estimates.
+            c1, c2 = c1_probe, c2_probe
+
+    return {1: c1, 2: c2, 3: c3, 4: c4}
+
+
+def _liu_apply(t: float | np.ndarray, coef: dict[str, float]) -> np.ndarray:
+    """Evaluate ``Pr(Q > t)`` from cached Liu coefficients.
+
+    ``coef`` is the dict returned by :func:`_liu_prepare`. Broadcasts
+    across array ``t`` in a single :func:`scipy.stats.ncx2.sf` call.
+    """
+    t = np.asarray(t, dtype=float)
+    t_star = (t - coef["mu_Q"]) / (coef["sigma_Q"] + _DELTA)
+    tfinal = t_star * coef["sigma_x"] + coef["mu_x"]
+    return ncx2.sf(tfinal, coef["dof_x"], max(coef["delta_x"], 1e-9))
+
+
+def liu_sf(
+    t: float | np.ndarray,
+    lambs: np.ndarray,
+    dofs: np.ndarray | None = None,
+    deltas: np.ndarray | None = None,
+    kurtosis: bool = False,
+    n: int | None = None,
+) -> float | np.ndarray:
+    """
+    Liu approximation to a linear combination of non-central chi-squared variables.
+
+    One-shot convenience wrapper equivalent to
+    ``_liu_apply(t, _liu_prepare(lambs, ...))``. For multi-feature
+    workloads, prefer the split form: call :func:`_liu_prepare` once on
+    the spectrum and :func:`_liu_apply` for each Q-batch
+    (:func:`compute_null_params` already caches the coefficients under
+    ``null_params['liu_coef']``, so :func:`spatial_q_test` does this
+    automatically).
+
+    Parameters
+    ----------
+    t : float or np.ndarray
+        Test statistic value(s). Array input is broadcast efficiently
+        through a single :func:`scipy.stats.ncx2.sf` call.
+    lambs : np.ndarray
+        Eigenvalues of the kernel matrix, shape ``(n_evals,)``.
+    dofs : np.ndarray, optional
+        Per-eigenvalue degrees of freedom. Default: ones (chi-squared).
+    deltas : np.ndarray, optional
+        Non-centrality parameters. Default: zeros (central).
+    kurtosis : bool, default False
+        If True, use the kurtosis-based edge-case approximation.
+    n : int, optional
+        Sample size. When provided, applies the Dirichlet(1/2) variance
+        correction ``Var[Q] = 2·(m·c_2 - c_1²)/(m+2)`` with ``m = n-1``
+        for the z-scored ratio ``Q = XᵀK̃X/σ̂²``. Essential for
+        broad-spectrum PSD kernels (CAR, graph_laplacian) on dense
+        grids, where the large-:math:`n` limit ``2·c_2`` overestimates
+        ``Var[Q]`` and collapses the tail to zero. Default ``None``
+        keeps the original large-:math:`n` behavior for back-compat
+        with callers supplying a raw eigenvalue mixture.
+
+    Returns
+    -------
+    float or np.ndarray
+        Tail probability ``Pr(Q > t)`` with the same shape as ``t``.
+    """
+    coef = _liu_prepare(lambs, dofs=dofs, deltas=deltas, kurtosis=kurtosis, n=n)
+    return _liu_apply(t, coef)
 
 
 def compute_null_params(
@@ -110,13 +360,14 @@ def compute_null_params(
     method: str = "welch",
     k_eigen: int | None = None,
     dirichlet_correction: bool = True,
+    liu_n_probes: int | None = None,
 ) -> dict[str, float | np.ndarray]:
     r"""
     Pre-compute null distribution parameters for spatial tests.
 
     Call this ONCE before running parallel tests on thousands of features.
-    Caches the expensive computations (traces, eigenvalues) for reuse across
-    both Q-tests and R-tests.
+    Caches the expensive computations (traces, cumulants, shifted-χ² fit)
+    for reuse across both Q-tests and R-tests.
 
     Parameters
     ----------
@@ -124,7 +375,7 @@ def compute_null_params(
         The spatial kernel object (MatrixKernel, FFTKernel, NUFFTKernel, or compatible).
     method : {'clt', 'welch', 'liu'}, default 'welch'
         Null approximation method for the **Q-test**. The R-test entry
-        ``var_R = trace(K²)`` is always populated alongside, regardless of
+        ``var_R = trace(K̃²)`` is always populated alongside, regardless of
         ``method`` — R-tests use a Normal approximation and only need this
         one moment.
 
@@ -133,11 +384,25 @@ def compute_null_params(
         - 'liu': Liu eigenvalue-based approximation (accurate tail, slower)
     k_eigen : int, optional
         Number of top eigenvalues to compute if method='liu' and kernel is sparse.
-        If None, computes all available eigenvalues.
+        If None, computes all available eigenvalues. Ignored when
+        ``liu_n_probes`` is set (eigenvalues are bypassed entirely).
+    liu_n_probes : int, optional
+        If set, bypass the eigendecomposition for ``method='liu'`` and
+        estimate the four spectral cumulants ``c_p = trace(K̃^p)``,
+        ``p = 1..4``, directly from the kernel via Hutchinson probing
+        (:func:`_hutchinson_cumulants`). Cost drops from
+        :math:`O(n^3)` (dense eigensolve) or :math:`O(r^3)` (reduced
+        Toeplitz-M) to :math:`2 \cdot n_\mathrm{probes}` kernel
+        matvecs, at the cost of :math:`O(n_\mathrm{probes}^{-1/2})`
+        Monte-Carlo error in each cumulant. Rule of thumb:
+        ``n_probes = 60`` gives Liu p-values within ``~5\%`` of the
+        eigenvalue-exact baseline; ``n_probes = 120`` within
+        ``~0.2\%``. When ``None`` (default), the eigenvalue path is
+        used.
     dirichlet_correction : bool, default True
         When ``True``: use the finite-``n`` Dirichlet(1/2) ratio
-        ``Var[Q] = 2 · (m · trace((HKH)²) − trace(HKH)²) / (m+2)`` with
-        ``m = n−1``. When ``False``: drop the ``mean²`` term to the
+        ``Var[Q] = 2 · (m · trace((HKH)²) - trace(HKH)²) / (m+2)`` with
+        ``m = n-1``. When ``False``: drop the ``mean²`` term to the
         large-``n`` limit ``Var[Q] = 2 · trace((HKH)²)``, a monotonic
         upper bound that slightly overestimates ``Var[Q]`` at finite
         ``n``. See **Notes** for the derivation.
@@ -148,14 +413,22 @@ def compute_null_params(
         Always populated (regardless of ``method``):
 
         - ``'method'`` : str — the Q-test approximation selected.
-        - ``'var_R'`` : float — ``trace(K²)``, the null variance of ``R``
+        - ``'var_R'`` : float — ``trace(K̃²)``, the null variance of ``R``
           (used by :func:`spatial_r_test`).
 
         Method-specific additions:
 
         - ``method='liu'`` (default for FFT / NUFFT kernels):
 
-          * ``'eigenvalues'`` : ``np.ndarray`` of non-trivial kernel eigenvalues.
+          * ``'cumulants'`` : ``dict {1: c_1, 2: c_2, 3: c_3, 4: c_4}``
+            with ``c_p = trace(K̃^p)``. Computed from the full
+            eigendecomposition when available (``liu_n_probes is
+            None``) or from :math:`2m` Hutchinson probes otherwise.
+          * ``'liu_coef'`` : ``dict`` with cached Liu coefficients
+            ``{'mu_Q', 'sigma_Q', 'mu_x', 'sigma_x', 'dof_x',
+            'delta_x'}`` derived from ``cumulants`` once; consumed by
+            :func:`spatial_q_test` so per-feature p-values reduce to a
+            pure :math:`t`-broadcast.
 
         - ``method='welch'`` (default for MatrixKernel Q-tests):
 
@@ -238,12 +511,35 @@ def compute_null_params(
     params["var_R"] = tr_HKH_sq
 
     if method == "liu":
-        # ``kernel.eigenvalues`` returns eigvals(HKH) when ``centering`` is
-        # True (FFT / NUFFT zero out the DC mode; MatrixKernel falls back
-        # to raw eigvals with a documented approximation).
-        vals = kernel.eigenvalues(k=k_eigen)
-        # Filter numerical noise.
-        params["eigenvalues"] = vals[np.abs(vals) > 1e-9]
+        # Liu's method is entirely determined by the four spectral
+        # cumulants c_1..c_4. We ALWAYS store them under ``cumulants``
+        # and the derived shifted-χ² fit under ``liu_coef``; callers
+        # consuming Liu p-values read only ``liu_coef``.
+        #
+        # Two paths produce the cumulants:
+        #   - ``liu_n_probes is not None``: Hutchinson — 2·m matvecs.
+        #   - ``liu_n_probes is None``: try the kernel's full
+        #     eigendecomposition first, fall back to Hutchinson if the
+        #     kernel can't produce a full spectrum (NUFFT with broad
+        #     support or indefinite Λ → ``NotImplementedError``).
+        if liu_n_probes is not None:
+            c = _hutchinson_cumulants(kernel, n_probes=int(liu_n_probes))
+        else:
+            try:
+                vals = kernel.eigenvalues(k=k_eigen)
+                sig = vals[np.abs(vals) > 1e-9]
+                c = {p: float(np.sum(sig**p)) for p in (1, 2, 3, 4)}
+            except NotImplementedError:
+                c = _hutchinson_cumulants(kernel, n_probes=60)
+        params["cumulants"] = c
+        # Pass ``n`` for the Dirichlet(1/2) variance correction — matches
+        # the Welch branch below when ``dirichlet_correction=True``.
+        # Broad-spectrum PSD kernels (CAR, graph_laplacian) have
+        # ``c_1² ≈ m · c_2``; the large-n limit ``2·c_2`` then
+        # overestimates ``Var[Q]`` by up to an order of magnitude,
+        # collapsing Liu's tail probability to zero.
+        liu_n = n if dirichlet_correction else None
+        params["liu_coef"] = _liu_prepare_from_cumulants(c, n=liu_n)
     else:
         # Q-test CLT / Welch moments.
         mean_Q = tr_HKH
@@ -492,16 +788,22 @@ def spatial_q_test(  # noqa: C901
         pval = chi2.sf(Q / g, df=d)
 
     elif null_approx_method == "liu":
-        lambs = null_params["eigenvalues"]
-        # filter numerical noise
-        lambs = lambs[np.abs(lambs) > _DELTA]
-
-        # liu_sf likely needs a loop if not vectorized, or use np.vectorize
-        # Assuming liu_sf handles array inputs or we map it:
-        if M > 1:  # batched inputs
-            pval = np.array([liu_sf(q_val, lambs) for q_val in Q])
-        else:
-            pval = liu_sf(Q, lambs)
+        # Read the cached Liu coefficients (O(1) per Q). If a caller
+        # hand-built ``null_params`` with raw ``cumulants`` instead, derive
+        # the coef on the fly and pass ``n=kernel.n`` so the Dirichlet(1/2)
+        # variance correction fires — keeps calibration on broad-spectrum
+        # PSD kernels.
+        coef = null_params.get("liu_coef")
+        if coef is None:
+            if "cumulants" not in null_params:
+                raise ValueError(
+                    "null_params with method='liu' must contain either "
+                    "'liu_coef' (preferred) or 'cumulants'. Build via "
+                    "compute_null_params(kernel, method='liu')."
+                )
+            n_kernel = int(getattr(kernel, "n", 0)) or None
+            coef = _liu_prepare_from_cumulants(null_params["cumulants"], n=n_kernel)
+        pval = _liu_apply(Q, coef)
     else:
         pval = np.ones_like(Q, dtype=float)
 

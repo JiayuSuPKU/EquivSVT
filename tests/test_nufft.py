@@ -108,6 +108,7 @@ class TestBatchedValues:
 
 from quadsv.nufft import NUFFTKernel
 from quadsv.statistics import spatial_q_test, spatial_r_test
+from quadsv.utils import get_rect_coords
 
 
 class TestNUFFTKernelConstruction:
@@ -256,27 +257,67 @@ class TestNUFFTKernelKx:
 
 
 class TestNUFFTKernelTrace:
-    def test_trace_analytic_scales_fftkernel(self):
-        """Raw analytic moments (centering=False) under the n-point operator.
-
-        - ``trace(K_n) = (n/n') · T_1`` always (diagonal of ``G=UᴴU`` is
-          exactly ``n``, independent of coord arrangement).
-        - ``trace(K_n²) = (n²/n'²) · λᵀ Ψ λ`` with ``Ψ_{k,k'} = |φ(k'-k)|²``
-          — the Toeplitz identity; on a regular grid that coincides with
-          the k-grid this reduces to ``(n/n')² · S_2``. Compared against
-          the ``'empirical'`` probe-based estimator as a sanity check.
-        """
+    def test_trace_scales_fftkernel(self):
+        """Raw ``trace(K_n) = (n/n') · trace(K_grid)`` — exact because the
+        diagonal of ``G = UᴴU`` is ``n`` for any coord arrangement."""
         rng = np.random.default_rng(0)
         coords = rng.uniform(0, 20, size=(400, 2))
         k_raw = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5, centering=False)
         n_over_nprime = k_raw.n / (k_raw.grid_shape[0] * k_raw.grid_shape[1])
-        # Mean trace identity is exact for any coord arrangement.
         assert k_raw.trace() == pytest.approx(k_raw._fft_kernel.trace() * n_over_nprime, rel=1e-12)
-        # Square trace analytic against empirical (centered, n_probes=128).
-        k_cen = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
-        s_ana = k_cen.square_trace(method="analytic")
-        s_emp = k_cen.square_trace(method="empirical", n_probes=128)
-        assert abs(s_ana - s_emp) / abs(s_emp) < 0.20
+
+    @pytest.mark.parametrize(
+        "method, kwargs, centering, rel_tol",
+        [
+            # Narrow-spectrum PSD kernels: analytic path returns ‖K‖_F² to
+            # NUFFT eps (float precision, ~1e-7) on raw K.
+            ("gaussian", {"bandwidth": 3.0}, False, 1e-6),
+            ("matern", {"bandwidth": 3.0, "nu": 1.5}, False, 1e-6),
+            # Broad-spectrum PSD kernels: the doubled-grid linear FFT
+            # convolution is accurate to ~0.1–1% on raw K (NUFFT band-
+            # limit residual). Pre-fix (circular convolution at period
+            # ``n'``) these were ~45% (CAR) and ~60% (graph_laplacian) off.
+            ("car", {"rho": 0.95}, False, 2e-2),
+            ("graph_laplacian", {}, False, 2e-2),
+            # Indefinite Λ — Moran tested under ``centering=True`` (the
+            # production path) with an explicit ``k_neighbors=4``
+            # (coord-aware, the documented NUFFT usage). With the
+            # oversampled internal grid, leaving ``k_neighbors`` out
+            # falls back to FFTKernel's default ``neighbor_degree=1``
+            # whose ring radius is smaller than the coord spacing —
+            # producing a near-identity kernel where the ``λᵀΨλ``
+            # cancellation becomes pathological. The coord-aware
+            # resolver fixes that; residual is ~1%.
+            ("moran", {"k_neighbors": 4}, True, 2e-2),
+        ],
+    )
+    def test_square_trace_matches_explicit_frobenius(self, method, kwargs, centering, rel_tol):
+        """``square_trace()`` should match ``‖K‖_F² = tr(K²)`` built from
+        the explicit ``Kx(I)`` matrix on the typical oversampled NUFFT
+        grid.
+
+        Regression test for the circular-vs-linear FFT convolution bug:
+        before the doubled-grid fix, the analytic path used a circular
+        convolution of ``|φ|² ⋆ λ`` at period ``n'``, silently wrapping
+        values of ``|φ|²`` that are not ``n'``-periodic when
+        ``n' > n`` (default oversampling). On CAR / graph_laplacian
+        that produced ~45–60% over-estimates of ``tr(K²)`` — enough to
+        collapse the Liu tail and bias Welch's variance by 2–4×. The fix
+        evaluates ``|φ|²`` on a ``(2·ny, 2·nx)`` grid via a separate
+        type-1 NUFFT and zero-pads ``λ`` for a true linear convolution.
+        """
+        coords, _ = get_rect_coords(30, 30)
+        coords = np.asarray(coords, dtype=float)
+        k = NUFFTKernel(coords=coords, method=method, centering=centering, **kwargs)
+        # Ground truth: build K explicitly via Kx applied to the identity.
+        # Kx respects centering, so K_explicit = HKH when centering=True.
+        K_explicit = np.asarray(k.Kx(np.eye(k.n)))
+        truth = float(np.sum(K_explicit * K_explicit))
+        s_ana = float(k.square_trace())
+        assert abs(s_ana - truth) / max(truth, 1e-30) < rel_tol, (
+            f"method={method} centering={centering}: analytic={s_ana:.5g} "
+            f"vs truth={truth:.5g} (rel={abs(s_ana - truth) / truth:.3g})"
+        )
 
 
 class TestNUFFTTwoPathsAgree:
@@ -315,19 +356,24 @@ class TestNUFFTTwoPathsAgree:
                 abs(Q_a - Q_b) / max(abs(Q_a), 1e-30) < 1e-8
             ), f"seed={seed}: Q_a={Q_a:.6e}, Q_b={Q_b:.6e}"
 
-    def test_trace_analytic_vs_empirical_agree_on_irregular(self):
-        """``trace(method='analytic')`` and ``trace(method='empirical')``
-        should agree within the empirical probe noise on an irregular-coord
-        kernel (centered, so both paths apply)."""
+    def test_trace_takes_no_kwargs(self):
+        """``NUFFTKernel.trace`` / ``square_trace`` are closed-form on the
+        FFT spectrum — no probes, no options. The signatures match
+        :class:`quadsv.fft.FFTKernel` (also argument-free). Only
+        :class:`quadsv.kernels.MatrixKernelBase` exposes an ``n_probes``
+        kwarg, and only because its precision-stored path runs a
+        Rademacher-through-LU Hutchinson estimator.
+        """
         rng = np.random.default_rng(0)
         coords = rng.uniform(0, 20, size=(500, 2))
         k = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
-        t_ana = k.trace(method="analytic")
-        t_emp = k.trace(method="empirical", n_probes=128)
-        assert abs(t_ana - t_emp) / max(abs(t_ana), 1e-30) < 0.2
-        s_ana = k.square_trace(method="analytic")
-        s_emp = k.square_trace(method="empirical", n_probes=128)
-        assert abs(s_ana - s_emp) / max(abs(s_ana), 1e-30) < 0.2
+        # Positional / keyword calls work; stray kwargs raise TypeError.
+        assert isinstance(k.trace(), float)
+        assert isinstance(k.square_trace(), float)
+        with pytest.raises(TypeError):
+            k.trace(n_probes=32)
+        with pytest.raises(TypeError):
+            k.square_trace(n_probes=32)
 
     def test_Kx_grid_round_trip_matches_xtKx(self):
         """``Kx_grid`` returns ``K x`` on the spatial grid; its inner product
@@ -505,7 +551,7 @@ class TestNUFFTKernelNullParamsRoundTrip:
 
     def test_qtest_nufft_null_params_round_trip(self):
         from quadsv.nufft import NUFFTKernel
-        from quadsv.statistics import spatial_q_test
+        from quadsv.statistics import compute_null_params, spatial_q_test
 
         rng = np.random.default_rng(0)
         ny, nx = 16, 16
@@ -513,15 +559,32 @@ class TestNUFFTKernelNullParamsRoundTrip:
         k = NUFFTKernel(coords, (ny, nx), (1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5)
         z = rng.standard_normal(ny * nx)
         Q_auto, p_auto = spatial_q_test(z, k)
-        # Pre-supply rescaled eigenvalues exactly as the internal branch does.
-        scale = k.n / (ny * nx)
-        evals = k.eigenvalues(return_full_layout=True)
-        sig_evals = evals[evals > 1e-9] * scale
-        Q_given, p_given = spatial_q_test(
-            z, k, null_params={"method": "liu", "eigenvalues": sig_evals}
-        )
+        # Pre-build the Liu null_params dict exactly as compute_null_params
+        # produces it; passing it back in should round-trip the p-value.
+        null_params = compute_null_params(k, method="liu")
+        Q_given, p_given = spatial_q_test(z, k, null_params=null_params)
         assert abs(Q_auto - Q_given) < 1e-10
         assert abs(p_auto - p_given) < 1e-10
+
+    def test_qtest_liu_requires_liu_coef_or_cumulants(self):
+        """Passing ``method='liu'`` with an unrelated / deprecated key
+        (e.g. the legacy ``'eigenvalues'``) must raise a clear error —
+        callers should use ``compute_null_params`` or supply
+        ``liu_coef`` / ``cumulants`` directly."""
+        from quadsv.nufft import NUFFTKernel
+        from quadsv.statistics import spatial_q_test
+
+        rng = np.random.default_rng(0)
+        ny, nx = 16, 16
+        coords = rng.uniform(0, 15, size=(ny * nx, 2))
+        k = NUFFTKernel(coords, (ny, nx), (1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5)
+        z = rng.standard_normal(ny * nx)
+        with pytest.raises(ValueError, match="liu_coef"):
+            spatial_q_test(
+                z,
+                k,
+                null_params={"method": "liu", "eigenvalues": np.ones(ny * nx)},
+            )
 
     def test_rtest_nufft_null_params_round_trip(self):
         from quadsv.nufft import NUFFTKernel
@@ -544,34 +607,128 @@ class TestNUFFTKernelNullParamsRoundTrip:
 
 
 class TestNUFFTKNeighborsAPI:
-    """``NUFFTKernel`` forwards ``k_neighbors`` to its internal ``FFTKernel``
-    — same k-NN semantic as MatrixKernel.
+    """``NUFFTKernel`` resolves ``k_neighbors`` on the *actual coord set* —
+    mirroring MatrixKernel's mutual-k-NN semantic — rather than forwarding
+    to FFTKernel's grid-cell counter. The resolved ``neighbor_degree`` is
+    whichever grid ring has radius closest to the median k-th nearest
+    neighbor distance of the coords.
     """
 
-    def test_k_neighbors_forwarded(self):
+    def test_k_neighbors_resolves_to_density_matched_ring(self):
+        """200 uniform points in [0, 20]² have density 0.5/unit², so the
+        4-NN radius is ≈ ``(4 / (π · 0.5))^{1/2} ≈ 1.6``. With grid
+        spacing 0.6, ring 5 (radius ``~1.70``) is the closest match —
+        *not* ring 1 (radius 0.6) that the old grid-cell counter would
+        have returned.
+        """
         rng = np.random.default_rng(0)
         coords = rng.uniform(0, 20, size=(200, 2))
         k = NUFFTKernel(
             coords, grid_shape=(32, 32), spacing=(0.6, 0.6), method="moran", k_neighbors=4
         )
-        assert k.params["neighbor_degree"] == 1
+        # Expected neighbor_degree: the ring with Euclidean radius closest
+        # to the median 4-NN distance of the coord set.
+        from scipy.spatial import cKDTree
 
-    def test_k_neighbors_for_car(self):
+        dists, _ = cKDTree(coords).query(coords, k=5)
+        r_k = float(np.median(dists[:, 4]))
+        # Grid ring radii² on the 32×32 / 0.6-spaced torus.
+        ny, nx, dy, dx = 32, 32, 0.6, 0.6
+        y = np.minimum(np.arange(ny) * dy, (ny * dy) - np.arange(ny) * dy)
+        x = np.minimum(np.arange(nx) * dx, (nx * dx) - np.arange(nx) * dx)
+        yy, xx = np.meshgrid(y, x, indexing="ij")
+        flat = np.sort((yy**2 + xx**2).ravel())
+        tol = 1e-6 * flat[-1]
+        unique_sq = flat[np.concatenate([[True], np.diff(flat) > tol])]
+        expected_deg = int(np.argmin(np.abs(unique_sq[1:] - r_k**2))) + 1
+
+        assert k.params["neighbor_degree"] == expected_deg
+        # And the chosen ring is within one ring of the coord r_k:
+        ring_r = np.sqrt(unique_sq[expected_deg])
+        assert abs(ring_r - r_k) <= np.sqrt(unique_sq[min(expected_deg + 1, len(unique_sq) - 1)])
+        # Requested k_neighbors is echoed back in ``params`` for
+        # inspection.
+        assert k.params["k_neighbors"] == 4
+
+    def test_k_neighbors_for_car_resolves_to_density_matched_ring(self):
+        """Same resolution for ``method='car'`` — ``rho`` is preserved
+        unchanged."""
         rng = np.random.default_rng(0)
         coords = rng.uniform(0, 20, size=(200, 2))
         k = NUFFTKernel(
             coords, grid_shape=(32, 32), spacing=(0.6, 0.6), method="car", k_neighbors=4, rho=0.9
         )
-        assert k.params["neighbor_degree"] == 1
+        # Same coord set → same k-NN radius → same ring.
+        k_ref = NUFFTKernel(
+            coords, grid_shape=(32, 32), spacing=(0.6, 0.6), method="moran", k_neighbors=4
+        )
+        assert k.params["neighbor_degree"] == k_ref.params["neighbor_degree"]
         assert k.params["rho"] == 0.9
+        assert k.params["k_neighbors"] == 4
+
+    def test_k_neighbors_and_neighbor_degree_conflict_raises(self):
+        """Passing both ``k_neighbors`` (coord-k-NN semantic) and
+        ``neighbor_degree`` (grid-ring semantic) is ambiguous and must
+        raise."""
+        rng = np.random.default_rng(0)
+        coords = rng.uniform(0, 20, size=(100, 2))
+        with pytest.raises(ValueError, match="Pass either 'k_neighbors'"):
+            NUFFTKernel(coords, method="moran", k_neighbors=4, neighbor_degree=1)
+
+    def test_explicit_neighbor_degree_bypasses_coord_resolution(self):
+        """Passing ``neighbor_degree`` directly skips the coord-aware
+        resolution — callers keep access to the raw grid-ring semantic
+        for back-compat or fine-grained control."""
+        rng = np.random.default_rng(0)
+        coords = rng.uniform(0, 20, size=(200, 2))
+        k = NUFFTKernel(
+            coords,
+            grid_shape=(32, 32),
+            spacing=(0.6, 0.6),
+            method="moran",
+            neighbor_degree=1,
+        )
+        assert k.params["neighbor_degree"] == 1
+        assert "k_neighbors" not in k.params
+
+    def test_k_neighbors_matches_matrix_kernel_adjacency_on_moran(self):
+        """NUFFTKernel's implicit K should rank coord-space k-NN pairs
+        much higher than non-neighbor pairs — mirroring MatrixKernel's
+        *exact* mutual-k-NN adjacency kernel. Correlation across all
+        off-diagonal entries jumps from ``~0.26`` (pre-fix, grid-cell
+        counting) to ``>0.6`` (post-fix, coord-aware resolution).
+        """
+        rng = np.random.default_rng(0)
+        coords = rng.uniform(0, 20, size=(200, 2))
+        # MatrixKernel Moran: normalized adjacency of the mutual 4-NN graph.
+        from quadsv.kernels import MatrixKernel
+
+        km = MatrixKernel.from_coordinates(coords, method="moran", k_neighbors=4)
+        K_m = km._K.toarray() if hasattr(km._K, "toarray") else np.asarray(km._K)
+        n = K_m.shape[0]
+        H = np.eye(n) - np.ones((n, n)) / n
+        K_m_c = H @ K_m @ H
+
+        # NUFFT Moran with the coord-aware resolver.
+        kn = NUFFTKernel(coords, method="moran", k_neighbors=4)
+        K_n_c = np.asarray(kn.Kx(np.eye(n)))
+
+        mask = ~np.eye(n, dtype=bool)
+        corr = float(np.corrcoef(K_m_c[mask].ravel(), K_n_c[mask].ravel())[0, 1])
+        assert corr > 0.6, (
+            f"Post-fix correlation should be > 0.6, got {corr:.3f} "
+            f"(grid_shape={kn.grid_shape}, neighbor_degree={kn.params['neighbor_degree']})"
+        )
 
 
 class TestNUFFTEmpiricalNullMoments:
-    """NUFFT graph kernels use z-scored (standardized) probes by default for
-    ``trace`` / ``square_trace`` so the reported null moments match the
-    realized variance of Q after :func:`spatial_q_test`'s z-scoring.
-    Without this, CAR/Moran/graph_laplacian FPR collapsed to 0 under
-    Welch/CLT (Fig 2C of the comparison notebook).
+    """FPR calibration sanity for NUFFT graph kernels. All paths
+    (analytic default, empirical opt-in, Liu with Dirichlet correction)
+    should land CLT / Welch FPR within ±0.03 of nominal 0.05 on the
+    indefinite-``Λ`` Moran kernel and the broad-spectrum CAR kernel.
+    Historical context: early on these FPRs collapsed to 0 until the
+    doubled-grid analytic ``square_trace`` fix + Dirichlet(1/2)
+    correction + Rademacher empirical path landed.
     """
 
     def _mk_irregular(self, n=1024, seed=11):
