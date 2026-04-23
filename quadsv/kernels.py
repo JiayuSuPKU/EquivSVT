@@ -84,11 +84,19 @@ class Kernel(ABC):
 
     @abstractmethod
     def trace(self) -> float:
-        """``trace(K)`` or ``trace(HKH) = trace(K) - s₁/n``."""
+        """``trace(K)`` or ``trace(HKH) = trace(K) − s₁/n``.
+
+        Concrete backends are free to add kwargs for backend-specific
+        options (e.g. :class:`MatrixKernelBase` exposes ``n_probes``
+        for its precision-stored Hutchinson path).
+        """
 
     @abstractmethod
     def square_trace(self) -> float:
-        """``trace(K²)`` or ``trace((HKH)²) = trace(K²) - 2·s₂/n + s₁²/n²``."""
+        """``trace(K²)`` or ``trace((HKH)²) = trace(K²) − 2·s₂/n + s₁²/n²``.
+
+        Same contract as :meth:`trace` re: backend-specific kwargs.
+        """
 
     @abstractmethod
     def eigenvalues(self, k: int | None = None) -> np.ndarray:
@@ -705,17 +713,37 @@ class MatrixKernelBase(Kernel):
         self._trace_rvs_cache = {"n_vectors": n_vectors, "rvs": rvs, "Y": Y}
         return self._trace_rvs_cache
 
-    def trace(self) -> float:
-        """
-        ``trace(K)`` (or ``trace(HKH) = trace(K) − s₁/n`` when ``centering``).
+    def trace(self, n_probes: int | None = None) -> float:
+        """``trace(K)`` (raw) or ``trace(HKH)`` (centered).
 
-        For implicit kernels (precision-stored), the raw trace uses a
-        Hutchinson estimator with cached ``±1`` probes (``n_probes=15``).
+        Dispatch is automatic based on :attr:`stores_precision`:
+
+        - **Explicit ``K``** (dense or sparse): diagonal sum of the
+          stored ``K`` — exact, ``O(n)`` (sparse) or ``O(n)`` (dense).
+        - **Precision-stored** (CAR in the implicit regime, ``K`` only
+          available through the LU solve on ``K⁻¹``): Hutchinson
+          estimator ``(1/m) Σᵢ vᵢᵀ (K vᵢ)`` with cached ``±1`` probes
+          solved through the precision.
+
+        ``-s₁/n`` is applied on top when ``centering=True``.
+
+        Parameters
+        ----------
+        n_probes : int, optional
+            Probe count for the Hutchinson path (default 15). **Ignored**
+            on the analytic / explicit-``K`` path (no probes involved).
+            On the Hutchinson path the cache is keyed on ``n_probes``;
+            requesting a different count recomputes the LU-solve cache
+            and emits a :class:`RuntimeWarning`.
+
+        Returns
+        -------
+        float
         """
         if self.stores_precision:
-            n_vectors = 15
-            cache = self._get_rvs_trace_cache(n_vectors)
-            raw = float(np.sum(cache["rvs"] * cache["Y"]) / n_vectors)
+            m = int(n_probes) if n_probes else 15
+            cache = self._get_rvs_trace_cache(m)
+            raw = float(np.sum(cache["rvs"] * cache["Y"]) / m)
         elif sp.issparse(self._K):
             raw = float(self._K.diagonal().sum())
         else:
@@ -725,27 +753,34 @@ class MatrixKernelBase(Kernel):
         s1, _ = self._ones_stats()
         return raw - s1 / self.n
 
-    def square_trace(self) -> float:
-        """
-        ``trace(K²)`` (or ``trace((HKH)²) = trace(K²) − 2·s₂/n + s₁²/n²``).
+    def square_trace(self, n_probes: int | None = None) -> float:
+        """``trace(K²)`` (raw) or ``trace((HKH)²)`` (centered).
 
-        Used for variance estimation in statistical tests. For implicit kernels,
-        uses Hutchinson's trick for efficient O(n) estimation.
+        Dispatch is automatic based on :attr:`stores_precision`:
+
+        - **Explicit ``K``**: Frobenius norm of the stored ``K`` —
+          ``Σᵢⱼ Kᵢⱼ²`` in ``O(nnz)`` for sparse, ``O(n²)`` for dense.
+        - **Precision-stored**: ``(1/m) Σᵢ ‖K vᵢ‖²`` with the same
+          cached ``±1`` probes as :meth:`trace` (single LU solve
+          shared across both moments).
+
+        ``-2·s₂/n + s₁²/n²`` is applied on top when ``centering=True``.
+
+        Parameters
+        ----------
+        n_probes : int, optional
+            Probe count for the Hutchinson path (default 15). **Ignored**
+            on the analytic / explicit-``K`` path. Shared cache with
+            :meth:`trace`.
 
         Returns
         -------
         float
-            Trace of K squared.
-
-        Notes
-        -----
-        For implicit kernels the result is a stochastic estimate using a fixed
-        ``n_vectors=15`` Hutchinson probes (shared with :meth:`trace`).
         """
         if self.stores_precision:
-            n_vectors = 15
-            cache = self._get_rvs_trace_cache(n_vectors)
-            raw = float(np.sum(cache["Y"] ** 2) / n_vectors)
+            m = int(n_probes) if n_probes else 15
+            cache = self._get_rvs_trace_cache(m)
+            raw = float(np.sum(cache["Y"] ** 2) / m)
         elif sp.issparse(self._K):
             raw = float(self._K.power(2).sum())
         else:

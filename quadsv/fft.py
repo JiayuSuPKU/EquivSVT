@@ -701,11 +701,20 @@ class FFTKernel(Kernel):
         return spec[idx]
 
     def trace(self) -> float:
-        """``trace(K)`` — sum of eigenvalues (centered or raw)."""
+        """``trace(K)`` (raw) or ``trace(HKH)`` (centered).
+
+        Closed-form ``Σ_k λ(k)`` — FFT diagonalizes ``K`` in the
+        Fourier basis, so the trace is an ``O(n)`` sum over the
+        spectrum. No stochastic path.
+        """
         return float(np.sum(self.eigenvalues(return_full_layout=True)))
 
     def square_trace(self) -> float:
-        """``trace(K²)`` — sum of squared eigenvalues (centered or raw)."""
+        """``trace(K²)`` (raw) or ``trace((HKH)²)`` (centered).
+
+        Closed-form ``Σ_k λ(k)²`` — FFT diagonalization gives the
+        spectrum directly.
+        """
         return float(np.sum(self.eigenvalues(return_full_layout=True) ** 2))
 
 
