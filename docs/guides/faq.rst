@@ -9,9 +9,9 @@ Frequently Asked Questions (FAQ)
 
 .. math::
 
-   Q_n = \mathbf{z}^\top \mathbf{K} \mathbf{z},
+   Q_n = \mathbf{z}^\top \tilde{\mathbf{K}} \mathbf{z},
 
-where the kernel matrix :math:`\mathbf{K}` encodes spatial structure.
+where the (double-centered) kernel matrix :math:`\tilde{\mathbf{K}}=\mathbf{HKH}` encodes spatial structure.
 
 
 **Q: Why is Moran's I potentially problematic for SVG detection?**
@@ -40,34 +40,30 @@ Use Q-test for identifying spatially variable genes (SVGs). Use R-test for findi
 
 **Q: Which backend should I pick?**
 
-``quadsv`` has three kernel representations and one test layer built on top
-of them. You almost always pick via the detector's ``backend`` keyword
-rather than hand-building a kernel:
+``quadsv`` has three implementations for spatial kernels and one test layer built on top of them. 
+You almost always pick via the detector's ``backend`` keyword rather than hand-building a kernel:
 
-**``backend="matrix"`` (default,** :class:`~quadsv.MatrixKernel`\ **)**
+``backend="matrix"`` (:class:`~quadsv.MatrixKernel`)
 
-- Works on any spatial coordinates or graphs (irregular layouts).
+- Works on any spatial coordinates and graphs (e.g., expression-based k-NN graphs).
 - The kernel class auto-decides internally whether to materialize the dense
   ``(N, N)`` matrix or keep just the sparse precision matrix and solve with
-  an LU factorization on demand — **you never see the dense-vs-sparse
-  switch**, it is memory-driven.
-- Example: standard Visium, MERFISH, single-cell lineage trees.
+  an LU factorization on demand.
+- Example: in situ data like MERFISH, or single-cell lineage trees.
 
-**``backend="nufft"`` (**\ :class:`~quadsv.NUFFTKernel`\ **)**
+``backend="nufft"`` (:class:`~quadsv.NUFFTKernel`)
 
-- Also handles irregular spots but never forms an ``(N, N)`` matrix —
-  kernel action is evaluated via type-1/type-2 non-uniform FFTs in
+- Works on any 2D spatial coordinates.
+- Kernel action is evaluated via type-1/type-2 non-uniform FFTs in
   ``O(N log N)`` per feature.
-- Ideal for ≥ 10⁴ spots where even the sparse-precision matrix becomes
-  prohibitive.
-- Grid resolution and spacing are auto-inferred from the coordinates.
+- Ideal for ≥ 1M spots where even the sparse-precision matrix becomes too slow.
+- Example: in situ data like MERFISH, or Visium HD (segmented).
 
-**``DetectorGrid`` (**\ :class:`~quadsv.FFTKernel`\ **)**
+``DetectorGrid`` (:class:`~quadsv.FFTKernel`)
 
-- Specialized for regular rasterized grids with periodic boundary
-  conditions. Consumes :class:`spatialdata.SpatialData` directly.
+- Specialized for regular rasterized grids and consumes :class:`spatialdata.SpatialData` directly.
 - O(N log N) via FFT spectral decomposition with no k-NN graph needed.
-- Example: Visium HD at millions of spots on a fixed grid.
+- Example: Visium HD on a fixed grid (16/8/2um).
 
 .. code-block:: python
 
@@ -98,6 +94,7 @@ affinities).
 **Q: Does quadsv support 3D spatial coordinates?**
 
 Yes, but currently only for matrix-based kernels. Pass 3D coordinates to :meth:`quadsv.kernels.MatrixKernel.from_coordinates` as usual.
+If you would like to see NUFFT and FFT backends support 3D coordinates, please open a feature request at `https://github.com/JiayuSuPKU/EquivSVT/issues`.
 
 
 Further help

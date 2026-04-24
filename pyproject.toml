@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "quadsv"
-version = "0.1.1"
+dynamic = ["version"]
 description = "Consistent and scalable spatial pattern detection via quadratic forms."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,13 +43,11 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=1.22",
-    "scipy>=1.9",
-    "scikit-learn>=1.1",  # for KNN
-    "pandas>=1.5",
+    # scanpy transitively pulls anndata, numpy, scipy, scikit-learn, and
+    # pandas — we track scanpy's own floor rather than restate them.
     "scanpy>=1.9",
-    "spatialdata>=0.1",   # for FFT rasterization
-    "finufft>=2.2",       # for NUFFT backend
+    "spatialdata>=0.1",   # FFT rasterization + SpatialData IO
+    "finufft>=2.2",       # NUFFT backend
     "joblib>=1.2",
     "tqdm>=4.60",
 ]
@@ -170,3 +168,14 @@ precision = 2
 where = ["."]
 include = ["quadsv*"]
 exclude = ["tests*", "data*", "figures*"]
+
+# Derive the package version from git tags. On a clean release commit
+# tagged ``vX.Y.Z`` the version is ``X.Y.Z``; between tags it is
+# ``X.Y.(Z+1).devN+g<sha>[.dYYYYMMDD]`` per PEP 440. On install / build
+# the resolved version is written to ``quadsv/_version.py`` so the
+# runtime ``__version__`` lookup works without git (sdist, wheel, shallow
+# clones). ``fallback_version`` is used only when both git AND the
+# generated file are missing — keep it in sync with the last release.
+[tool.setuptools_scm]
+version_file = "quadsv/_version.py"
+fallback_version = "0.1.1"

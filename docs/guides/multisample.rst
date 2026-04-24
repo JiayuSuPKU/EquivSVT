@@ -1,11 +1,16 @@
 Cross-sample Comparison
 ========================
 
-When you have **two groups of spatial-omics samples** — e.g. a set of healthy slides
-and a set of cancer slides — and want to ask *"which genes show the largest
+When you have **two groups of spatial-omics samples**, say a set of healthy controls
+and a set of cancer sections, and want to ask *"which genes show the largest
 difference in spatial pattern between the two groups?"*, the
 :mod:`quadsv.multisample` module gives you an alignment-free, frequency-domain
 pipeline with valid permutation-based hypothesis testing.
+
+.. note::
+
+  The cross-sample comparison functionality is under active development.
+  The current API is experimental and may change in future releases.
 
 Why frequency domain?
 ---------------------
@@ -159,35 +164,6 @@ per sample via :func:`spatialdata.rasterize_bins` — same recipe as
    ).fit().normalize_background()
    cmp.test(statistic="log_l2", n_perm=300)
 
-Magnitude-robust gene clustering via ``shape_normalize``
---------------------------------------------------------
-
-When clustering genes by "how their spatial pattern changes between groups" —
-as in the contrastive-programs analysis in the example notebooks — the raw
-log-spectrum contrast ``log P_B - log P_A`` is easily dominated by genes that
-are simply expressed in one group and absent in the other: a multiplicative
-magnitude difference produces a constant offset at every frequency bin, which
-overwhelms genuine shape differences.
-
-:func:`quadsv.shape_normalize` fixes this by dividing each
-``(sample, gene)`` spectrum by its own geometric mean (equivalently, subtracting
-the per-row mean of ``log P``). Two rows that differ only by a positive scalar
-become identical after the transform; only the shape of the power-vs-frequency
-curve survives. Chain it after background normalization:
-
-.. code-block:: python
-
-   cmp = (
-       ComparatorIrregular(samples, groups, gene_names)
-       .fit()
-       .normalize_background()   # cancels per-sample gain across genes
-       .shape_normalize()        # cancels per-(sample, gene) magnitude across freq
-   )
-   # cmp.spectra_ now has unit geometric mean along the K axis; use it for
-   # downstream KMeans / hierarchical clustering of gene-level contrast vectors.
-
-The per-gene DE test via :meth:`ComparatorIrregular.test_expression` is
-unaffected — it reads from ``cmp.dc_`` directly.
 
 Cross-sample unit conversion (NUFFT path)
 -----------------------------------------
@@ -249,25 +225,6 @@ Useful candidates:
 
 Residualization is applied **after** background normalization and **before** testing.
 
-When to use 2D mode
--------------------
-
-The default radial mode is rotation-invariant. Switch to ``feature_mode="2d"`` when
-your samples have a meaningful, biologically conserved orientation
-(e.g., DV/AP axes preserved across slides). The pipeline will rotation-align each
-sample's full 2D spectrum to a chosen reference before flattening, giving you back
-directional anisotropy without requiring per-pixel registration.
-
-Reference
----------
-
-The default ``log_l2`` statistic follows the nonparametric two-sample test of
-log-spectral densities by Bandyopadhyay & Wu
-(`arXiv:2602.10774 <https://arxiv.org/html/2602.10774>`_). The pipeline is
-inspired by the alignment-free philosophy of
-`SpaGFT <https://www.nature.com/articles/s41467-024-51590-5>`_ but replaces the
-graph Fourier basis with the standard 2D FFT, which is faster on regular grids and
-exposes a translation-invariance property that graph Fourier does not.
 
 API reference
 -------------

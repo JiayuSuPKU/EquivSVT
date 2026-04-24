@@ -20,12 +20,19 @@ import logging
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
+# Version resolution order: prefer the file written by ``setuptools-scm`` at
+# build time (``quadsv/_version.py`` — see ``[tool.setuptools_scm]`` in
+# ``pyproject.toml``), fall back to installed-package metadata, then to a
+# last-known release string for unbuilt / shallow-clone checkouts.
 try:
-    from importlib.metadata import PackageNotFoundError, version
+    from quadsv._version import version as __version__  # type: ignore[assignment]
+except ImportError:  # _version.py absent — source checkout without a build step
+    try:
+        from importlib.metadata import PackageNotFoundError, version
 
-    __version__ = version("quadsv")
-except (ImportError, PackageNotFoundError):
-    __version__ = "0.1.0"
+        __version__ = version("quadsv")
+    except (ImportError, PackageNotFoundError):
+        __version__ = "0.0.0+unknown"
 
 from quadsv.comparators import ComparatorGrid, ComparatorIrregular
 from quadsv.detector import DetectorIrregular
