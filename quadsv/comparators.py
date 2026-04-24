@@ -667,13 +667,16 @@ class ComparatorGrid(_ComparatorBase):
     gene_names : sequence of str, optional
         If None, inferred from the first sample's table. All samples must
         share ``var_names``.
-    feature_mode, n_radial_bins, fft_solver, workers, freq_edges, center,
-    presence_threshold, min_samples_per_group : see parent.
     fft_chunk_size : int, default 256
         Genes per batched ``scipy.fft`` call on the rasterized block. Keeps
         transient memory bounded at ``O(ny · nx · chunk · 8 B)``. The raster
         itself is still built once per sample (full ``(n_genes, ny, nx)``
         footprint is unavoidable on SpatialData).
+
+    Other Parameters
+    ----------------
+    feature_mode, n_radial_bins, fft_solver, workers, freq_edges, center, presence_threshold, min_samples_per_group
+        See :class:`_ComparatorBase`.
     """
 
     def __init__(

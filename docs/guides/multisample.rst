@@ -1,5 +1,5 @@
-Cross-sample spectral comparison
-================================
+Cross-sample Comparison
+========================
 
 When you have **two groups of spatial-omics samples** — e.g. a set of healthy slides
 and a set of cancer slides — and want to ask *"which genes show the largest
@@ -222,13 +222,13 @@ on real Visium data: ``FFT(zero-filled raster)`` equals
 Visium hex grids
 ----------------
 
-For 10x Visium slides, :func:`quadsv.io_visium.load_visium_sample` (from the
+For 10x Visium slides, :func:`quadsv.utils.load_visium_sample` (from the
 submodule) reads a Space Ranger output directory into an
 :class:`anndata.AnnData`. You can feed that :class:`~anndata.AnnData`
 directly to :class:`~quadsv.ComparatorIrregular` — the NUFFT backend handles
 the irregular hex layout without any manual rasterization step. If you do
 want the explicit hex-to-grid rasterization for other purposes,
-:func:`quadsv.io_visium.visium_to_grid` returns the ``(n_genes, 78, 128)``
+:func:`quadsv.utils.visium_to_grid` returns the ``(n_genes, 78, 128)``
 array and the physical spacing ``(dy, dx) = (100·√3/2, 50)`` μm per cell
 for v1 Visium.
 

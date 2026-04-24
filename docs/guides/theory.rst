@@ -89,38 +89,31 @@ where:
 Null distribution approximations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Under the null hypothesis (spatial independence), :math:`Q_n` follows a weighted chi-square:
+Under the null hypothesis (spatial independence), :math:`Q_n` follows a
+weighted chi-square mixture
 
 .. math::
-   Q_n \sim \sum_{i=1}^m \lambda_i \chi^2_1
+   Q_n \;\sim\; \textstyle\sum_{i=1}^m \lambda_i \chi^2_1,
 
-where :math:`\lambda_i` are eigenvalues of :math:`\mathbf{K}` and :math:`m = \text{rank}(\mathbf{K})`.
+where :math:`\lambda_i` are eigenvalues of
+:math:`\tilde{\mathbf{K}} = \mathbf{H}\mathbf{K}\mathbf{H}` and
+:math:`m = n - 1`. ``quadsv`` ships three moment-matching fits:
 
-Three approximation methods are provided, balancing accuracy and speed:
+- **CLT** — normal fit to :math:`(c_1, c_2)`. Valid for any
+  :math:`\mathbf{K}`, including indefinite Moran-style adjacencies.
+- **Welch-Satterthwaite** — scaled central :math:`\chi^2` fit to
+  :math:`(c_1, c_2)`. PSD kernels only; default when applicable.
+- **Liu** — shifted non-central :math:`\chi^2` fit to
+  :math:`(c_1, c_2, c_3, c_4)`. PSD kernels only; tightest right tail.
 
-.. list-table::
-   :widths: 15 15 15 40
-
-   * - Method
-     - Complexity
-     - Applicability
-     - Use case
-   * - CLT
-     - O(N)
-     - Works for all kernels
-     - Large N, indefinite kernels
-   * - Welch
-     - O(N)
-     - Positive semi-definite kernels only
-     - Default, large N
-   * - Liu
-     - O(N³)
-     - Positive semi-definite kernels only
-     - N ≤ 5000 or FFT grids
-
-- **CLT**: Approximates :math:`Q_n` as normal with mean :math:`\mu = \text{tr}(\mathbf{K})` and variance :math:`\sigma^2 = 2\text{tr}(\mathbf{K}^2)`.
-- **Welch/Satterthwaite**: Matches first two moments to a scaled chi-square distribution using Hutchinson trace estimation. Recommended default.
-- **Liu**: Exact eigendecomposition followed by polynomial moment-matching. Most accurate but requires O(N³) computation.
+Here :math:`c_p = \operatorname{tr}(\tilde{\mathbf{K}}^p)` is the *p*-th
+spectral power sum. ``quadsv`` also applies a **finite-\ n Dirichlet(1/2)
+correction** to :math:`\operatorname{Var}[Q_n]`, accounting for the
+correlation between numerator and denominator introduced by the sample-
+variance standardisation of :math:`\mathbf{z}`.
+See :doc:`/guides/scaling` for the formulas, the three cumulant-computing
+paths (FFT / NUFFT analytic, Matrix Frobenius, Hutchinson probes), and
+the full complexity table.
 
 R-test: bivariate spatial co-expression
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -140,33 +133,8 @@ where :math:`\mathbf{x}, \mathbf{y}` are standardized features.
 2. Test pairwise R-statistics among top SVGs
 3. Control false discovery rate (FDR) across comparisons
 
-FFT acceleration for regular grids
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For Block-Toeplitz kernels on regular grids (e.g., Visium HD, imaging), eigenvalues decouple via FFT:
-
-.. math::
-   \mathbf{K} = \mathbf{U} \Lambda \mathbf{U}^\top
-   \quad \Rightarrow \quad
-   Q_n = \sum_i \lambda_i |u_i^\top \mathbf{z}|^2
-
-where :math:`\mathbf{U}` is the FFT basis and :math:`\Lambda` is diagonal.
-
-**Complexity reduction:**
-
-- Explicit eigendecomposition: O(N³)
-- FFT eigenvalues: O(N log N)
-
-**Example: single-gene, 1000×1000 grid**
-
-- Explicit kernel (eigen): memory error
-- Explicit kernel (Welch): ~10 seconds
-- FFT kernel (eigen): ~0.1 seconds
-
-**Supported topologies:** Square (4-neighbor, default) and hexagonal (6-neighbor).
-
-Practical summary
-~~~~~~~~~~~~~~~~~
+Drop-in replacement for Moran's I
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ============== ======================== ================================
 Method         Test consistency         Use case
@@ -176,11 +144,14 @@ Graph Lap.     ✓ Guaranteed             High-frequency, local variation
 CAR            ✓ Guaranteed             Low-frequency, smoothed patterns
 ============== ======================== ================================
 
-**Best practice**: Use CAR kernel for consistent, high-power detection across functional patterns. Use FFT-accelerated CAR on regular grids.
+**Best practice**: 
+- On a graph: Use CAR kernel for consistent, high-power detection across functional patterns. 
+- On 2D physical space: Use NUFFT- and FFT-accelerated implementations of any PSD kernels (e.g., Matern).
 
 See also
 --------
 
 - :doc:`/guides/quickstart` — Practical usage examples
+- :doc:`/guides/scaling` — Scaling and complexity details
 - :doc:`/guides/kernels` — Kernel selection and design
 - :doc:`/autoapi/quadsv/statistics/index` — Statistical API reference

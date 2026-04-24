@@ -3,41 +3,66 @@ Quick Start
 
 Get started with ``quadsv`` in 5 minutes.
 
-The library exposes **four conceptual layers** and nothing else:
+The library exposes *four conceptual layers*:
 
-1. **Kernels** — :class:`~quadsv.SpatialKernel` (dense/sparse),
-   :class:`~quadsv.FFTKernel` (regular grid), :class:`~quadsv.NUFFTKernel`
-   (irregular 2D coordinates).
-2. **Statistical tests** — :func:`~quadsv.spatial_q_test` /
-   :func:`~quadsv.spatial_r_test` plus their FFT and NUFFT variants. All six
-   share the same signature shape.
-3. **PatternDetector** — :class:`~quadsv.PatternDetector` for
-   :class:`anndata.AnnData` with a ``backend={'matrix', 'nufft'}`` switch;
-   :class:`~quadsv.PatternDetectorFFT` for :class:`spatialdata.SpatialData`.
-4. **Pattern comparators** — cross-sample pattern comparison across a list of
-   AnnData (→ NUFFT) or SpatialData (→ FFT) objects.
+.. list-table::
+   :header-rows: 1
+   :widths: 14 32 54
+
+   * - Layer
+     - What it is for
+     - Implementations
+   * - **Kernels**
+     - Describe the spatial pattern to capture and which frequencies to prioritize.
+     - :class:`~quadsv.MatrixKernel` on arbitrary coords or adjacency
+       (dense / sparse / sparse-precision auto-switched);
+       :class:`~quadsv.FFTKernel` on a regular grid with periodic
+       boundaries; :class:`~quadsv.NUFFTKernel` on irregular 2-D coords.
+   * - **Statistical tests**
+     - Evaluate the Q / R quadratic form and its null p-value on a
+       given data vector (or batch).
+     - :func:`~quadsv.spatial_q_test` for univariate spatial variability
+       and :func:`~quadsv.spatial_r_test` for bivariate co-expression.
+   * - **Detectors**
+     - Transcriptome-wide SVG / co-expression screening over a single sample.
+     - :class:`~quadsv.DetectorIrregular` for
+       :class:`anndata.AnnData` (``backend={'matrix', 'nufft'}``
+       switch); :class:`~quadsv.DetectorGrid` for
+       :class:`spatialdata.SpatialData` (FFT-accelerated on rasterised
+       bins).
+   * - **Comparators**
+     - Alignment-free cross-sample pattern comparison between groups of slides 
+       in the frequency domain.
+     - :class:`~quadsv.ComparatorIrregular` for a list of
+       :class:`anndata.AnnData` (NUFFT backend);
+       :class:`~quadsv.ComparatorGrid` for a list of
+       :class:`spatialdata.SpatialData` (FFT backend).
 
 
 Q-test basics for spatial variability
 -------------------------------------
 
-Test whether a single gene exhibits significant spatial clustering.
+Test whether a single gene exhibits significant spatial clustering. The
+default recommendation on irregular coords is :class:`~quadsv.NUFFTKernel`
+with the Matérn kernel — positive definite, ``O(n log n)`` per feature via
+``finufft``, and the grid shape / spacing are auto-inferred from the
+coords (no kernel matrix ever materialised).
 
 .. code-block:: python
 
    import numpy as np
-   from quadsv import SpatialKernel, spatial_q_test
+   from quadsv import NUFFTKernel, spatial_q_test
 
    rng = np.random.default_rng(0)
-   coords = rng.standard_normal((500, 2))
+   coords = rng.uniform(0, 20, size=(500, 2))
    gene_expression = rng.standard_normal(500)
 
-   # CAR kernel (recommended: strictly positive definite)
-   kernel = SpatialKernel.from_coordinates(
+   # Matérn kernel (positive definite, smooth low-pass)
+   kernel = NUFFTKernel(
        coords,
-       method="car",
-       k_neighbors=15,
-       rho=0.9,
+       method="matern",
+       bandwidth=2.0,
+       nu=1.5,
    )
 
    Q, pval = spatial_q_test(gene_expression, kernel)
@@ -48,22 +73,27 @@ Test whether a single gene exhibits significant spatial clustering.
 - High Q + low p-value → gene is spatially clustered/dispersed
 - Low Q + high p-value → gene is spatially random
 
-All six test variants share one signature — ``(x[, y], kernel,
-null_params=None, return_pval=True, is_standardized=False)`` — so you can swap
-backends without changing the call:
+The same ``spatial_q_test`` / ``spatial_r_test`` calls dispatch on the
+kernel type — a :class:`~quadsv.MatrixKernel` takes a flat ``(n,)`` or
+``(n, M)`` array, an :class:`~quadsv.FFTKernel` takes a 2-D grid
+``(ny, nx)`` or ``(ny, nx, M)``, and an :class:`~quadsv.NUFFTKernel` takes
+a flat ``(n,)`` / ``(n, M)`` just like MatrixKernel. No per-backend
+functions to import:
 
 .. code-block:: python
 
-   from quadsv import spatial_q_test_fft, spatial_q_test_nufft
+   from quadsv import spatial_q_test
 
-   # spatial_q_test_fft(img_2d, fft_kernel)
-   # spatial_q_test_nufft(values_1d, nufft_kernel)
+   # spatial_q_test(values_1d, matrix_kernel)  # Matrix path
+   # spatial_q_test(img_2d, fft_kernel)        # FFT path
+   # spatial_q_test(values_1d, nufft_kernel)   # NUFFT path
 
 
 R-test basics for spatial co-expression
 ---------------------------------------
 
-Test whether two genes are spatially co-expressed.
+Test whether two genes are spatially co-expressed (reuses the same
+kernel built above):
 
 .. code-block:: python
 
@@ -80,34 +110,36 @@ Testing SVG for all genes with AnnData
 --------------------------------------
 
 Detect all spatially variable genes (SVGs) in a tissue sample using
-:class:`~quadsv.PatternDetector`, the wrapper around :class:`anndata.AnnData`.
-The single :meth:`~quadsv.PatternDetector.build_kernel` entry point picks the
-right kernel representation via ``backend``:
+:class:`~quadsv.DetectorIrregular`, the wrapper around
+:class:`anndata.AnnData`. Kernel type and parameters are picked in
+``__init__``; the data is attached via :meth:`setup_data`:
 
-- ``backend="matrix"`` (default) — :class:`~quadsv.SpatialKernel`. The class
-  internally switches between a materialized dense kernel and a sparse
-  precision-matrix + LU-solve representation based on ``n_obs``; you never
-  choose the representation directly.
-- ``backend="nufft"`` — :class:`~quadsv.NUFFTKernel`. Ideal for ≥ 10⁴
-  irregular spots; O(N log N) per feature via finufft.
+- ``backend="nufft"`` (recommended) — :class:`~quadsv.NUFFTKernel`.
+  ``O(n log n)`` per feature via ``finufft``, never forms an ``(n, n)``
+  matrix. Grid shape / spacing auto-inferred from the coords. Pairs
+  naturally with Matérn / Gaussian kernels.
+- ``backend="matrix"`` — :class:`~quadsv.MatrixKernel`. Picks between a
+  materialized dense kernel and a sparse precision + LU-solve
+  representation based on ``n_obs``; use this for graph kernels (``car``,
+  ``moran``) on smaller ``n`` or for precomputed ``adata.obsp``
+  adjacencies.
 
 .. code-block:: python
 
    import anndata as ad
-   from quadsv import PatternDetector
+   from quadsv import DetectorIrregular
 
    adata = ad.read_h5ad("spatial_tissue.h5ad")
    print(f"Data: {adata.n_obs} spots x {adata.n_vars} genes")
 
    detector = (
-       PatternDetector(adata, min_cells_frac=0.05)
-       .build_kernel(
-           backend="matrix",
-           method="car",
-           coordinates_key="spatial",
-           rho=0.9,
-           k_neighbors=15,
+       DetectorIrregular(
+           kernel_method="matern",
+           backend="nufft",
+           bandwidth=25.0,   # in the same units as adata.obsm["spatial"]
+           nu=1.5,
        )
+       .setup_data(adata, obsm_key="spatial", min_cells_frac=0.05)
    )
 
    q_results = detector.compute_qstat(source="var", n_jobs=4, return_pval=True)
@@ -117,21 +149,21 @@ right kernel representation via ``backend``:
    print(q_results.head())
 
 
-Scaling to ≥ 10⁴ irregular spots via NUFFT
-------------------------------------------
+Graph-kernel alternative via the Matrix backend
+-----------------------------------------------
 
-Switching to the NUFFT backend needs one argument change. The k-grid and
-per-axis spacing are auto-inferred from the coordinates:
+If you need a graph-flavored kernel (CAR, Moran, graph Laplacian) on a
+smaller ``n`` — or if your ``adata.obsp`` already carries a custom
+adjacency — switch to ``backend="matrix"``:
 
 .. code-block:: python
 
-   detector = PatternDetector(adata).build_kernel(
-       backend="nufft",
-       method="matern",
-       coordinates_key="spatial",
-       bandwidth=25.0,   # in the same units as adata.obsm["spatial"]
-       nu=1.5,
-   )
+   detector = DetectorIrregular(
+       kernel_method="car",
+       backend="matrix",
+       rho=0.9,
+       k_neighbors=15,
+   ).setup_data(adata, obsm_key="spatial", min_cells_frac=0.05)
    q_results = detector.compute_qstat(n_jobs=4)
 
 
@@ -161,31 +193,34 @@ Large regular grids via FFT + SpatialData
 -----------------------------------------
 
 For regular grids (e.g., Visium HD with 1M+ spots), use FFT acceleration
-through :class:`~quadsv.PatternDetectorFFT`, which consumes
-:class:`spatialdata.SpatialData`:
+through :class:`~quadsv.DetectorGrid`, which consumes
+:class:`spatialdata.SpatialData`. Kernel hyperparameters go to
+``__init__``; the SpatialData and its bin / table / coord layout go to
+:meth:`setup_data`:
 
 .. code-block:: python
 
    import spatialdata as sd
-   from quadsv import PatternDetectorFFT
+   from quadsv import DetectorGrid
 
    sdata = sd.read_zarr("visium_hd.zarr")
 
-   detector_fft = PatternDetectorFFT(
-       sdata,
-       min_count=10,
+   detector = DetectorGrid(
        kernel_method="car",
        rho=0.9,
        neighbor_degree=1,
        topology="square",
        fft_solver="rfft2",
-   )
-
-   results = detector_fft.compute_qstat(
-       bins=["Visium_HD_bin_name"],
-       table_name=["table_name"],
+   ).setup_data(
+       sdata,
+       bins="Visium_HD_bin_name",
+       table_name="table_name",
        col_key="array_col",
        row_key="array_row",
+       min_count=10,
+   )
+
+   results = detector.compute_qstat(
        n_jobs=4,
        workers=2,
        chunk_size=256,
@@ -199,5 +234,5 @@ Next steps
 
 - **Theory**: :doc:`/guides/theory`
 - **Kernel design**: :doc:`/guides/kernels`
-- **Cross-sample comparison**: :doc:`/guides/spectral_compare`
+- **Cross-sample comparison**: :doc:`/guides/multisample`
 - **API reference**: :doc:`/autoapi/quadsv/index`

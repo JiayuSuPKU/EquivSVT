@@ -23,7 +23,7 @@ The **CAR kernel** :math:`\mathbf{K} = (\mathbf{I} - \rho \mathbf{\tilde{W}})^{-
 .. code-block:: python
 
    # Use CAR instead of Moran's I
-   kernel = SpatialKernel.from_coordinates(
+   kernel = MatrixKernel.from_coordinates(
        coords, method='car', k_neighbors=4, rho=0.9
    )
 
@@ -41,10 +41,10 @@ Use Q-test for identifying spatially variable genes (SVGs). Use R-test for findi
 **Q: Which backend should I pick?**
 
 ``quadsv`` has three kernel representations and one test layer built on top
-of them. You almost always pick via the detector's ``backend`` argument
+of them. You almost always pick via the detector's ``backend`` keyword
 rather than hand-building a kernel:
 
-**``backend="matrix"`` (default,** :class:`~quadsv.SpatialKernel`\ **)**
+**``backend="matrix"`` (default,** :class:`~quadsv.MatrixKernel`\ **)**
 
 - Works on any spatial coordinates or graphs (irregular layouts).
 - The kernel class auto-decides internally whether to materialize the dense
@@ -62,7 +62,7 @@ rather than hand-building a kernel:
   prohibitive.
 - Grid resolution and spacing are auto-inferred from the coordinates.
 
-**``PatternDetectorFFT`` (**\ :class:`~quadsv.FFTKernel`\ **)**
+**``DetectorGrid`` (**\ :class:`~quadsv.FFTKernel`\ **)**
 
 - Specialized for regular rasterized grids with periodic boundary
   conditions. Consumes :class:`spatialdata.SpatialData` directly.
@@ -71,30 +71,33 @@ rather than hand-building a kernel:
 
 .. code-block:: python
 
-   from quadsv import PatternDetector, PatternDetectorFFT
+   from quadsv import DetectorIrregular, DetectorGrid
 
    # Irregular layout, small-to-moderate N
-   det = PatternDetector(adata).build_kernel(backend="matrix", method="car")
+   det = DetectorIrregular(kernel_method="car", backend="matrix").setup_data(adata)
 
    # Irregular layout, large N
-   det = PatternDetector(adata).build_kernel(backend="nufft", method="matern")
+   det = DetectorIrregular(kernel_method="matern", backend="nufft").setup_data(adata)
 
    # Regular grid, SpatialData
-   det = PatternDetectorFFT(sdata, kernel_method="car", rho=0.9, topology="square")
+   det = DetectorGrid(kernel_method="car", rho=0.9, topology="square").setup_data(
+       sdata, bins="...", table_name="...", col_key="array_col", row_key="array_row"
+   )
 
 **Q: Can I use quadsv with single-cell data (not spatially resolved)?**
 
 Yes, if you can define spatial relationships (e.g., k-NN graph in PCA
 space, pseudotime ordering, lineage trees). Pass the coordinates to
-:meth:`quadsv.SpatialKernel.from_coordinates`, or a precomputed kernel /
-precision matrix directly to :meth:`quadsv.SpatialKernel.from_matrix`. If
+:meth:`quadsv.MatrixKernel.from_coordinates`, or a precomputed kernel /
+precision matrix directly to :meth:`quadsv.MatrixKernel.from_matrix`. If
 you have an :class:`~anndata.AnnData` and want to build the kernel from
-``.obsp``, reach for
-:meth:`quadsv.PatternDetector.build_kernel_from_obsp`.
+``.obsp``, call :meth:`DetectorIrregular.setup_data` with ``obsp_key=...``
+(optionally ``is_distance=True`` if the matrix stores distances rather than
+affinities).
 
 **Q: Does quadsv support 3D spatial coordinates?**
 
-Yes, but currently only for matrix-based kernels. Pass 3D coordinates to :meth:`quadsv.kernels.SpatialKernel.from_coordinates` as usual.
+Yes, but currently only for matrix-based kernels. Pass 3D coordinates to :meth:`quadsv.kernels.MatrixKernel.from_coordinates` as usual.
 
 
 Further help

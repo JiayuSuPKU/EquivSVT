@@ -34,17 +34,17 @@ __all__ = ["Detector"]
 
 
 class Detector(ABC):
-    """
+    r"""
     Abstract base for single-sample pattern detectors.
 
     Attributes
     ----------
-    kernel_method_ : str
+    kernel_method\_ : str
         Kernel method name (e.g. ``'matern'``, ``'car'``). Set at construction.
-    kernel_params_ : dict
+    kernel_params\_ : dict
         Resolved kernel parameters after backend-specific defaults are merged
         with user overrides. Set at construction.
-    kernel_ : :class:`~quadsv.Kernel` or None
+    kernel\_ : :class:`~quadsv.Kernel` or None
         Kernel object built in :meth:`setup_data`. ``None`` before data setup.
     n : int or None
         Effective number of observations after preprocessing. ``None`` before

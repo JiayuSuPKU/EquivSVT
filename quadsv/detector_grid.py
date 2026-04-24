@@ -90,7 +90,7 @@ def _qstat_worker_fft(
 
 
 class DetectorGrid(Detector):
-    """
+    r"""
     Detect spatial patterns on **regular grids** (SpatialData bins) with
     FFT-accelerated kernel tests.
 
@@ -120,9 +120,10 @@ class DetectorGrid(Detector):
         Input container set by :meth:`setup_data`.
     min_count : int or None
         Feature count threshold; set by :meth:`setup_data`.
-    kernel_ : :class:`~quadsv.FFTKernel` or None
+    kernel\_ : :class:`~quadsv.FFTKernel` or None
         Built in :meth:`setup_data` once the grid shape is known.
-    kernel_method_, kernel_params_, n : see :class:`Detector`.
+    kernel_method\_, kernel_params\_, n
+        See :class:`Detector`.
 
     Examples
     --------

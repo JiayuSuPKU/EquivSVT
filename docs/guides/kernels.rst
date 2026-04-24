@@ -48,8 +48,8 @@ Quick Start examples
 
 .. code-block:: python
 
-   from quadsv import SpatialKernel
-   kernel = SpatialKernel.from_coordinates(
+   from quadsv import MatrixKernel
+   kernel = MatrixKernel.from_coordinates(
        coords, method="car", k_neighbors=4, rho=0.9
    )
 
@@ -75,7 +75,7 @@ Quick Start examples
 
 .. code-block:: python
 
-   kernel = SpatialKernel.from_coordinates(
+   kernel = MatrixKernel.from_coordinates(
        coords, method="matern", bandwidth=1.0, nu=1.5
    )
 
@@ -94,7 +94,7 @@ Use median pairwise distance as starting point:
    
    dist = pdist(coords)
    bandwidth_init = np.median(dist)
-   kernel = SpatialKernel.from_coordinates(
+   kernel = MatrixKernel.from_coordinates(
        coords, method='gaussian', bandwidth=bandwidth_init
    )
 
@@ -108,7 +108,7 @@ Use median pairwise distance as starting point:
 
    rhos = [0.5, 0.7, 0.9, 0.95]
    for rho in rhos:
-       kernel = SpatialKernel.from_coordinates(
+       kernel = MatrixKernel.from_coordinates(
            coords, method='car', rho=rho
        )
        Q, pval = spatial_q_test(data, kernel)
@@ -123,7 +123,7 @@ Use median pairwise distance as starting point:
 
    ks = [5, 10, 15, 20, 30]
    for k in ks:
-       kernel = SpatialKernel.from_coordinates(
+       kernel = MatrixKernel.from_coordinates(
            coords, method='car', k_neighbors=k, rho=0.9
        )
        trace = kernel.trace()
@@ -134,17 +134,17 @@ Custom kernel design
 
 **Option 1: Build from custom adjacency or distance matrix**
 
-Use ``SpatialKernel.from_matrix()``:
+Use ``MatrixKernel.from_matrix()``:
 
 .. code-block:: python
 
    import numpy as np
-   from quadsv.kernels import SpatialKernel
+   from quadsv.kernels import MatrixKernel
    
    # From adjacency matrix
    W = ...  # (N, N) adjacency, e.g., from graph structure
    L = np.eye(W.shape[0]) - 0.9 * W  # CAR precision (K^-1)
-   kernel = SpatialKernel.from_matrix(L, is_inverse=True, method='precomputed')
+   kernel = MatrixKernel.from_matrix(L, is_precision=True, method='precomputed')
 
 
 **Option 2: Subclass ``Kernel`` for custom implementations**
@@ -165,7 +165,7 @@ The base :class:`quadsv.kernels.Kernel` provides default implementations of
    class MyKernel(Kernel):
        def _build_kernel(self):
            # Return a custom (N, N) SPD kernel matrix (or its inverse if you
-           # want the implicit/sparse path — see SpatialKernel for the
+           # want the implicit/sparse path — see MatrixKernel for the
            # precision-matrix pattern).
            return self.params["K"]
 
