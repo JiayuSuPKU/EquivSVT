@@ -297,7 +297,7 @@ def _rstat_worker_chunked(
 
 
 class DetectorIrregular(Detector):
-    """
+    r"""
     Detect spatial patterns on **irregular** samples (AnnData spots / cells).
 
     Univariate (Q-test) and bivariate (R-test) kernel-based spatial statistics.
@@ -337,14 +337,16 @@ class DetectorIrregular(Detector):
 
     Attributes
     ----------
-    backend_ : {``'matrix'``, ``'nufft'``}
+    backend\_ : {``'matrix'``, ``'nufft'``}
         Which backend was selected at construction.
     adata : :class:`anndata.AnnData` or None
         Input container set by :meth:`setup_data`.
     min_cells : int or None
         Minimum non-zero count per feature; set by :meth:`setup_data`.
-    kernel_ : :class:`~quadsv.Kernel` or None
-    kernel_method_, kernel_params_, n : see :class:`Detector`.
+    kernel\_ : :class:`~quadsv.Kernel` or None
+        The built kernel; populated by :meth:`setup_data`.
+    kernel_method\_, kernel_params\_, n
+        See :class:`Detector`.
 
     Examples
     --------
@@ -487,17 +489,95 @@ class DetectorIrregular(Detector):
     # ------------------------------------------------------------------
     # Auto-tuning helpers
     # ------------------------------------------------------------------
-    def _auto_chunk_size(self, budget_bytes: int = 2**28) -> int:
-        """Resolve ``chunk_size='auto'`` to a concrete integer.
+    @staticmethod
+    def _resolve_n_jobs(n_jobs: int | str) -> int:
+        """Turn a joblib-style ``n_jobs`` (``-1``, ``'auto'``, positive int)
+        into a concrete worker count."""
+        import os
 
-        Heuristic: each column in a worker batch costs roughly ``4 · n · 8`` bytes
-        (dense Z block + ``K @ Z`` scratch + incidentals). Target a per-batch
-        footprint of ``budget_bytes`` (default 256 MB) and clip the result to
-        ``[16, 512]``.
+        if isinstance(n_jobs, str):
+            if n_jobs != "auto":
+                raise ValueError(f"n_jobs must be 'auto', -1, or a positive int; got {n_jobs!r}.")
+            return os.cpu_count() or 1
+        n_jobs = int(n_jobs)
+        if n_jobs == -1:
+            return os.cpu_count() or 1
+        if n_jobs < 1:
+            raise ValueError(f"n_jobs must be >= 1 (or -1/'auto' for all cores); got {n_jobs}.")
+        return n_jobs
+
+    def _auto_chunk_size(
+        self,
+        n_jobs: int = 1,
+        budget_bytes: int = 2 * (1 << 30),
+    ) -> int:
+        """Resolve ``chunk_size='auto'`` against the active backend and
+        the number of parallel workers.
+
+        Splits a **single aggregate live-memory budget** across workers:
+
+        .. math::
+            \\text{chunk\\_size}
+            \\;=\\; \\operatorname{clip}\\!\\Bigl(
+                \\frac{\\text{budget\\_bytes} / n_{\\text{jobs}}}{\\text{per\\_feat}},\\;
+                8,\\; 1024\\Bigr)
+
+        ``per_feat`` is the backend-specific per-feature transient bytes
+        inside one :func:`~quadsv.spatial_q_test` /
+        :func:`~quadsv.spatial_r_test` call:
+
+        - **MatrixKernel dense or sparse:** ``~16 · n`` bytes (RHS + output).
+        - **MatrixKernel precision-stored (CAR, n ≳ 8k):** ``~24 · n``
+          bytes — LU triangular-solve workspace on top of RHS + output.
+        - **NUFFTKernel:** ``~16 · ny · nx`` (complex k-grid) + ``~8 · n``
+          (real coord-space RHS). The k-grid typically oversamples by
+          ``n' ≈ 2n``, so per-feat ≈ ``40–48 · n`` — notably heavier
+          than the Matrix path.
+
+        **joblib awareness.** Every :meth:`compute_qstat` /
+        :meth:`compute_rstat` path in this class runs work batches under
+        ``joblib.Parallel``. Both thread- and process-backed workers
+        allocate their own live batch buffer, so the total peak RAM
+        roughly equals ``n_jobs × chunk_size × per_feat`` — dividing the
+        budget by ``n_jobs`` here keeps that product bounded regardless
+        of the worker count. Kernel-pickling overhead (an extra copy
+        per process on the MatrixKernel Q-test path) is *not* modelled
+        here; it's a fixed one-time cost and typically much smaller than
+        the aggregated batch memory at the ``n`` where chunking matters.
+
+        Parameters
+        ----------
+        n_jobs : int, default 1
+            Number of parallel workers the caller plans to use. Callers
+            should pre-resolve ``-1`` / ``'auto'`` via
+            :meth:`_resolve_n_jobs` so this value reflects the actual
+            worker count.
+        budget_bytes : int, default 2 GiB
+            Aggregate live-memory cap to target across *all* workers.
+
+        Returns
+        -------
+        int
+            Batch size to use inside :func:`~quadsv.spatial_q_test` /
+            :func:`~quadsv.spatial_r_test`, clipped to ``[8, 1024]``.
         """
+        from quadsv.nufft import NUFFTKernel
+
         n = self.n or 1
-        per_col = max(1, 4 * n * 8)
-        return int(np.clip(budget_bytes // per_col, 16, 512))
+        if self.kernel_ is None:
+            per_feat = 16 * n  # no kernel yet — use MatrixKernel baseline.
+        elif isinstance(self.kernel_, NUFFTKernel):
+            ny, nx = self.kernel_.grid_shape
+            per_feat = max(1, 16 * ny * nx + 8 * n)
+        else:
+            # MatrixKernel family. Precision-stored kernels carry an
+            # LU-solve workspace on top of the RHS+output buffer.
+            stores_precision = bool(getattr(self.kernel_, "stores_precision", False))
+            per_feat = (24 if stores_precision else 16) * n
+
+        n_workers = max(1, int(n_jobs))
+        per_worker_budget = max(per_feat, budget_bytes // n_workers)
+        return int(np.clip(per_worker_budget // per_feat, 8, 1024))
 
     def _build_kernel_from_obsm(self, obsm_key: str = "spatial") -> None:
         """Build the kernel over ``adata.obsm[obsm_key]`` using the
@@ -859,12 +939,14 @@ class DetectorIrregular(Detector):
         # 1. Ensure Kernel Exists
         self._require_setup()
 
-        # Resolve chunk_size='auto' once up front so downstream paths (incl.
-        # NUFFT dispatch) see a concrete integer.
+        # Resolve n_jobs first so chunk_size='auto' can divide the live-
+        # memory budget across the actual worker count (see
+        # _auto_chunk_size).
+        n_jobs = self._resolve_n_jobs(n_jobs)
         if isinstance(chunk_size, str):
             if chunk_size != "auto":
                 raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
-            chunk_size = self._auto_chunk_size()
+            chunk_size = self._auto_chunk_size(n_jobs=n_jobs)
 
         # NUFFT backend takes a different code path (no dense K, different
         # null rescaling). Dispatch early and delegate.
@@ -891,10 +973,6 @@ class DetectorIrregular(Detector):
 
         # 4. Parallel Execution
         n_feats = len(names)
-        if n_jobs == -1:
-            import os
-
-            n_jobs = os.cpu_count() or 1
 
         indices = np.arange(n_feats)
         chunks = np.array_split(indices, max(n_jobs * 4, 1))
@@ -1025,10 +1103,11 @@ class DetectorIrregular(Detector):
         """
         self._require_setup()
 
+        n_jobs = self._resolve_n_jobs(n_jobs)
         if isinstance(chunk_size, str):
             if chunk_size != "auto":
                 raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
-            chunk_size = self._auto_chunk_size()
+            chunk_size = self._auto_chunk_size(n_jobs=n_jobs)
 
         if self.backend_ == "nufft":
             return self._compute_rstat_nufft(
@@ -1095,12 +1174,8 @@ class DetectorIrregular(Detector):
         if len(valid_x_indices) == 0 or len(valid_y_indices) == 0:
             raise ValueError("No valid features found after filtering.")
 
-        # 5. Parallel Execution: Process each Y chunk
-        if n_jobs == -1:
-            import os
-
-            n_jobs = os.cpu_count() or 1
-
+        # 5. Parallel Execution: Process each Y chunk.
+        # n_jobs is pre-resolved at the compute_rstat entry point.
         logger.info(
             "Testing %d x %d pairs using %d cores with chunk_size=%d...",
             len(valid_x_indices),
