@@ -511,73 +511,44 @@ class DetectorIrregular(Detector):
         n_jobs: int = 1,
         budget_bytes: int = 2 * (1 << 30),
     ) -> int:
-        """Resolve ``chunk_size='auto'`` against the active backend and
-        the number of parallel workers.
+        """Thin wrapper around :func:`quadsv.statistics.auto_chunk_size`.
 
-        Splits a **single aggregate live-memory budget** across workers:
-
-        .. math::
-            \\text{chunk\\_size}
-            \\;=\\; \\operatorname{clip}\\!\\Bigl(
-                \\frac{\\text{budget\\_bytes} / n_{\\text{jobs}}}{\\text{per\\_feat}},\\;
-                8,\\; 1024\\Bigr)
-
-        ``per_feat`` is the backend-specific per-feature transient bytes
-        inside one :func:`~quadsv.spatial_q_test` /
-        :func:`~quadsv.spatial_r_test` call:
-
-        - **MatrixKernel dense or sparse:** ``~16 · n`` bytes (RHS + output).
-        - **MatrixKernel precision-stored (CAR, n ≳ 8k):** ``~24 · n``
-          bytes — LU triangular-solve workspace on top of RHS + output.
-        - **NUFFTKernel:** ``~16 · ny · nx`` (complex k-grid) + ``~8 · n``
-          (real coord-space RHS). The k-grid typically oversamples by
-          ``n' ≈ 2n``, so per-feat ≈ ``40–48 · n`` — notably heavier
-          than the Matrix path.
-
-        **joblib awareness.** Every :meth:`compute_qstat` /
-        :meth:`compute_rstat` path in this class runs work batches under
-        ``joblib.Parallel``. Both thread- and process-backed workers
-        allocate their own live batch buffer, so the total peak RAM
-        roughly equals ``n_jobs × chunk_size × per_feat`` — dividing the
-        budget by ``n_jobs`` here keeps that product bounded regardless
-        of the worker count. Kernel-pickling overhead (an extra copy
-        per process on the MatrixKernel Q-test path) is *not* modelled
-        here; it's a fixed one-time cost and typically much smaller than
-        the aggregated batch memory at the ``n`` where chunking matters.
+        Delegates to the shared helper so the chunk-size policy stays
+        in one place across :class:`DetectorIrregular`,
+        :class:`DetectorGrid`, and :func:`~quadsv.spatial_q_test` /
+        :func:`~quadsv.spatial_r_test`. See the helper's docstring for
+        the cache sweet-spot caps and per-feature memory model.
 
         Parameters
         ----------
         n_jobs : int, default 1
             Number of parallel workers the caller plans to use. Callers
             should pre-resolve ``-1`` / ``'auto'`` via
-            :meth:`_resolve_n_jobs` so this value reflects the actual
-            worker count.
+            :meth:`_resolve_n_jobs`.
         budget_bytes : int, default 2 GiB
-            Aggregate live-memory cap to target across *all* workers.
+            Aggregate live-memory cap across *all* workers.
 
         Returns
         -------
         int
             Batch size to use inside :func:`~quadsv.spatial_q_test` /
-            :func:`~quadsv.spatial_r_test`, clipped to ``[8, 1024]``.
+            :func:`~quadsv.spatial_r_test`.
         """
-        from quadsv.nufft import NUFFTKernel
+        from quadsv.statistics import auto_chunk_size
 
-        n = self.n or 1
         if self.kernel_ is None:
-            per_feat = 16 * n  # no kernel yet — use MatrixKernel baseline.
-        elif isinstance(self.kernel_, NUFFTKernel):
-            ny, nx = self.kernel_.grid_shape
-            per_feat = max(1, 16 * ny * nx + 8 * n)
-        else:
-            # MatrixKernel family. Precision-stored kernels carry an
-            # LU-solve workspace on top of the RHS+output buffer.
-            stores_precision = bool(getattr(self.kernel_, "stores_precision", False))
-            per_feat = (24 if stores_precision else 16) * n
+            # Kernel not built yet — fall back to a conservative MatrixKernel
+            # default. Used only by very early setup paths; normal flows call
+            # this after ``setup_data``.
+            n = self.n or 1
+            per_feat = 16 * n
+            chunk_cap = 16
+            n_workers = max(1, int(n_jobs))
+            per_worker_budget = max(per_feat, budget_bytes // n_workers)
+            mem_cap = int(per_worker_budget // per_feat)
+            return int(np.clip(min(mem_cap, chunk_cap), 8, chunk_cap))
 
-        n_workers = max(1, int(n_jobs))
-        per_worker_budget = max(per_feat, budget_bytes // n_workers)
-        return int(np.clip(per_worker_budget // per_feat, 8, 1024))
+        return auto_chunk_size(self.kernel_, n_jobs=n_jobs, budget_bytes=budget_bytes)
 
     def _build_kernel_from_obsm(self, obsm_key: str = "spatial") -> None:
         """Build the kernel over ``adata.obsm[obsm_key]`` using the

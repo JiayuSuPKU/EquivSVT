@@ -320,16 +320,17 @@ class DetectorGrid(Detector):
     # ------------------------------------------------------------------
     # Auto-tuning helpers
     # ------------------------------------------------------------------
-    def _auto_chunk_size(self, budget_bytes: int = 2**28) -> int:
-        """Resolve ``chunk_size='auto'`` against the grid size.
+    def _auto_chunk_size(self, budget_bytes: int = 2 * (1 << 30)) -> int:
+        """Thin wrapper around :func:`quadsv.statistics.auto_chunk_size`.
 
-        Memory per batched feature: ``ny · nx · 24 B`` (float64 raster + complex
-        FFT scratch). Targets ``budget_bytes`` (default 256 MB) per worker batch,
-        clipped to ``[16, 1024]``.
+        Delegates to the shared helper so the FFT chunk-size policy
+        (cache sweet spot of 32, per-feature ``~24·n`` bytes) is kept
+        in one place — see :func:`~quadsv.statistics.auto_chunk_size`
+        for the full model.
         """
-        ny, nx = self.kernel_.ny, self.kernel_.nx
-        per_feat = max(1, ny * nx * 24)
-        return int(np.clip(budget_bytes // per_feat, 16, 1024))
+        from quadsv.statistics import auto_chunk_size
+
+        return auto_chunk_size(self.kernel_, budget_bytes=budget_bytes)
 
     def _auto_schedule(
         self, n_batches: int, n_jobs: int | str, workers: int | str | None

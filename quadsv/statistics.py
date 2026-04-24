@@ -7,9 +7,108 @@ from tqdm import tqdm
 
 from quadsv.kernels import Kernel
 
-__all__ = ["liu_sf", "compute_null_params", "spatial_q_test", "spatial_r_test"]
+__all__ = [
+    "auto_chunk_size",
+    "compute_null_params",
+    "liu_sf",
+    "spatial_q_test",
+    "spatial_r_test",
+]
 
 _DELTA = 1e-10
+
+
+# Default live-memory budget for :func:`auto_chunk_size` — 2 GiB. On an
+# 8-core host with joblib parallelism this keeps aggregate peak RAM
+# around 16 GiB (2 GiB × 8), comfortable on most modern laptops.
+_DEFAULT_CHUNK_BUDGET = 2 * (1 << 30)
+
+
+def auto_chunk_size(
+    kernel: Kernel,
+    n_jobs: int = 1,
+    budget_bytes: int = _DEFAULT_CHUNK_BUDGET,
+) -> int:
+    """Pick a per-backend-optimal ``chunk_size`` for the Q / R test.
+
+    The returned value is used by :func:`spatial_q_test` /
+    :func:`spatial_r_test` (and by :meth:`DetectorGrid.compute_qstat` /
+    :meth:`DetectorIrregular.compute_qstat`) to split a multi-feature
+    batch into chunks. It is the smaller of two caps:
+
+    1. **Cache sweet-spot cap** — empirical sweep of per-feature time
+       vs ``chunk`` at ``n ∈ {30k, 100k, 300k, 1M}``:
+
+       =========================  ==============
+       Backend                     chunk cap
+       =========================  ==============
+       :class:`~quadsv.FFTKernel`  32
+       :class:`~quadsv.NUFFTKernel` 64
+       MatrixKernel (any sub-type) 16 (n < 200k)
+                                   8  (n ≥ 200k)
+       =========================  ==============
+
+       Matrix backends don't vectorise over RHS columns (scipy CSR SpMV,
+       SuperLU triangular solve), and the chunk size cap is determined empirically
+       for best per-feature speed under the given memory constraints.
+       FFT / NUFFT *do* benefit from BLAS / ``n_transf`` batching, but their
+       complex workspace spills L3 past the listed cap (15× slowdown
+       for FFT at chunk=512, 1.9× for NUFFT at chunk=256).
+
+    2. **Memory cap** — ``budget_bytes / n_jobs // per_feat``, where
+       ``per_feat`` is the backend-specific transient bytes per
+       feature:
+
+       - MatrixKernel dense / sparse: ``16 · n``
+       - MatrixKernel precision-stored CAR: ``24 · n``
+       - FFTKernel: ``24 · n``
+       - NUFFTKernel: ``16 · ny·nx + 8 · n``
+
+    Parameters
+    ----------
+    kernel : Kernel
+        The backend kernel the chunk will operate on.
+    n_jobs : int, default 1
+        Number of parallel workers the caller plans to use. The
+        ``budget_bytes`` is divided by ``n_jobs`` so aggregate live
+        memory stays bounded.
+    budget_bytes : int, default 2 GiB
+        Aggregate live-memory cap across *all* workers.
+
+    Returns
+    -------
+    int
+        A ``chunk_size`` in ``[8, chunk_cap]``. The lower bound of 8
+        ensures measurements stay meaningful even when a single feature
+        consumes most of the per-worker budget.
+    """
+    # Lazy imports to avoid circular dependency with the FFT / NUFFT modules.
+    from quadsv.fft import FFTKernel
+    from quadsv.nufft import NUFFTKernel
+
+    if isinstance(kernel, FFTKernel):
+        n = kernel.n
+        per_feat = max(1, 24 * n)
+        chunk_cap = 32
+    elif isinstance(kernel, NUFFTKernel):
+        ny, nx = kernel.grid_shape
+        n = kernel.n
+        per_feat = max(1, 16 * ny * nx + 8 * n)
+        chunk_cap = 64
+    else:
+        # MatrixKernel family. Precision-stored kernels carry an extra
+        # LU-solve workspace on top of the RHS + output buffer.
+        n = int(getattr(kernel, "n", 0)) or 1
+        stores_precision = bool(getattr(kernel, "stores_precision", False))
+        per_feat = (24 if stores_precision else 16) * n
+        # Sparse sweet spot shifts from 16 → 8 once the CSR kernel or
+        # LU factor itself fills L3 (~200k for k≈4 nbrs, rho≈0.9).
+        chunk_cap = 16 if n < 200_000 else 8
+
+    n_workers = max(1, int(n_jobs))
+    per_worker_budget = max(per_feat, budget_bytes // n_workers)
+    mem_cap = int(per_worker_budget // per_feat)
+    return int(np.clip(min(mem_cap, chunk_cap), 8, chunk_cap))
 
 
 def _liu_prepare_from_cumulants(
@@ -566,115 +665,21 @@ def compute_null_params(
     return params
 
 
-def spatial_q_test(  # noqa: C901
+def _q_test_matrix(  # noqa: C901
     Xn: np.ndarray | sp.spmatrix,
     kernel: Kernel,
     null_params: dict | None = None,
     return_pval: bool = True,
     is_standardized: bool = False,
-    chunk_size: int = -1,
-    show_progress: bool = False,
 ) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
+    """Single-batch Q-test on a MatrixKernel (no chunking).
+
+    Parallel to :func:`quadsv.fft._q_test_fft` /
+    :func:`quadsv.nufft._q_test_nufft`: takes whatever batch size is
+    handed in and processes it in one call. The chunking loop lives in
+    :func:`spatial_q_test`, which dispatches here per chunk.
     """
-    Univariate spatial Q-test for detecting spatial variability.
-
-    Tests whether a spatial variable exhibits significant clustering or dispersion
-    using the specified kernel weighting scheme. Supports both single features and
-    batch processing with sparse matrices.
-
-    Parameters
-    ----------
-    Xn : np.ndarray or scipy.sparse matrix
-        Input data array of shape (n,) for single feature or (n, M) for M features.
-        Can be dense numpy array or sparse matrix (CSC/CSR format recommended).
-        Should be standardized before calling unless is_standardized=True.
-    kernel : Kernel
-        Pre-constructed :class:`~quadsv.Kernel` (``MatrixKernel`` / ``FFTKernel`` /
-        ``NUFFTKernel``) or a raw dense / sparse kernel matrix.
-    null_params : dict, optional
-        Pre-computed null distribution parameters from :func:`compute_null_params`.
-        If None, computed on-the-fly using the ``'welch'`` method (only accurate when
-        the kernel is positive semi-definite).
-    return_pval : bool, default True
-        If True, returns (Q, pval) tuple; if False, returns Q only.
-    is_standardized : bool, default False
-        If True, skips Z-score standardization internally (assumes input is N(0,1)).
-    chunk_size : int, default -1
-        Number of features to process in each chunk. If -1, processes all features at once.
-        Useful for large feature sets to reduce memory usage. Must be <= M.
-    show_progress : bool, default False
-        If True, displays a progress bar during chunk processing.
-
-    Returns
-    -------
-    Q : float or np.ndarray
-        Test statistic value(s). Shape (M,) if input was 2D, scalar if input was 1D.
-    pval : float or np.ndarray, optional
-        Tail probability under null hypothesis. Only returned if return_pval=True.
-        Same shape as Q.
-
-    Raises
-    ------
-    ValueError
-        If kernel dimensions don't match data size or if params is None and kernel is not a Kernel object.
-
-    Notes
-    -----
-    Under H₀: data is spatially independent.
-    Under H₁: mean-shift present.
-
-    The test statistic ``Q = xᵀ K x`` where ``K`` is the kernel matrix
-    follows approximately a chi-squared mixture distribution:
-
-    .. math::
-       Q \\sim \\sum_{i=1}^{n} \\lambda_i \\chi^2_{1}
-
-    where :math:`\\lambda_i` are the kernel eigenvalues.
-
-    By default, the null is approximated with Welch-Satterthwaite moment matching.
-    To use a different approximation, either pass
-    ``null_params={'method': 'liu'}`` (this function will then call
-    :func:`compute_null_params` internally with that method) or pass the fully
-    pre-computed dict from ``compute_null_params(kernel, method='liu')``.
-
-    Examples
-    --------
-    >>> coords = np.random.randn(100, 2)
-    >>> kernel = MatrixKernel.from_coordinates(coords, method='gaussian')
-    >>> data = np.random.randn(100)
-    >>> Q, pval = spatial_q_test(data, kernel)
-    >>> # Sparse matrix example
-    >>> from scipy.sparse import csr_matrix
-    >>> sparse_data = csr_matrix(np.random.randn(100, 1000))
-    >>> Q, pval = spatial_q_test(sparse_data, kernel, chunk_size=100, show_progress=True)
-    """
-    # Dispatch to FFT / NUFFT helpers when the kernel is one of those backends.
-    # Liu's approximation (or normal for Moran) is hard-coded there — FFT/NUFFT
-    # spectra are cheap, so there is no Welch option to select.
-    # Lazy imports avoid a circular import with ``quadsv.fft`` / ``quadsv.nufft``.
-    from quadsv.fft import FFTKernel, _q_test_fft
-    from quadsv.nufft import NUFFTKernel, _q_test_nufft
-
-    if isinstance(kernel, FFTKernel):
-        return _q_test_fft(
-            Xn,
-            kernel,
-            null_params=null_params,
-            return_pval=return_pval,
-            is_standardized=is_standardized,
-        )
-    if isinstance(kernel, NUFFTKernel):
-        return _q_test_nufft(
-            Xn,
-            kernel,
-            null_params=null_params,
-            return_pval=return_pval,
-            is_standardized=is_standardized,
-        )
-
-    # Matrix path (MatrixKernel or raw dense / sparse kernel matrix).
     is_sparse = sp.issparse(Xn)
-
     if is_sparse:
         n, M = Xn.shape if Xn.ndim == 2 else (Xn.shape[0], 1)
         if Xn.ndim == 1 or M == 1:
@@ -686,113 +691,64 @@ def spatial_q_test(  # noqa: C901
             Xn = Xn.reshape(-1, 1)
         n, M = Xn.shape
 
-    if chunk_size == -1 or chunk_size >= M:
-        chunk_size = M
-    n_chunks = int(np.ceil(M / chunk_size))
-
-    iterator = range(n_chunks)
-    if show_progress and n_chunks > 1:
-        iterator = tqdm(
-            iterator,
-            desc="Q-test chunks",
-            total=n_chunks,
-            bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
-        )
-
     # Fast path: sparse Xn + unstandardized + kernel exposes xtKx_standardized.
-    # Uses the (K·1, 1^T K 1) expansion so sparse Xn never needs densification.
-    use_sparse_fastpath = is_sparse and not is_standardized and hasattr(kernel, "xtKx_standardized")
-
-    Q_results = []
-    for chunk_idx in iterator:
-        start_idx = chunk_idx * chunk_size
-        end_idx = min(start_idx + chunk_size, M)
-        Xn_chunk = Xn[:, start_idx:end_idx]
-
-        if use_sparse_fastpath:
-            # Compute means / stds from sparse directly (ddof=1 to match below).
-            col_sum = np.asarray(Xn_chunk.sum(axis=0)).ravel()
-            means = col_sum / n
-            sq_sum = np.asarray(Xn_chunk.multiply(Xn_chunk).sum(axis=0)).ravel()
-            var = (sq_sum - n * means**2) / max(n - 1, 1)
-            var[var < 0] = 0.0
-            stds = np.sqrt(var)
-            Q_chunk = kernel.xtKx_standardized(Xn_chunk, means, stds)
+    # Uses the (K·1, 1ᵀK1) expansion so sparse Xn never needs densification.
+    if is_sparse and not is_standardized and hasattr(kernel, "xtKx_standardized"):
+        col_sum = np.asarray(Xn.sum(axis=0)).ravel()
+        means = col_sum / n
+        sq_sum = np.asarray(Xn.multiply(Xn).sum(axis=0)).ravel()
+        var = (sq_sum - n * means**2) / max(n - 1, 1)
+        var[var < 0] = 0.0
+        stds = np.sqrt(var)
+        Q = kernel.xtKx_standardized(Xn, means, stds)
+    else:
+        if is_standardized:
+            z = Xn
         else:
-            if is_standardized:
-                z = Xn_chunk
-            else:
-                if is_sparse:
-                    Xn_chunk = Xn_chunk.toarray()
-                means = np.mean(Xn_chunk, axis=0)
-                stds = np.std(Xn_chunk, axis=0, ddof=1)
-                valid_mask = stds > 1e-12
-                z = np.zeros_like(Xn_chunk)
-                if np.any(valid_mask):
-                    z[:, valid_mask] = (Xn_chunk[:, valid_mask] - means[valid_mask]) / stds[
-                        valid_mask
-                    ]
+            if is_sparse:
+                Xn = Xn.toarray()
+            means = np.mean(Xn, axis=0)
+            stds = np.std(Xn, axis=0, ddof=1)
+            valid_mask = stds > 1e-12
+            z = np.zeros_like(Xn)
+            if np.any(valid_mask):
+                z[:, valid_mask] = (Xn[:, valid_mask] - means[valid_mask]) / stds[valid_mask]
+        if hasattr(kernel, "xtKx"):
+            Q = kernel.xtKx(z)
+        else:
+            # Fallback for raw matrices.
+            Kz = kernel.dot(z) if sp.issparse(kernel) else np.dot(kernel, z)
+            Q = np.sum(z * Kz, axis=0)
 
-            if hasattr(kernel, "xtKx"):
-                Q_chunk = kernel.xtKx(z)
-            else:
-                # Fallback for raw matrices.
-                Kz = kernel.dot(z) if sp.issparse(kernel) else np.dot(kernel, z)
-                Q_chunk = np.sum(z * Kz, axis=0)
-
-        Q_results.append(Q_chunk)
-
-    # Concatenate results
-    Q = np.concatenate([np.atleast_1d(q) for q in Q_results])
-
-    # Unwrap if M=1
+    Q = np.atleast_1d(np.asarray(Q, dtype=float))
     if M == 1 and Q.size == 1:
         Q = Q.item()
 
     if not return_pval:
         return Q
 
-    # 3. Compute P-value (Vectorized)
+    # P-value from cached null_params (pre-resolved by spatial_q_test).
     kernel_method = getattr(kernel, "method", None)
-    if null_params is None:
-        if not hasattr(kernel, "square_trace"):
-            raise ValueError("If params is None, kernel must be a Kernel object.")
-        # Moran is indefinite — Welch/Liu degenerate, auto-pick CLT.
-        default_method = "clt" if kernel_method == "moran" else "welch"
-        null_params = compute_null_params(kernel, method=default_method)
-        null_approx_method = default_method
-    else:
-        null_approx_method = null_params.get("method", "welch")
-        # Ensure params exist
-        if len(null_params) == 1 and hasattr(kernel, "square_trace"):
-            null_params.update(compute_null_params(kernel, method=null_approx_method))
+    null_approx_method = null_params.get("method", "welch") if null_params else "welch"
     if kernel_method == "moran" and null_approx_method != "clt":
         raise ValueError(
             f"Moran's I kernel is indefinite; only null_method='clt' is "
             f"supported for the Q-test. Got method={null_approx_method!r}."
         )
 
-    # P-value logic
     if null_approx_method == "clt":
         mu_Q = null_params["mean_Q"]
         var_Q = null_params["var_Q"]
         if var_Q > 0:
-            z_score = (Q - mu_Q) / np.sqrt(var_Q)
+            z_score = (np.atleast_1d(Q) - mu_Q) / np.sqrt(var_Q)
             pval = chi2.sf(z_score**2, df=1)
         else:
-            pval = np.ones_like(Q, dtype=float)
-
+            pval = np.ones(max(np.atleast_1d(Q).size, 1), dtype=float)
     elif null_approx_method == "welch":
         g = null_params["scale_g"]
         d = null_params["df_h"]
-        pval = chi2.sf(Q / g, df=d)
-
+        pval = chi2.sf(np.atleast_1d(Q) / g, df=d)
     elif null_approx_method == "liu":
-        # Read the cached Liu coefficients (O(1) per Q). If a caller
-        # hand-built ``null_params`` with raw ``cumulants`` instead, derive
-        # the coef on the fly and pass ``n=kernel.n`` so the Dirichlet(1/2)
-        # variance correction fires — keeps calibration on broad-spectrum
-        # PSD kernels.
         coef = null_params.get("liu_coef")
         if coef is None:
             if "cumulants" not in null_params:
@@ -803,103 +759,251 @@ def spatial_q_test(  # noqa: C901
                 )
             n_kernel = int(getattr(kernel, "n", 0)) or None
             coef = _liu_prepare_from_cumulants(null_params["cumulants"], n=n_kernel)
-        pval = _liu_apply(Q, coef)
+        pval = _liu_apply(np.atleast_1d(Q), coef)
     else:
-        pval = np.ones_like(Q, dtype=float)
+        pval = np.ones(max(np.atleast_1d(Q).size, 1), dtype=float)
 
-    # Unwrap if M=1
+    pval = np.atleast_1d(pval)
     if M == 1 and pval.size == 1:
         pval = pval.item()
-
     return Q, pval
 
 
-def spatial_r_test(  # noqa: C901
+def _chunk_last_axis(X, start: int, end: int):
+    """Slice ``X`` along its trailing (feature) axis. Works on numpy
+    arrays and ``scipy.sparse`` matrices alike."""
+    if sp.issparse(X) or X.ndim == 2:
+        return X[:, start:end]
+    return X[:, :, start:end]
+
+
+def _feature_count(X, is_fft: bool) -> int:
+    """Return the number of features ``M`` in the trailing axis of ``X``.
+
+    FFTKernel input shape is ``(ny, nx)`` / ``(ny, nx, M)``; everything
+    else is ``(n,)`` / ``(n, M)``.
+    """
+    if is_fft:
+        return X.shape[2] if X.ndim == 3 else 1
+    if sp.issparse(X):
+        return X.shape[1] if X.ndim == 2 else 1
+    return X.shape[1] if X.ndim == 2 else 1
+
+
+def _resolve_chunk_size(
+    chunk_size: int | str,
+    kernel: Kernel,
+    M: int,
+    n_jobs: int = 1,
+) -> int:
+    """Turn ``chunk_size='auto' | -1 | int`` into a concrete batch size.
+
+    ``'auto'`` → :func:`auto_chunk_size`. ``-1`` or ``>= M`` → ``M``
+    (no chunking). Everything else is coerced to a positive int.
+    """
+    if isinstance(chunk_size, str):
+        if chunk_size != "auto":
+            raise ValueError(f"chunk_size must be 'auto', -1, or int, got {chunk_size!r}.")
+        resolved = auto_chunk_size(kernel, n_jobs=n_jobs)
+    elif int(chunk_size) == -1:
+        resolved = M
+    else:
+        resolved = max(1, int(chunk_size))
+    return max(1, min(resolved, M))
+
+
+def spatial_q_test(  # noqa: C901
+    Xn: np.ndarray | sp.spmatrix,
+    kernel: Kernel,
+    null_params: dict | None = None,
+    return_pval: bool = True,
+    is_standardized: bool = False,
+    chunk_size: int | str = "auto",
+    show_progress: bool = False,
+) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
+    """
+    Univariate spatial Q-test for detecting spatial variability.
+
+    Top-level chunking wrapper — splits the feature batch along the
+    trailing axis into blocks of ``chunk_size`` features, dispatches
+    each block to the backend-specific per-chunk helper
+    (:func:`quadsv.fft._q_test_fft`,
+    :func:`quadsv.nufft._q_test_nufft`, or :func:`_q_test_matrix`), and
+    concatenates the results. The per-chunk helpers do **not** handle
+    chunking themselves.
+
+    Parameters
+    ----------
+    Xn : np.ndarray or scipy.sparse matrix
+        Input data of shape ``(n,)`` / ``(n, M)`` for MatrixKernel and
+        NUFFTKernel, or ``(ny, nx)`` / ``(ny, nx, M)`` for FFTKernel.
+        Can be dense numpy array or sparse matrix (CSC/CSR recommended)
+        for MatrixKernel; FFT/NUFFT paths require dense input.
+    kernel : Kernel
+        Pre-constructed :class:`~quadsv.Kernel` (``MatrixKernel`` /
+        ``FFTKernel`` / ``NUFFTKernel``) or a raw dense / sparse kernel
+        matrix.
+    null_params : dict, optional
+        Pre-computed null distribution parameters from
+        :func:`compute_null_params`. Resolved once at the top level if
+        ``None`` and shared across chunks (no redundant recomputation).
+    return_pval : bool, default True
+        If True, returns ``(Q, pval)``; else returns ``Q`` only.
+    is_standardized : bool, default False
+        If True, skips Z-score standardization internally.
+    chunk_size : int or ``'auto'``, default ``'auto'``
+        Number of features processed per per-chunk dispatch call.
+        ``'auto'`` defers to :func:`auto_chunk_size` (backend-specific
+        cache sweet spot under a 2 GiB live-memory budget); ``-1``
+        processes the full batch in a single call. For a cross-backend
+        cost model see :doc:`/guides/scaling`.
+    show_progress : bool, default False
+        If True, displays a tqdm bar over chunks (only when ``M > chunk_size``).
+
+    Returns
+    -------
+    Q : float or np.ndarray
+        Test statistic value(s). Shape ``(M,)`` for 2-D / 3-D inputs,
+        scalar for 1-D.
+    pval : float or np.ndarray, optional
+        Tail probability under null hypothesis; returned only if
+        ``return_pval=True``. Same shape as Q.
+
+    Notes
+    -----
+    Under H₀: data is spatially independent. Under H₁: mean shift
+    present. The test statistic ``Q = xᵀ K x`` approximates a
+    chi-squared mixture under the null; see :doc:`/guides/theory` and
+    :doc:`/guides/scaling`.
+
+    Examples
+    --------
+    >>> coords = np.random.randn(100, 2)
+    >>> kernel = MatrixKernel.from_coordinates(coords, method='gaussian')
+    >>> data = np.random.randn(100)
+    >>> Q, pval = spatial_q_test(data, kernel)
+    >>> # Sparse-matrix batch of features (auto-chunked):
+    >>> from scipy.sparse import csr_matrix
+    >>> sparse_data = csr_matrix(np.random.randn(100, 1000))
+    >>> Q, pval = spatial_q_test(sparse_data, kernel, show_progress=True)
+    """
+    # Lazy imports — avoid circular dependency with the FFT / NUFFT modules.
+    from quadsv.fft import FFTKernel, _q_test_fft
+    from quadsv.nufft import NUFFTKernel, _q_test_nufft
+
+    is_fft = isinstance(kernel, FFTKernel)
+    is_nufft = isinstance(kernel, NUFFTKernel)
+    is_matrix_path = not (is_fft or is_nufft)
+
+    # Resolve null_params once (cached across chunks).
+    kernel_method = getattr(kernel, "method", None)
+    if (
+        return_pval
+        and null_params is not None
+        and "method" in null_params
+        and len(null_params) == 1
+    ):
+        # User passed only {'method': ...} — flesh out the full param set.
+        null_params = {**null_params, **compute_null_params(kernel, method=null_params["method"])}
+    elif return_pval and null_params is None and is_matrix_path:
+        if not hasattr(kernel, "square_trace"):
+            # A raw dense / sparse kernel matrix can't produce null moments
+            # on its own — the caller must supply ``null_params`` or wrap
+            # the matrix in a :class:`~quadsv.MatrixKernel`.
+            raise ValueError(
+                "spatial_q_test received a raw kernel matrix without "
+                "null_params; pass a Kernel object or provide "
+                "null_params=compute_null_params(kernel)."
+            )
+        default_method = "clt" if kernel_method == "moran" else "welch"
+        null_params = compute_null_params(kernel, method=default_method)
+
+    # Determine M on the trailing axis.
+    M = _feature_count(Xn, is_fft=is_fft)
+    resolved_chunk = _resolve_chunk_size(chunk_size, kernel, M)
+
+    if is_fft:
+
+        def _dispatch(X):
+            return _q_test_fft(
+                X,
+                kernel,
+                null_params=null_params,
+                return_pval=return_pval,
+                is_standardized=is_standardized,
+            )
+
+    elif is_nufft:
+
+        def _dispatch(X):
+            return _q_test_nufft(
+                X,
+                kernel,
+                null_params=null_params,
+                return_pval=return_pval,
+                is_standardized=is_standardized,
+            )
+
+    else:
+
+        def _dispatch(X):
+            return _q_test_matrix(
+                X,
+                kernel,
+                null_params=null_params,
+                return_pval=return_pval,
+                is_standardized=is_standardized,
+            )
+
+    # Single-batch shortcut.
+    if resolved_chunk >= M:
+        return _dispatch(Xn)
+
+    # Chunk loop.
+    starts = list(range(0, M, resolved_chunk))
+    iterator = starts
+    if show_progress and len(starts) > 1:
+        iterator = tqdm(
+            starts,
+            desc="Q-test chunks",
+            total=len(starts),
+            bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
+        )
+
+    Q_parts: list[np.ndarray] = []
+    P_parts: list[np.ndarray] = []
+    for start in iterator:
+        end = min(start + resolved_chunk, M)
+        block = _chunk_last_axis(Xn, start, end)
+        result = _dispatch(block)
+        if return_pval:
+            Q_b, P_b = result
+            Q_parts.append(np.atleast_1d(Q_b))
+            P_parts.append(np.atleast_1d(P_b))
+        else:
+            Q_parts.append(np.atleast_1d(result))
+
+    Q = np.concatenate(Q_parts)
+    if return_pval:
+        return Q, np.concatenate(P_parts)
+    return Q
+
+
+def _r_test_matrix(  # noqa: C901
     Xn: np.ndarray | sp.spmatrix,
     Yn: np.ndarray | sp.spmatrix,
     kernel: Kernel,
     null_params: dict | None = None,
     return_pval: bool = True,
     is_standardized: bool = False,
-    show_progress: bool = False,
 ) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
+    """Single-batch R-test on a MatrixKernel (no chunking).
+
+    Parallel to :func:`quadsv.fft._r_test_fft` /
+    :func:`quadsv.nufft._r_test_nufft`: takes whatever batch size is
+    handed in and processes it in one call. The chunking loop lives in
+    :func:`spatial_r_test`, which dispatches here per chunk.
     """
-    Bivariate spatial R-test for correlation between two spatial variables.
-
-    Computes the pairwise spatial statistic ``R = xᵀ K y``, testing for spatial
-    association between two variables. Supports batch processing.
-
-    Parameters
-    ----------
-    Xn : np.ndarray
-        First input data vector or batch. Shape (n,) or (n, M).
-    Yn : np.ndarray
-        Second input data vector or batch. Shape (n,) or (n, M) matching Xn.
-    kernel : Kernel
-        Pre-constructed kernel object compatible with xtKy() method.
-    null_params : dict, optional
-        Pre-computed null distribution parameters. Should include 'var_R'.
-        If None, computed on-the-fly from kernel traces.
-    return_pval : bool, default True
-        If True, returns (R, pval) tuple; if False, returns R only.
-    is_standardized : bool, default False
-        If True, skips Z-score standardization internally.
-
-    Returns
-    -------
-    R : float or np.ndarray
-        Test statistic value(s). Shape (M,) if input was 2D, scalar if input was 1D.
-    pval : float or np.ndarray, optional
-        Tail probability under null hypothesis (two-tailed test). Only returned if return_pval=True.
-        Based on Normal approximation.
-
-    Raises
-    ------
-    ValueError
-        If Xn and Yn shapes don't match or kernel dimensions are incompatible.
-
-    Notes
-    -----
-    Under H₀: the two variables are spatially uncorrelated.
-
-    The test statistic ``R = xᵀ K y`` is approximated as Normal under the null:
-
-    .. math::
-       R \\sim N(0, \\text{Trace}(K^2))
-
-    P-value is computed as two-tailed: ``2 × Pr(|R| > |r_obs|)``.
-
-    Examples
-    --------
-    >>> coords = np.random.randn(100, 2)
-    >>> kernel = MatrixKernel.from_coordinates(coords, method='gaussian')
-    >>> x_data = np.random.randn(100)
-    >>> y_data = np.random.randn(100)
-    >>> R, pval = spatial_r_test(x_data, y_data, kernel)
-    """
-    # Dispatch to FFT / NUFFT helpers when the kernel is one of those backends.
-    # Lazy imports avoid a circular import with ``quadsv.fft`` / ``quadsv.nufft``.
-    from quadsv.fft import FFTKernel, _r_test_fft
-    from quadsv.nufft import NUFFTKernel, _r_test_nufft
-
-    if isinstance(kernel, FFTKernel):
-        return _r_test_fft(
-            Xn,
-            Yn,
-            kernel,
-            null_params=null_params,
-            return_pval=return_pval,
-            is_standardized=is_standardized,
-        )
-    if isinstance(kernel, NUFFTKernel):
-        return _r_test_nufft(
-            Xn,
-            Yn,
-            kernel,
-            null_params=null_params,
-            return_pval=return_pval,
-            is_standardized=is_standardized,
-        )
 
     # Normalize shapes; preserve sparsity of inputs.
     def _prep(A):
@@ -936,46 +1040,199 @@ def spatial_r_test(  # noqa: C901
         return Z
 
     if is_standardized:
-        # ``is_standardized=True`` implies dense already (sparse can't be pre-z-scored).
         Zx = np.asarray(Xn.toarray() if sp.issparse(Xn) else Xn, dtype=float)
         Zy = np.asarray(Yn.toarray() if sp.issparse(Yn) else Yn, dtype=float)
     else:
-        if show_progress:
-            with tqdm(total=2, desc="Standardizing", leave=False) as pbar:
-                Zx = _standardize(Xn)
-                pbar.update(1)
-                Zy = _standardize(Yn)
-                pbar.update(1)
-        else:
-            Zx = _standardize(Xn)
-            Zy = _standardize(Yn)
+        Zx = _standardize(Xn)
+        Zy = _standardize(Yn)
 
     # R = diag(Zx^T K Zy) via the kernel's public bilinear primitive.
     R = np.atleast_1d(np.asarray(kernel.xtKy(Zx, Zy)))
 
-    # Unwrap if M=1
     if M == 1 and R.size == 1:
         R = R.item()
 
     if not return_pval:
         return R
 
-    # 3. P-value (Normal Approximation).
-    # Both X, Y are z-scored before R = Zₓᵀ K Zᵧ, so R ~ N(0, trace((HKH)²))
-    # — NOT trace(K²). kernel.square_trace() returns the centered trace by
-    # default (centering=True).
+    # P-value (Normal Approximation). Both X, Y are z-scored before
+    # R = Zₓᵀ K Zᵧ, so R ~ N(0, trace((HKH)²)) — NOT trace(K²).
     if null_params is not None and "var_R" in null_params:
         var_R = float(null_params["var_R"])
     else:
         var_R = float(kernel.square_trace())
-
     sigma = np.sqrt(var_R)
-
-    # Two-sided p-value for Normal distribution
     if sigma > 0:
         z_score = R / sigma
         pval = 2 * norm.sf(np.abs(z_score))
     else:
         pval = np.ones_like(R) if isinstance(R, np.ndarray) else 1.0
-
     return R, pval
+
+
+def spatial_r_test(  # noqa: C901
+    Xn: np.ndarray | sp.spmatrix,
+    Yn: np.ndarray | sp.spmatrix,
+    kernel: Kernel,
+    null_params: dict | None = None,
+    return_pval: bool = True,
+    is_standardized: bool = False,
+    chunk_size: int | str = "auto",
+    show_progress: bool = False,
+) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
+    """
+    Bivariate spatial R-test for correlation between two spatial variables.
+
+    Top-level chunking wrapper — splits the paired feature batch along
+    the trailing axis into blocks of ``chunk_size`` features, dispatches
+    each block to the backend-specific per-chunk helper
+    (:func:`quadsv.fft._r_test_fft`,
+    :func:`quadsv.nufft._r_test_nufft`, or :func:`_r_test_matrix`), and
+    concatenates the results. The per-chunk helpers do **not** handle
+    chunking themselves.
+
+    Parameters
+    ----------
+    Xn : np.ndarray or scipy.sparse matrix
+        First input. Shape ``(n,)`` / ``(n, M)`` for MatrixKernel and
+        NUFFTKernel, ``(ny, nx)`` / ``(ny, nx, M)`` for FFTKernel.
+    Yn : np.ndarray or scipy.sparse matrix
+        Second input, same shape as ``Xn`` (paired R-test).
+        For ``NUFFTKernel`` a bipartite mode with ``M_x != M_y`` is
+        passed through without chunking.
+    kernel : Kernel
+        Pre-constructed :class:`~quadsv.Kernel`.
+    null_params : dict, optional
+        Pre-computed null parameters; only ``'var_R'`` is consumed.
+        Resolved once at the top level if ``None`` and shared across
+        chunks.
+    return_pval : bool, default True
+        If True, returns ``(R, pval)``; else returns ``R`` only.
+    is_standardized : bool, default False
+        If True, skips Z-score standardization internally.
+    chunk_size : int or ``'auto'``, default ``'auto'``
+        Number of feature pairs processed per per-chunk dispatch call.
+        ``'auto'`` defers to :func:`auto_chunk_size`; ``-1`` processes
+        the full batch in a single call. For a cross-backend cost model
+        see :doc:`/guides/scaling`.
+    show_progress : bool, default False
+        If True, displays a tqdm bar over chunks (only when
+        ``M > chunk_size``).
+
+    Returns
+    -------
+    R : float or np.ndarray
+        Test statistic value(s). Shape ``(M,)`` for 2-D / 3-D inputs,
+        scalar for 1-D. For bipartite NUFFT input
+        (``M_x != M_y``), shape ``(M_x, M_y)``.
+    pval : float or np.ndarray, optional
+        Two-tailed tail probability under null hypothesis; returned
+        only if ``return_pval=True``.
+
+    Notes
+    -----
+    Under H₀, ``R = xᵀ K y`` is approximated as
+    :math:`\\mathcal{N}(0, \\mathrm{trace}((HKH)^2))` on z-scored inputs.
+    See :doc:`/guides/theory` and :doc:`/guides/scaling`.
+
+    Examples
+    --------
+    >>> coords = np.random.randn(100, 2)
+    >>> kernel = MatrixKernel.from_coordinates(coords, method='gaussian')
+    >>> x_data = np.random.randn(100)
+    >>> y_data = np.random.randn(100)
+    >>> R, pval = spatial_r_test(x_data, y_data, kernel)
+    """
+    # Lazy imports — avoid circular dependency with the FFT / NUFFT modules.
+    from quadsv.fft import FFTKernel, _r_test_fft
+    from quadsv.nufft import NUFFTKernel, _r_test_nufft
+
+    is_fft = isinstance(kernel, FFTKernel)
+    is_nufft = isinstance(kernel, NUFFTKernel)
+
+    # Resolve var_R once (cached across chunks).
+    if null_params is None:
+        null_params = {"var_R": float(kernel.square_trace())}
+    elif "var_R" not in null_params:
+        null_params = {**null_params, "var_R": float(kernel.square_trace())}
+
+    Mx = _feature_count(Xn, is_fft=is_fft)
+    My = _feature_count(Yn, is_fft=is_fft)
+
+    if is_fft:
+
+        def _dispatch(X, Y):
+            return _r_test_fft(
+                X,
+                Y,
+                kernel,
+                null_params=null_params,
+                return_pval=return_pval,
+                is_standardized=is_standardized,
+            )
+
+    elif is_nufft:
+
+        def _dispatch(X, Y):
+            return _r_test_nufft(
+                X,
+                Y,
+                kernel,
+                null_params=null_params,
+                return_pval=return_pval,
+                is_standardized=is_standardized,
+            )
+
+    else:
+
+        def _dispatch(X, Y):
+            return _r_test_matrix(
+                X,
+                Y,
+                kernel,
+                null_params=null_params,
+                return_pval=return_pval,
+                is_standardized=is_standardized,
+            )
+
+    # Bipartite NUFFT (M_x != M_y) doesn't fit the paired-chunk pattern —
+    # pass the full batch through and let the backend handle it.
+    if Mx != My:
+        return _dispatch(Xn, Yn)
+
+    M = Mx
+    resolved_chunk = _resolve_chunk_size(chunk_size, kernel, M)
+
+    # Single-batch shortcut.
+    if resolved_chunk >= M:
+        return _dispatch(Xn, Yn)
+
+    # Chunk loop.
+    starts = list(range(0, M, resolved_chunk))
+    iterator = starts
+    if show_progress and len(starts) > 1:
+        iterator = tqdm(
+            starts,
+            desc="R-test chunks",
+            total=len(starts),
+            bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
+        )
+
+    R_parts: list[np.ndarray] = []
+    P_parts: list[np.ndarray] = []
+    for start in iterator:
+        end = min(start + resolved_chunk, M)
+        Xblock = _chunk_last_axis(Xn, start, end)
+        Yblock = _chunk_last_axis(Yn, start, end)
+        result = _dispatch(Xblock, Yblock)
+        if return_pval:
+            R_b, P_b = result
+            R_parts.append(np.atleast_1d(R_b))
+            P_parts.append(np.atleast_1d(P_b))
+        else:
+            R_parts.append(np.atleast_1d(result))
+
+    R = np.concatenate(R_parts)
+    if return_pval:
+        return R, np.concatenate(P_parts)
+    return R
