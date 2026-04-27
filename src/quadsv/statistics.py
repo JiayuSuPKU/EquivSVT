@@ -39,14 +39,18 @@ def auto_chunk_size(
     1. **Cache sweet-spot cap** — empirical sweep of per-feature time
        vs ``chunk`` at ``n ∈ {30k, 100k, 300k, 1M}``:
 
-       =========================  ==============
-       Backend                     chunk cap
-       =========================  ==============
-       :class:`~quadsv.FFTKernel`  32
-       :class:`~quadsv.NUFFTKernel` 64
-       MatrixKernel (any sub-type) 16 (n < 200k)
-                                   8  (n ≥ 200k)
-       =========================  ==============
+       .. list-table::
+          :header-rows: 1
+          :widths: 50 50
+
+          * - Backend
+            - chunk cap
+          * - :class:`~quadsv.FFTKernel`
+            - 32
+          * - :class:`~quadsv.NUFFTKernel`
+            - 64
+          * - MatrixKernel (any sub-type)
+            - 16 (``n < 200k``); 8 (``n ≥ 200k``)
 
        Matrix backends don't vectorise over RHS columns (scipy CSR SpMV,
        SuperLU triangular solve), and the chunk size cap is determined empirically
@@ -674,8 +678,8 @@ def _q_test_matrix(  # noqa: C901
 ) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
     """Single-batch Q-test on a MatrixKernel (no chunking).
 
-    Parallel to :func:`quadsv.fft._q_test_fft` /
-    :func:`quadsv.nufft._q_test_nufft`: takes whatever batch size is
+    Parallel to :func:`quadsv.kernels.fft._q_test_fft` /
+    :func:`quadsv.kernels.nufft._q_test_nufft`: takes whatever batch size is
     handed in and processes it in one call. The chunking loop lives in
     :func:`spatial_q_test`, which dispatches here per chunk.
     """
@@ -827,8 +831,8 @@ def spatial_q_test(  # noqa: C901
     Top-level chunking wrapper — splits the feature batch along the
     trailing axis into blocks of ``chunk_size`` features, dispatches
     each block to the backend-specific per-chunk helper
-    (:func:`quadsv.fft._q_test_fft`,
-    :func:`quadsv.nufft._q_test_nufft`, or :func:`_q_test_matrix`), and
+    (:func:`quadsv.kernels.fft._q_test_fft`,
+    :func:`quadsv.kernels.nufft._q_test_nufft`, or :func:`_q_test_matrix`), and
     concatenates the results. The per-chunk helpers do **not** handle
     chunking themselves.
 
@@ -999,8 +1003,8 @@ def _r_test_matrix(  # noqa: C901
 ) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
     """Single-batch R-test on a MatrixKernel (no chunking).
 
-    Parallel to :func:`quadsv.fft._r_test_fft` /
-    :func:`quadsv.nufft._r_test_nufft`: takes whatever batch size is
+    Parallel to :func:`quadsv.kernels.fft._r_test_fft` /
+    :func:`quadsv.kernels.nufft._r_test_nufft`: takes whatever batch size is
     handed in and processes it in one call. The chunking loop lives in
     :func:`spatial_r_test`, which dispatches here per chunk.
     """
@@ -1086,8 +1090,8 @@ def spatial_r_test(  # noqa: C901
     Top-level chunking wrapper — splits the paired feature batch along
     the trailing axis into blocks of ``chunk_size`` features, dispatches
     each block to the backend-specific per-chunk helper
-    (:func:`quadsv.fft._r_test_fft`,
-    :func:`quadsv.nufft._r_test_nufft`, or :func:`_r_test_matrix`), and
+    (:func:`quadsv.kernels.fft._r_test_fft`,
+    :func:`quadsv.kernels.nufft._r_test_nufft`, or :func:`_r_test_matrix`), and
     concatenates the results. The per-chunk helpers do **not** handle
     chunking themselves.
 

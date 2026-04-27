@@ -46,6 +46,7 @@ extensions = [
     "autoapi.extension",
     "sphinx.ext.napoleon",
     "myst_parser",
+    "sphinx_design",  # provides ``.. dropdown::`` directives
 ]
 
 # MyST configuration

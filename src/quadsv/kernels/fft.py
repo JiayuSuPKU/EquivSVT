@@ -24,7 +24,7 @@ def power_spectrum_2d(
 
     The result is *translation-invariant*: shifting the input image leaves the power
     spectrum unchanged. This makes the spectrum a natural alignment-free representation
-    of a spatial pattern. Use :func:`quadsv.multisample.radial_bin_spectrum` to
+    of a spatial pattern. Use :func:`quadsv.comparators.multisample.radial_bin_spectrum` to
     further reduce the 2D spectrum to a 1D radial-binned vector that is also
     rotation-invariant.
 

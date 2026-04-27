@@ -2,9 +2,9 @@
 High-level wrapper classes for cross-sample spatial-pattern comparison.
 
 The array-level primitives (spectrum compute, radial binning, rotation
-alignment, statistical tests) live in :mod:`quadsv.multisample`. This
-module only carries the two user-facing classes that wire those primitives
-onto concrete container types:
+alignment, statistical tests) live in :mod:`quadsv.comparators.multisample`.
+This module only carries the two user-facing classes that wire those
+primitives onto concrete container types:
 
 - :class:`ComparatorIrregular` — a sequence of :class:`anndata.AnnData`,
   irregular spots. Spectra are computed with a batched type-1 NUFFT.
@@ -298,10 +298,11 @@ class _ComparatorBase:
     ) -> Any:
         """Two-group spectral-pattern test on :attr:`spectra_`.
 
-        Dispatches to :func:`quadsv.multisample.compare_two_groups_masked`
+        Dispatches to
+        :func:`quadsv.comparators.multisample.compare_two_groups_masked`
         when any ``(sample, gene)`` pair is marked absent in :attr:`presence_`
         (e.g. when ``presence_threshold > 0``), otherwise to
-        :func:`~quadsv.multisample.compare_two_groups`.
+        :func:`~quadsv.comparators.multisample.compare_two_groups`.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .test_pattern().")
@@ -439,7 +440,7 @@ class ComparatorIrregular(_ComparatorBase):
     grid_shape, spacing : optional
         When both given, used for every sample. Otherwise each sample's
         k-grid is auto-inferred from coords via
-        :func:`quadsv.nufft._infer_grid_from_coords`.
+        :func:`quadsv.kernels.nufft._infer_grid_from_coords`.
     freq_edges : np.ndarray, optional
     center : {'mean', 'zscore', None}, default 'mean'
     eps : float, default 1e-6

@@ -11,7 +11,7 @@ Pipeline
 --------
 
 1. **Per-sample spectra** — :func:`compute_sample_spectrum` runs
-   :func:`quadsv.fft.power_spectrum_2d` on each sample's ``(n_genes, ny, nx)`` array.
+   :func:`quadsv.kernels.fft.power_spectrum_2d` on each sample's ``(n_genes, ny, nx)`` array.
 2. **Radial binning (default, rotation-invariant)** — :func:`radial_bin_spectrum`
    collapses the 2D spectrum onto a ``K``-dim vector indexed by normalized radial
    frequency, harmonizing samples with different ``(ny, nx)``.
@@ -114,7 +114,7 @@ def compute_sample_spectrum(
     sample : np.ndarray
         Rasterized expression of shape ``(n_genes, ny, nx)``.
     fft_solver : {'fft2', 'rfft2'}, default 'rfft2'
-        FFT routine forwarded to :func:`quadsv.fft.power_spectrum_2d`.
+        FFT routine forwarded to :func:`quadsv.kernels.fft.power_spectrum_2d`.
     workers : int, optional
         Parallel workers forwarded to :mod:`scipy.fft`.
     center : {'mean', 'zscore', None}, default 'mean'

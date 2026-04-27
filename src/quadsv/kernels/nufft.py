@@ -16,7 +16,7 @@ evaluates the type-1 NUFFT
 on the same uniform ``(ny, nx)`` k-space grid that :func:`power_spectrum_2d`
 would produce for a rasterized input of the same physical extent, and returns
 :math:`|\\hat c|^2` in the scipy FFT layout (DC at ``[0, 0]``). Anything
-downstream — :func:`quadsv.multisample.radial_bin_spectrum`,
+downstream — :func:`quadsv.comparators.multisample.radial_bin_spectrum`,
 :class:`quadsv.ComparatorIrregular` — works identically.
 
 Notation (shared across this module)
@@ -213,7 +213,7 @@ def power_spectrum_2d_nufft(
     This function computes the power spectrum :math:`P(k) = |\\hat{c}(k)|^2` of
     one or more non-uniform spatial signals via a type-1 NUFFT.
     The output has the same ``(ny, nx)`` layout as
-    :func:`quadsv.fft.power_spectrum_2d` with ``fft_solver='fft2'``: DC at
+    :func:`quadsv.kernels.fft.power_spectrum_2d` with ``fft_solver='fft2'``: DC at
     ``[0, 0]``, Nyquist at ``[ny/2, nx/2]`` (when dimensions are even).
 
     Parameters
