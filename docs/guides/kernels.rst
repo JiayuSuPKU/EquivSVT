@@ -185,7 +185,7 @@ Override ``_compute_eigenvalues()`` to define custom spectrum. Store result in `
 
    import numpy as np
    import scipy.fft
-   from quadsv.fft import FFTKernel
+   from quadsv.kernels.fft import FFTKernel
    
    class CustomFFTKernel(FFTKernel):
        def _compute_eigenvalues(self):
@@ -251,4 +251,4 @@ See also
 
 - :doc:`/guides/quickstart` for practical examples
 - :doc:`/guides/theory` for mathematical background
-- :doc:`/autoapi/quadsv/kernels/index` and :doc:`/autoapi/quadsv/fft/index` for detailed kernel API documentation
+- :doc:`/autoapi/quadsv/kernels/index` for detailed kernel API documentation

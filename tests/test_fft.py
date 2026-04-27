@@ -7,8 +7,8 @@ import unittest
 
 import numpy as np
 
-from quadsv.fft import FFTKernel
 from quadsv.kernels import MatrixKernel
+from quadsv.kernels.fft import FFTKernel
 from quadsv.statistics import spatial_q_test, spatial_r_test
 from quadsv.statistics import spatial_q_test as spatial_q_test_standard
 from quadsv.statistics import spatial_r_test as spatial_r_test_standard

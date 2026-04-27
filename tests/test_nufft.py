@@ -1,12 +1,12 @@
-"""Tests for quadsv.nufft + ComparatorIrregular."""
+"""Tests for quadsv.kernels.nufft + ComparatorIrregular."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from quadsv.fft import power_spectrum_2d
-from quadsv.nufft import power_spectrum_2d_nufft
+from quadsv.kernels.fft import power_spectrum_2d
+from quadsv.kernels.nufft import power_spectrum_2d_nufft
 
 # ---------------------------------------------------------------------------
 # Primitive: power_spectrum_2d_nufft
@@ -106,7 +106,7 @@ class TestBatchedValues:
 # ---------------------------------------------------------------------------
 
 
-from quadsv.nufft import NUFFTKernel
+from quadsv.kernels.nufft import NUFFTKernel
 from quadsv.statistics import spatial_q_test, spatial_r_test
 from quadsv.utils import get_rect_coords
 
@@ -427,7 +427,7 @@ class TestSpatialQTestNUFFT:
 
     def test_matches_fft_on_regular_grid(self):
         """On a uniform N=ny*nx grid the NUFFT Q-test equals spatial_q_test (FFT kernel)."""
-        from quadsv.fft import FFTKernel
+        from quadsv.kernels.fft import FFTKernel
 
         ny, nx = 16, 20
         yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
@@ -550,7 +550,7 @@ class TestNUFFTKernelNullParamsRoundTrip:
     without changing results."""
 
     def test_qtest_nufft_null_params_round_trip(self):
-        from quadsv.nufft import NUFFTKernel
+        from quadsv.kernels.nufft import NUFFTKernel
         from quadsv.statistics import compute_null_params, spatial_q_test
 
         rng = np.random.default_rng(0)
@@ -571,7 +571,7 @@ class TestNUFFTKernelNullParamsRoundTrip:
         (e.g. the legacy ``'eigenvalues'``) must raise a clear error —
         callers should use ``compute_null_params`` or supply
         ``liu_coef`` / ``cumulants`` directly."""
-        from quadsv.nufft import NUFFTKernel
+        from quadsv.kernels.nufft import NUFFTKernel
         from quadsv.statistics import spatial_q_test
 
         rng = np.random.default_rng(0)
@@ -587,7 +587,7 @@ class TestNUFFTKernelNullParamsRoundTrip:
             )
 
     def test_rtest_nufft_null_params_round_trip(self):
-        from quadsv.nufft import NUFFTKernel
+        from quadsv.kernels.nufft import NUFFTKernel
         from quadsv.statistics import spatial_r_test
 
         rng = np.random.default_rng(0)

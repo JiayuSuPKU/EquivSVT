@@ -8,8 +8,7 @@ import pytest
 from scipy.stats import kstest
 
 from quadsv.comparators import ComparatorIrregular
-from quadsv.fft import power_spectrum_2d
-from quadsv.multisample import (
+from quadsv.comparators.multisample import (
     align_spectra_by_rotation,
     apply_rotations_to_spectra,
     benchmark_statistics,
@@ -23,6 +22,7 @@ from quadsv.multisample import (
     residualize_against_covariates,
     shape_normalize,
 )
+from quadsv.kernels.fft import power_spectrum_2d
 
 # ---------------------------------------------------------------------------
 # Test helpers for the AnnData-based ComparatorIrregular API (Phase D)

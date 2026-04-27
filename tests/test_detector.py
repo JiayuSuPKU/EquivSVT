@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from quadsv.detector import DetectorIrregular
+from quadsv.detectors.irregular import DetectorIrregular
 
 
 class TestDetectorIrregular(unittest.TestCase):

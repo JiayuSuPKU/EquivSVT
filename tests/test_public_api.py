@@ -12,13 +12,6 @@ What this test enforces:
    *same* object as their canonical path (e.g.
    ``quadsv.compute_null_params is quadsv.statistics.compute_null_params``).
    Guards against accidental re-export breakage during refactors.
-4. **Legacy-shim back-compat.** Each pre-Stage-2 import path
-   (``quadsv.fft``, ``quadsv.nufft``, ``quadsv.detector``,
-   ``quadsv.detector_grid``, ``quadsv._detector_base``,
-   ``quadsv.multisample``) still resolves to the canonical class /
-   function under ``quadsv.kernels.*``, ``quadsv.detectors.*``, or
-   ``quadsv.comparators.multisample``. Locks in the one-release
-   back-compat contract.
 """
 
 from __future__ import annotations
@@ -121,33 +114,27 @@ def test_top_level_objects_identity_match_canonical_paths():
 
 
 # ---------------------------------------------------------------------------
-# Legacy-path shim contract (one-release back-compat from Stage 2).
-#
-# Each pre-Stage-2 module path must still resolve. The shim modules
-# do ``from quadsv.<canonical> import *`` plus ``__all__``, so checking
-# every public name on each canonical module round-trips through the
-# legacy path is the strongest assertion.
+# Legacy-path shims (Stage 2) have been removed. Importing from
+# ``quadsv.fft``, ``quadsv.nufft``, ``quadsv.detector``,
+# ``quadsv.detector_grid``, ``quadsv._detector_base``, or
+# ``quadsv.multisample`` now raises ``ModuleNotFoundError`` — callers
+# must use the canonical paths under ``quadsv.kernels.*``,
+# ``quadsv.detectors.*``, and ``quadsv.comparators.multisample``.
 # ---------------------------------------------------------------------------
-_LEGACY_SHIMS: dict[str, str] = {
-    "quadsv.fft": "quadsv.kernels.fft",
-    "quadsv.nufft": "quadsv.kernels.nufft",
-    "quadsv.detector": "quadsv.detectors.irregular",
-    "quadsv.detector_grid": "quadsv.detectors.grid",
-    "quadsv._detector_base": "quadsv.detectors.base",
-    "quadsv.multisample": "quadsv.comparators.multisample",
-}
+_REMOVED_LEGACY_PATHS: list[str] = [
+    "quadsv.fft",
+    "quadsv.nufft",
+    "quadsv.detector",
+    "quadsv.detector_grid",
+    "quadsv._detector_base",
+    "quadsv.multisample",
+]
 
 
-def test_legacy_shim_paths_resolve_to_canonical():
-    """Each legacy module path is importable and re-exports every
-    name listed in the canonical module's ``__all__`` with object
-    identity.
-    """
-    for legacy_path, canonical_path in _LEGACY_SHIMS.items():
-        legacy = importlib.import_module(legacy_path)
-        canonical = importlib.import_module(canonical_path)
-        for name in canonical.__all__:
-            assert hasattr(legacy, name), f"{legacy_path}.{name} missing"
-            assert getattr(legacy, name) is getattr(
-                canonical, name
-            ), f"{legacy_path}.{name} is not {canonical_path}.{name}"
+def test_legacy_module_paths_no_longer_resolve():
+    """Importing a removed legacy path raises ``ModuleNotFoundError``."""
+    import pytest
+
+    for path in _REMOVED_LEGACY_PATHS:
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(path)

@@ -9,7 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from quadsv.detector_grid import DetectorGrid
+from quadsv.detectors.grid import DetectorGrid
 
 
 class MockCoord:
