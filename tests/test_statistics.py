@@ -313,6 +313,20 @@ class TestKernelPrimitivesAndNullParams(unittest.TestCase):
             sig = set(inspect.signature(fn).parameters)
             self.assertTrue(canonical_r.issubset(sig), f"{fn.__name__} missing {canonical_r - sig}")
 
+    def test_power_user_helpers_top_level_reexport(self):
+        """``compute_null_params``, ``auto_chunk_size``, ``liu_sf`` are
+        now first-class public symbols, importable directly from
+        ``quadsv``. The top-level shortcut and the canonical
+        ``quadsv.statistics`` path must point at the same callable.
+        """
+        import quadsv
+        import quadsv.statistics as _stats
+
+        for name in ("compute_null_params", "auto_chunk_size", "liu_sf"):
+            self.assertTrue(hasattr(quadsv, name), f"quadsv.{name} missing")
+            self.assertIs(getattr(quadsv, name), getattr(_stats, name))
+            self.assertIn(name, quadsv.__all__)
+
 
 if __name__ == "__main__":
     unittest.main()

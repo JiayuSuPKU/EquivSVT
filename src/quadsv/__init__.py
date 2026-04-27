@@ -40,7 +40,13 @@ from quadsv.detectors.irregular import DetectorIrregular
 from quadsv.kernels import Kernel, MatrixKernel, MatrixKernelBase
 from quadsv.kernels.fft import FFTKernel
 from quadsv.kernels.nufft import NUFFTKernel
-from quadsv.statistics import spatial_q_test, spatial_r_test
+from quadsv.statistics import (
+    auto_chunk_size,
+    compute_null_params,
+    liu_sf,
+    spatial_q_test,
+    spatial_r_test,
+)
 
 __all__ = [
     # Kernels
@@ -51,6 +57,10 @@ __all__ = [
     # Statistical tests
     "spatial_q_test",
     "spatial_r_test",
+    # Statistical-test power-user helpers (precompute-once, reuse-many-times)
+    "compute_null_params",
+    "auto_chunk_size",
+    "liu_sf",
     # Detectors
     "DetectorIrregular",
     "DetectorGrid",
