@@ -343,7 +343,7 @@ class DetectorIrregular(Detector):
         Input container set by :meth:`setup_data`.
     min_cells : int or None
         Minimum non-zero count per feature; set by :meth:`setup_data`.
-    kernel\_ : :class:`~quadsv.Kernel` or None
+    kernel\_ : :class:`~quadsv.kernels.Kernel` or None
         The built kernel; populated by :meth:`setup_data`.
     kernel_method\_, kernel_params\_, n
         See :class:`Detector`.

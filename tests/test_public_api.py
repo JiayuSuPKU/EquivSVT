@@ -28,7 +28,6 @@ import quadsv
 # ---------------------------------------------------------------------------
 EXPECTED_ALL: list[str] = [
     # Kernels
-    "Kernel",
     "MatrixKernel",
     "FFTKernel",
     "NUFFTKernel",
@@ -49,6 +48,11 @@ EXPECTED_ALL: list[str] = [
     "Detector",
     "Comparator",
 ]
+
+# ABCs used only by backend authors. They live in ``quadsv.kernels`` and
+# are not part of the top-level public surface, so they must not show up
+# in ``quadsv.__all__`` or as attributes on the package.
+_INTERNAL_BACKEND_ABCS: list[str] = ["Kernel", "MatrixKernelBase"]
 
 
 def test_top_level_all_matches_snapshot():
@@ -85,7 +89,6 @@ def test_every_public_name_resolves_and_documented():
 # ---------------------------------------------------------------------------
 _CANONICAL_PATHS: dict[str, tuple[str, str]] = {
     # name on quadsv: (submodule, attribute on submodule)
-    "Kernel": ("quadsv.kernels", "Kernel"),
     "MatrixKernel": ("quadsv.kernels", "MatrixKernel"),
     "FFTKernel": ("quadsv.kernels.fft", "FFTKernel"),
     "NUFFTKernel": ("quadsv.kernels.nufft", "NUFFTKernel"),
@@ -111,6 +114,21 @@ def test_top_level_objects_identity_match_canonical_paths():
         top = getattr(quadsv, name)
         canonical = getattr(importlib.import_module(modpath), attr)
         assert top is canonical, f"quadsv.{name} drifted from {modpath}.{attr}"
+
+
+def test_backend_abcs_are_not_top_level_public():
+    """``Kernel`` and ``MatrixKernelBase`` are extension points for
+    backend authors. They live at ``quadsv.kernels`` and must not be
+    accessible as top-level attributes on the ``quadsv`` package.
+    """
+    for name in _INTERNAL_BACKEND_ABCS:
+        assert name not in quadsv.__all__, f"{name} should not be in quadsv.__all__"
+        assert not hasattr(quadsv, name), (
+            f"quadsv.{name} should not be reachable on the top-level package; "
+            f"import from quadsv.kernels instead."
+        )
+    # ...but the canonical path is still importable.
+    from quadsv.kernels import Kernel, MatrixKernelBase  # noqa: F401
 
 
 # ---------------------------------------------------------------------------

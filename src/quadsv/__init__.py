@@ -1,9 +1,13 @@
 """
 quadsv: kernel-based spatial pattern detection and comparison for spatial omics.
 
+The public top-level API is organised in four layers:
+
 1. **Kernels** — :class:`MatrixKernel` (dense / sparse), :class:`FFTKernel`
-   (regular grid), :class:`NUFFTKernel` (irregular 2D coordinates). All three
-   are registered subclasses of the :class:`Kernel` ABC.
+   (regular grid), :class:`NUFFTKernel` (irregular 2D coordinates). The
+   :class:`~quadsv.kernels.Kernel` and
+   :class:`~quadsv.kernels.MatrixKernelBase` ABCs live in
+   :mod:`quadsv.kernels` and are intended for backend authors.
 2. **Statistical tests** — :func:`spatial_q_test` and :func:`spatial_r_test`.
    A single entry point per test dispatches on the kernel type (matrix, FFT,
    or NUFFT). Signature: ``(x, kernel, null_params=None, return_pval=True,
@@ -38,7 +42,7 @@ from quadsv.api import Comparator, Detector
 from quadsv.comparators import ComparatorGrid, ComparatorIrregular
 from quadsv.detectors.grid import DetectorGrid
 from quadsv.detectors.irregular import DetectorIrregular
-from quadsv.kernels import Kernel, MatrixKernel
+from quadsv.kernels import MatrixKernel
 from quadsv.kernels.fft import FFTKernel
 from quadsv.kernels.nufft import NUFFTKernel
 from quadsv.statistics import (
@@ -49,9 +53,14 @@ from quadsv.statistics import (
     spatial_r_test,
 )
 
+# The :class:`~quadsv.kernels.Kernel` and
+# :class:`~quadsv.kernels.MatrixKernelBase` ABCs are intentionally not
+# re-exported here. They are extension points for backend authors and
+# live at ``quadsv.kernels`` (the canonical path). Importing them through
+# ``quadsv`` directly is unsupported.
+
 __all__ = [
     # Kernels
-    "Kernel",
     "MatrixKernel",
     "FFTKernel",
     "NUFFTKernel",
@@ -72,35 +81,3 @@ __all__ = [
     "Detector",
     "Comparator",
 ]
-
-
-# ---------------------------------------------------------------------------
-# Soft-deprecated top-level exports.
-#
-# Resolves on first attribute access via ``__getattr__`` and emits a
-# ``DeprecationWarning`` pointing at the canonical import path. The symbol
-# itself is unchanged — only the *top-level* shortcut is being retired.
-#
-# - MatrixKernelBase: the abstract matrix-kernel base. Subclassing is a
-#   power-user / extension scenario, not a casual public API; users should
-#   import it from ``quadsv.kernels`` if they need it.
-# ---------------------------------------------------------------------------
-_DEPRECATED_TOPLEVEL = {
-    "MatrixKernelBase": ("quadsv.kernels", "MatrixKernelBase"),
-}
-
-
-def __getattr__(name):  # noqa: D401 - module-level dunder
-    """Resolve soft-deprecated top-level names lazily."""
-    if name in _DEPRECATED_TOPLEVEL:
-        import importlib
-        import warnings
-
-        mod_name, attr = _DEPRECATED_TOPLEVEL[name]
-        warnings.warn(
-            f"{name!r} is deprecated as a top-level export; " f"import from {mod_name!r} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return getattr(importlib.import_module(mod_name), attr)
-    raise AttributeError(f"module 'quadsv' has no attribute {name!r}")

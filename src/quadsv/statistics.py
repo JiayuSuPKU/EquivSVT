@@ -840,7 +840,7 @@ def spatial_q_test(  # noqa: C901
         Can be dense numpy array or sparse matrix (CSC/CSR recommended)
         for MatrixKernel; FFT/NUFFT paths require dense input.
     kernel : Kernel
-        Pre-constructed :class:`~quadsv.Kernel` (``MatrixKernel`` /
+        Pre-constructed :class:`~quadsv.kernels.Kernel` (``MatrixKernel`` /
         ``FFTKernel`` / ``NUFFTKernel``) or a raw dense / sparse kernel
         matrix.
     null_params : dict, optional
@@ -1101,7 +1101,7 @@ def spatial_r_test(  # noqa: C901
         For ``NUFFTKernel`` a bipartite mode with ``M_x != M_y`` is
         passed through without chunking.
     kernel : Kernel
-        Pre-constructed :class:`~quadsv.Kernel`.
+        Pre-constructed :class:`~quadsv.kernels.Kernel`.
     null_params : dict, optional
         Pre-computed null parameters; only ``'var_R'`` is consumed.
         Resolved once at the top level if ``None`` and shared across

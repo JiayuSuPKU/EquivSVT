@@ -332,7 +332,7 @@ class NUFFTKernel(Kernel):
     Spatial kernel over **irregular** 2D coordinates evaluated via NUFFTs.
 
     Parallels :class:`quadsv.fft.FFTKernel` (which requires a regular grid) and
-    implements the :class:`~quadsv.Kernel` interface so it plugs into
+    implements the :class:`~quadsv.kernels.Kernel` interface so it plugs into
     :func:`quadsv.statistics.spatial_q_test` /
     :func:`quadsv.statistics.spatial_r_test` the same way.
 
