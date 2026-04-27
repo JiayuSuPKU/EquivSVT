@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 import anndata as _ad
 import spatialdata as sd
 
-from quadsv.multisample import (
+from quadsv.comparators.multisample import (
     _AVAILABLE_STATISTICS,
     _ZSCORE_CLIP,
     align_spectra_by_rotation,
@@ -511,7 +511,7 @@ class ComparatorIrregular(_ComparatorBase):
         self._nufft_eps = float(eps)
 
         # Per-sample coords / grids.
-        from quadsv.nufft import _infer_grid_from_coords
+        from quadsv.kernels.nufft import _infer_grid_from_coords
 
         if unit_scales is None:
             unit_scales = [1.0] * len(samples_list)
@@ -550,7 +550,7 @@ class ComparatorIrregular(_ComparatorBase):
     def _compute_spectra(  # noqa: C901
         self, n_jobs: int, progress: bool
     ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        from quadsv.nufft import power_spectrum_2d_nufft
+        from quadsv.kernels.nufft import power_spectrum_2d_nufft
 
         chunk_size = self.nufft_chunk_size
         n_samples_total = len(self.samples)

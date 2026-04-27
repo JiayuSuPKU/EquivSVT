@@ -83,7 +83,7 @@ class MockSpatialData:
 
 def _patch_rasterize(mock_da):
     """Patch rasterize_table (used internally by DetectorGrid) to return `mock_da`."""
-    return patch("quadsv.detector_grid.rasterize_table", return_value=mock_da, create=True)
+    return patch("quadsv.detectors.grid.rasterize_table", return_value=mock_da, create=True)
 
 
 class TestDetectorGrid(unittest.TestCase):

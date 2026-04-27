@@ -21,7 +21,7 @@ import logging
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 # Version resolution order: prefer the file written by ``setuptools-scm`` at
-# build time (``quadsv/_version.py`` — see ``[tool.setuptools_scm]`` in
+# build time (``src/quadsv/_version.py`` — see ``[tool.setuptools_scm]`` in
 # ``pyproject.toml``), fall back to installed-package metadata, then to a
 # last-known release string for unbuilt / shallow-clone checkouts.
 try:
@@ -35,11 +35,11 @@ except ImportError:  # _version.py absent — source checkout without a build st
         __version__ = "0.0.0+unknown"
 
 from quadsv.comparators import ComparatorGrid, ComparatorIrregular
-from quadsv.detector import DetectorIrregular
-from quadsv.detector_grid import DetectorGrid
-from quadsv.fft import FFTKernel
+from quadsv.detectors.grid import DetectorGrid
+from quadsv.detectors.irregular import DetectorIrregular
 from quadsv.kernels import Kernel, MatrixKernel, MatrixKernelBase
-from quadsv.nufft import NUFFTKernel
+from quadsv.kernels.fft import FFTKernel
+from quadsv.kernels.nufft import NUFFTKernel
 from quadsv.statistics import spatial_q_test, spatial_r_test
 
 __all__ = [

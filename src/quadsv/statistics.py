@@ -83,8 +83,8 @@ def auto_chunk_size(
         consumes most of the per-worker budget.
     """
     # Lazy imports to avoid circular dependency with the FFT / NUFFT modules.
-    from quadsv.fft import FFTKernel
-    from quadsv.nufft import NUFFTKernel
+    from quadsv.kernels.fft import FFTKernel
+    from quadsv.kernels.nufft import NUFFTKernel
 
     if isinstance(kernel, FFTKernel):
         n = kernel.n
@@ -339,7 +339,7 @@ def _hutchinson_cumulants(
     # ------------------------------------------------------------------
     # FFTKernel fast path — full spectrum is O(n) and exact for all c_p.
     # ------------------------------------------------------------------
-    from quadsv.fft import FFTKernel  # lazy to avoid circular import
+    from quadsv.kernels.fft import FFTKernel  # lazy to avoid circular import
 
     if isinstance(kernel, FFTKernel):
         # ``return_full_layout=True`` unpacks the rfft2 half-spectrum to
@@ -888,8 +888,8 @@ def spatial_q_test(  # noqa: C901
     >>> Q, pval = spatial_q_test(sparse_data, kernel, show_progress=True)
     """
     # Lazy imports — avoid circular dependency with the FFT / NUFFT modules.
-    from quadsv.fft import FFTKernel, _q_test_fft
-    from quadsv.nufft import NUFFTKernel, _q_test_nufft
+    from quadsv.kernels.fft import FFTKernel, _q_test_fft
+    from quadsv.kernels.nufft import NUFFTKernel, _q_test_nufft
 
     is_fft = isinstance(kernel, FFTKernel)
     is_nufft = isinstance(kernel, NUFFTKernel)
@@ -1144,8 +1144,8 @@ def spatial_r_test(  # noqa: C901
     >>> R, pval = spatial_r_test(x_data, y_data, kernel)
     """
     # Lazy imports — avoid circular dependency with the FFT / NUFFT modules.
-    from quadsv.fft import FFTKernel, _r_test_fft
-    from quadsv.nufft import NUFFTKernel, _r_test_nufft
+    from quadsv.kernels.fft import FFTKernel, _r_test_fft
+    from quadsv.kernels.nufft import NUFFTKernel, _r_test_nufft
 
     is_fft = isinstance(kernel, FFTKernel)
     is_nufft = isinstance(kernel, NUFFTKernel)
