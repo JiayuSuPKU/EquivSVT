@@ -34,6 +34,7 @@ except ImportError:  # _version.py absent — source checkout without a build st
     except (ImportError, PackageNotFoundError):
         __version__ = "0.0.0+unknown"
 
+from quadsv.api import Comparator, Detector
 from quadsv.comparators import ComparatorGrid, ComparatorIrregular
 from quadsv.detectors.grid import DetectorGrid
 from quadsv.detectors.irregular import DetectorIrregular
@@ -67,4 +68,7 @@ __all__ = [
     # Cross-sample
     "ComparatorIrregular",
     "ComparatorGrid",
+    # Factories — type-dispatched discovery face on the four classes above
+    "Detector",
+    "Comparator",
 ]
