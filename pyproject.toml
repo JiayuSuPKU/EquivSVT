@@ -145,7 +145,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["quadsv"]
+source = ["src/quadsv"]
 branch = true
 omit = [
     "*/tests/*",
@@ -165,17 +165,15 @@ exclude_lines = [
 precision = 2
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["quadsv*"]
-exclude = ["tests*", "data*", "figures*"]
+where = ["src"]
 
 # Derive the package version from git tags. On a clean release commit
 # tagged ``vX.Y.Z`` the version is ``X.Y.Z``; between tags it is
 # ``X.Y.(Z+1).devN+g<sha>[.dYYYYMMDD]`` per PEP 440. On install / build
-# the resolved version is written to ``quadsv/_version.py`` so the
+# the resolved version is written to ``src/quadsv/_version.py`` so the
 # runtime ``__version__`` lookup works without git (sdist, wheel, shallow
 # clones). ``fallback_version`` is used only when both git AND the
 # generated file are missing — keep it in sync with the last release.
 [tool.setuptools_scm]
-version_file = "quadsv/_version.py"
+version_file = "src/quadsv/_version.py"
 fallback_version = "0.1.1"

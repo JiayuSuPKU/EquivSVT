@@ -55,7 +55,7 @@ myst_enable_extensions = [
 ]
 
 # AutoAPI configuration
-autoapi_dirs = ["../quadsv"]
+autoapi_dirs = ["../src/quadsv"]
 autoapi_add_toctree_entry = False
 autoapi_python_class_content = "class"
 autoapi_ignore = ["**/.ipynb_checkpoints/*", "**/*-checkpoint.py"]
