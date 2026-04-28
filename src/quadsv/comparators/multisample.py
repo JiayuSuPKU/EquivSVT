@@ -56,6 +56,7 @@ from scipy.stats import t as _t_dist
 from tqdm.auto import tqdm
 
 from quadsv.kernels.fft import power_spectrum_2d
+from quadsv.statistics import liu_sf
 from quadsv.utils import _apply_bh_correction
 
 __all__ = [
@@ -1216,6 +1217,101 @@ def _run_cauchy_welch_analytic(
 
 
 # ---------------------------------------------------------------------------
+# Step 4b' — analytic Wald-type null for log_l2 (mixture-χ² tail via Liu)
+# ---------------------------------------------------------------------------
+
+_NULL_OPTIONS = ("permutation", "wald")
+_NULL_ALIASES = {"liu": "wald"}
+
+
+def _resolve_null(null: str) -> str:
+    """Map ``null`` to the canonical token, handling aliases. Raises on unknown."""
+    canon = _NULL_ALIASES.get(null, null)
+    if canon not in _NULL_OPTIONS:
+        raise ValueError(
+            f"Unknown null='{null}'. Options: {sorted(_NULL_OPTIONS)} "
+            f"(aliases: {sorted(_NULL_ALIASES)})."
+        )
+    return canon
+
+
+def _pooled_diag_within_group_var(
+    spectra: np.ndarray, g_int: np.ndarray, *, eps: float = 1e-12
+) -> np.ndarray:
+    """Pooled-across-genes diagonal estimate of within-group log-spectrum variance.
+
+    For each (sample, gene, bin) entry, take the residual from the
+    within-group mean of log-spectrum, accumulate squared residuals, then
+    average across genes per frequency bin and divide by the residual
+    degrees of freedom ``n_a + n_b - 2``. Returns a ``(K,)`` array.
+
+    The pooling-across-genes assumption is the eBayes-style variance
+    stabilization used throughout differential analysis at small ``n``:
+    each gene contributes one ``df=n-2`` SSR estimate; averaging across
+    ``G`` genes produces a ``G·(n-2)``-df variance estimate per bin.
+    """
+    a_mask = g_int == 0
+    log_a = np.log(np.maximum(spectra[a_mask], eps))
+    log_b = np.log(np.maximum(spectra[~a_mask], eps))
+    n_a = log_a.shape[0]
+    n_b = log_b.shape[0]
+    res_a = log_a - log_a.mean(axis=0, keepdims=True)
+    res_b = log_b - log_b.mean(axis=0, keepdims=True)
+    ssr_per_gene = (res_a**2).sum(axis=0) + (res_b**2).sum(axis=0)  # (n_genes, K)
+    df = max(n_a + n_b - 2, 1)
+    return ssr_per_gene.mean(axis=0) / df  # (K,)
+
+
+def _log_l2_wald_pvalues(
+    observed_T: np.ndarray,
+    lambs: np.ndarray,
+    *,
+    eps: float = 1e-30,
+) -> np.ndarray:
+    """Wald-type analytic p-values for ``log_l2`` via Liu's mixture-χ² tail.
+
+    ``observed_T`` is the ``(n_genes,)`` per-gene statistic returned by
+    :func:`_stat_log_l2` — i.e. the *square root* of the underlying
+    quadratic form ``D'WD``. Squaring it here gives the H₀ statistic that
+    is distributed as ``Σ_k λ_k χ²_1``, which Liu's approximation handles
+    directly.
+    """
+    lambs_safe = np.maximum(np.asarray(lambs, dtype=float), eps)
+    T2 = np.asarray(observed_T, dtype=float) ** 2
+    return np.asarray(liu_sf(T2, lambs_safe), dtype=float)
+
+
+def _run_log_l2_wald(
+    spectra: np.ndarray,
+    g_int: np.ndarray,
+    freq_weights: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute observed log_l2 statistic + analytic Wald p-values per gene.
+
+    Returns ``(observed, pvals)`` both shape ``(n_genes,)``. Internally:
+    1. ``observed_T = _stat_log_l2(group_a, group_b, freq_weights)``.
+    2. Pooled-diagonal Σ_ℓ across genes via :func:`_pooled_diag_within_group_var`.
+    3. Eigenvalues of ``W½ Σ_D W½`` are diagonal:
+       ``λ_k = (1/n_a + 1/n_b) · w_k · σ_k²``.
+    4. ``p = liu_sf(T², λ)`` for the weighted-χ² tail.
+    """
+    a_mask = g_int == 0
+    group_a = spectra[a_mask]
+    group_b = spectra[~a_mask]
+    n_a = int(a_mask.sum())
+    n_b = int((~a_mask).sum())
+    K = spectra.shape[-1]
+    w = _resolve_freq_weights(freq_weights, K)
+
+    observed = _stat_log_l2(group_a, group_b, freq_weights=freq_weights)  # (n_genes,)
+    sigma2 = _pooled_diag_within_group_var(spectra, g_int)               # (K,)
+    v_c = (1.0 / max(n_a, 1)) + (1.0 / max(n_b, 1))
+    lambs = w * sigma2 * v_c                                              # (K,)
+    pvals = _log_l2_wald_pvalues(observed, lambs)
+    return observed, pvals
+
+
+# ---------------------------------------------------------------------------
 # Step 4c — public test functions
 # ---------------------------------------------------------------------------
 
@@ -1225,6 +1321,7 @@ def compare_two_groups(  # noqa: C901
     groups: np.ndarray,
     gene_names: Sequence[str] | None = None,
     statistic: str = "log_l2",
+    null: str = "permutation",
     n_perm: int = 1000,
     random_state: int | None = None,
     n_jobs: int = 1,
@@ -1257,9 +1354,21 @@ def compare_two_groups(  # noqa: C901
           per bin, which would also floor the gene-level combined
           p-value and destroy BH-FDR power across thousands of genes.
           Yields an extra ``P_value_per_bin`` column.
+    null : {'permutation', 'wald', 'liu'}, default 'permutation'
+        Null-distribution method. ``'permutation'`` uses the empirical
+        permutation null (default; back-compat). ``'wald'`` (alias
+        ``'liu'``) uses an analytic Wald-type test for the L2 quadratic
+        form: under H₀ the statistic ``T² = D'WD`` is distributed as a
+        weighted sum of χ²₁ variables whose tail is integrated via Liu's
+        approximation (see :func:`quadsv.statistics.liu_sf`). The pooled
+        within-group variance is estimated diagonally per frequency bin
+        and averaged across all genes for stability at small ``n``.
+        Currently ``null='wald'`` is only supported for
+        ``statistic='log_l2'``; raises ``ValueError`` otherwise.
+        ``cauchy_welch`` ignores this argument.
     n_perm : int, default 1000
         Number of label permutations for the null distribution. **Ignored**
-        when ``statistic='cauchy_welch'`` (that path is fully analytic).
+        when ``statistic='cauchy_welch'`` or ``null='wald'``.
     random_state : int, optional
         Seed for the permutation RNG (ignored for ``'cauchy_welch'``).
     n_jobs : int, default 1
@@ -1299,6 +1408,12 @@ def compare_two_groups(  # noqa: C901
     _available = set(_STAT_FNS) | {"cauchy_welch"}
     if statistic not in _available:
         raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_available)}.")
+    null_canon = _resolve_null(null)
+    if null_canon == "wald" and statistic != "log_l2":
+        raise ValueError(
+            f"null='wald' is only supported with statistic='log_l2', "
+            f"got statistic='{statistic}'."
+        )
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, K), got {spectra.shape}.")
     n_samples, n_genes, _ = spectra.shape
@@ -1333,6 +1448,20 @@ def compare_two_groups(  # noqa: C901
             logger.debug("n_jobs ignored: per-statistic implementations are already vectorized.")
         return df
 
+    if null_canon == "wald":
+        # Analytic Wald-type test for log_l2 (statistic check above).
+        observed, pvals = _run_log_l2_wald(spectra, g_int, freq_weights)
+        if gene_names is None:
+            gene_names = [str(i) for i in range(n_genes)]
+        df = pd.DataFrame(
+            {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
+        )
+        _apply_bh_correction(df)
+        df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
+        if n_jobs != 1:  # noqa: PLR2004
+            logger.debug("n_jobs ignored: per-statistic implementations are already vectorized.")
+        return df
+
     perm_labels, is_exact = _exchangeable_group_labels(g_int, n_perm, rng, n_perm_max=n_perm_max)
     if is_exact:
         logger.info(
@@ -1341,10 +1470,10 @@ def compare_two_groups(  # noqa: C901
             n_samples,
             int((g_int == 0).sum()),
         )
-    observed, null = _run_statistic_with_perm(
+    observed, null_dist = _run_statistic_with_perm(
         statistic, spectra, g_int, perm_labels, freq_weights=freq_weights
     )
-    pvals = _permutation_pvalue(observed, null)
+    pvals = _permutation_pvalue(observed, null_dist)
 
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]
@@ -1361,6 +1490,7 @@ def benchmark_statistics(
     groups: np.ndarray,
     gene_names: Sequence[str] | None = None,
     statistics: Sequence[str] = _AVAILABLE_STATISTICS,
+    null: str = "permutation",
     n_perm: int = 1000,
     random_state: int | None = None,
     n_perm_max: int = 10000,
@@ -1378,6 +1508,11 @@ def benchmark_statistics(
     statistics : sequence of str, default ``_AVAILABLE_STATISTICS``
         Subset of the implemented statistics (``'log_l2'``,
         ``'hotelling_lw'``, ``'mmd_rbf'``, ``'cauchy_welch'``).
+    null : {'permutation', 'wald', 'liu'}, default 'permutation'
+        Forwarded to each invocation of the underlying statistic. Only
+        ``'log_l2'`` accepts ``null='wald'``; for any other statistic the
+        argument is silently ignored (``'cauchy_welch'`` is always
+        analytic, others always permutation). Defaults preserve back-compat.
 
     Returns
     -------
@@ -1395,6 +1530,7 @@ def benchmark_statistics(
     for s in statistics:
         if s not in _available:
             raise ValueError(f"Unknown statistic '{s}'. Options: {sorted(_available)}.")
+    null_canon = _resolve_null(null)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, K), got {spectra.shape}.")
     n_samples, n_genes, _ = spectra.shape
@@ -1427,9 +1563,14 @@ def benchmark_statistics(
                     "P_value_per_bin": list(per_bin_p),
                 }
             )
+        elif s == "log_l2" and null_canon == "wald":
+            observed, pvals = _run_log_l2_wald(spectra, g_int, freq_weights=None)
+            df = pd.DataFrame(
+                {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
+            )
         else:
-            observed, null = _run_statistic_with_perm(s, spectra, g_int, perm_labels)
-            pvals = _permutation_pvalue(observed, null)
+            observed, null_dist = _run_statistic_with_perm(s, spectra, g_int, perm_labels)
+            pvals = _permutation_pvalue(observed, null_dist)
             df = pd.DataFrame(
                 {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
             )
@@ -1450,6 +1591,7 @@ def compare_two_groups_masked(  # noqa: C901
     presence: np.ndarray,
     gene_names: Sequence[str] | None = None,
     statistic: str = "log_l2",
+    null: str = "permutation",
     n_perm: int = 1000,
     random_state: int | None = None,
     min_samples_per_group: int = 2,
@@ -1476,6 +1618,12 @@ def compare_two_groups_masked(  # noqa: C901
         in that sample (contributes); ``False`` = gene is absent (ignored).
     gene_names : sequence of str, optional
     statistic : {'log_l2', 'hotelling_lw', 'mmd_rbf', 'cauchy_welch'}, default 'log_l2'
+    null : {'permutation', 'wald', 'liu'}, default 'permutation'
+        Currently only ``'permutation'`` is supported here. The analytic
+        Wald path requires a presence-complete gene panel for the
+        across-gene variance pooling; passing ``null='wald'`` raises
+        ``NotImplementedError``. Use :func:`compare_two_groups` after
+        pre-filtering genes to a complete panel for analytic p-values.
     n_perm : int, default 1000
     random_state : int, optional
     min_samples_per_group : int, default 2
@@ -1495,6 +1643,17 @@ def compare_two_groups_masked(  # noqa: C901
     _available = set(_STAT_FNS) | {"cauchy_welch"}
     if statistic not in _available:
         raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_available)}.")
+    null_canon = _resolve_null(null)
+    if null_canon == "wald":
+        # The Wald path uses a pooled-across-genes Σ estimator that requires
+        # all genes share the same sample set. Per-gene presence subsets
+        # break that pooling; defer until a per-gene-subset variance
+        # estimator is added.
+        raise NotImplementedError(
+            "null='wald' is not yet supported by compare_two_groups_masked. "
+            "Use null='permutation' (default), or call compare_two_groups "
+            "after pre-filtering genes to a presence-complete panel."
+        )
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D, got {spectra.shape}.")
     n_samples, n_genes, K = spectra.shape

@@ -497,6 +497,106 @@ class TestTwoGroupNullCalibration:
         assert 0.4 < df_a["P_value"].mean() < 0.6
 
 
+class TestLogL2WaldNull:
+    """Analytic Wald-type null for ``log_l2`` (mixture-χ² tail via Liu)."""
+
+    def test_synthetic_h0_pvalues_are_uniform(self):
+        """Under H0 with iid genes, Wald p-values should pass KS-uniform."""
+        rng = np.random.default_rng(0)
+        n_a, n_b, K = 4, 4, 30
+        # log-spectra ~ N(0, 1) → spectra ~ lognormal → realistic data scale.
+        spectra = np.exp(rng.standard_normal((n_a + n_b, 5000, K)))
+        groups = np.array([0] * n_a + [1] * n_b)
+        df = compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
+        ks_stat, ks_p = kstest(df["P_value"].to_numpy(), "uniform")
+        assert ks_p > 0.01, f"Wald p-values not uniform under H0: KS p={ks_p:.4f}"
+        # Mean should also be near 0.5.
+        assert 0.45 < df["P_value"].mean() < 0.55
+
+    def test_wald_breaks_permutation_floor_on_implanted_signal(self):
+        """An implanted strong shift gets p ≪ 1/(M+1) under Wald, vs flooring at
+        the smallest exact-permutation value under permutation.
+        """
+        rng = np.random.default_rng(7)
+        n_per = 4  # → C(8, 4) = 70 perms; floor = 1/71 ≈ 0.0141.
+        n_genes, K = 50, 30
+        a = np.exp(rng.normal(loc=0.0, scale=0.2, size=(n_per, n_genes, K)))
+        b = np.exp(rng.normal(loc=0.0, scale=0.2, size=(n_per, n_genes, K)))
+        # Strong shift on the first 5 genes' low-frequency bins.
+        b[:, :5, :3] *= 5.0
+        spectra = np.concatenate([a, b], axis=0)
+        groups = np.array([0] * n_per + [1] * n_per)
+        df_perm = compare_two_groups(
+            spectra, groups, statistic="log_l2", null="permutation", random_state=0
+        )
+        df_wald = compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
+        # All five implanted genes should pass through both filters.
+        # Under permutation they all hit the floor 1/71 ≈ 0.0141.
+        # Under Wald they should be far below the floor.
+        for g in ("0", "1", "2", "3", "4"):
+            p_perm = df_perm.loc[df_perm["Feature"] == g, "P_value"].iloc[0]
+            p_wald = df_wald.loc[df_wald["Feature"] == g, "P_value"].iloc[0]
+            assert p_wald < p_perm, f"gene {g}: Wald={p_wald:.3g} not < perm={p_perm:.3g}"
+            assert p_wald < 1.0 / 71.0, f"gene {g}: Wald={p_wald:.3g} above perm floor"
+
+    def test_liu_alias_matches_wald(self):
+        rng = np.random.default_rng(1)
+        spectra = np.exp(rng.standard_normal((6, 100, 20)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        df_w = compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
+        df_l = compare_two_groups(spectra, groups, statistic="log_l2", null="liu")
+        # Sort both by Feature for safe comparison.
+        df_w_s = df_w.sort_values("Feature").reset_index(drop=True)
+        df_l_s = df_l.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_array_equal(
+            df_w_s["P_value"].to_numpy(), df_l_s["P_value"].to_numpy()
+        )
+
+    def test_wald_is_deterministic(self):
+        rng = np.random.default_rng(2)
+        spectra = np.exp(rng.standard_normal((6, 100, 20)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        # Two calls with different seeds (Wald is RNG-free).
+        df_a = compare_two_groups(
+            spectra, groups, statistic="log_l2", null="wald", random_state=0
+        )
+        df_b = compare_two_groups(
+            spectra, groups, statistic="log_l2", null="wald", random_state=999
+        )
+        np.testing.assert_array_equal(
+            df_a.sort_values("Feature")["P_value"].to_numpy(),
+            df_b.sort_values("Feature")["P_value"].to_numpy(),
+        )
+
+    @pytest.mark.parametrize("stat", ["cauchy_welch", "hotelling_lw", "mmd_rbf"])
+    def test_wald_rejects_non_log_l2_statistic(self, stat):
+        rng = np.random.default_rng(3)
+        spectra = np.exp(rng.standard_normal((6, 50, 20)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        with pytest.raises(ValueError, match="null='wald' is only supported"):
+            compare_two_groups(spectra, groups, statistic=stat, null="wald")
+
+    def test_unknown_null_raises(self):
+        rng = np.random.default_rng(4)
+        spectra = np.exp(rng.standard_normal((6, 50, 20)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        with pytest.raises(ValueError, match="Unknown null"):
+            compare_two_groups(spectra, groups, statistic="log_l2", null="bootstrap")
+
+    def test_masked_path_rejects_wald(self):
+        rng = np.random.default_rng(5)
+        n_samples, n_genes, K = 6, 30, 20
+        spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        presence = np.ones((n_samples, n_genes), dtype=bool)
+        # Make one cell absent so the masked path is the natural choice.
+        presence[0, 0] = False
+        with pytest.raises(NotImplementedError, match="null='wald' is not yet supported"):
+            compare_two_groups_masked(
+                spectra, groups, presence, statistic="log_l2", null="wald"
+            )
+
+
 class TestTwoGroupPower:
     def test_implanted_difference_is_recovered(self):
         rng = np.random.default_rng(7)

@@ -272,6 +272,7 @@ class _ComparatorBase:
     def test_pattern(
         self,
         statistic: str = "log_l2",
+        null: str = "permutation",
         n_perm: int = 1000,
         random_state: int | None = None,
         freq_weights: np.ndarray | None = None,
@@ -284,6 +285,11 @@ class _ComparatorBase:
         when any ``(sample, gene)`` pair is marked absent in :attr:`presence_`
         (e.g. when ``presence_threshold > 0``), otherwise to
         :func:`~quadsv.comparators.multisample.compare_two_groups`.
+
+        ``null`` selects the null-distribution method:
+        ``'permutation'`` (default, back-compat) or ``'wald'`` (alias
+        ``'liu'``) for the analytic Wald-type test. Only ``log_l2`` accepts
+        ``null='wald'``; the masked path does not yet support it.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .test_pattern().")
@@ -295,6 +301,7 @@ class _ComparatorBase:
                 self.presence_,
                 gene_names=self.gene_names,
                 statistic=statistic,
+                null=null,
                 n_perm=n_perm,
                 random_state=random_state,
                 min_samples_per_group=self.min_samples_per_group,
@@ -306,6 +313,7 @@ class _ComparatorBase:
             self.groups,
             gene_names=self.gene_names,
             statistic=statistic,
+            null=null,
             n_perm=n_perm,
             random_state=random_state,
             freq_weights=freq_weights,
@@ -335,11 +343,16 @@ class _ComparatorBase:
     def benchmark(
         self,
         statistics: Sequence[str] = _AVAILABLE_STATISTICS,
+        null: str = "permutation",
         n_perm: int = 1000,
         random_state: int | None = None,
         n_perm_max: int = 10000,
     ) -> dict[str, Any]:
-        """Run :func:`benchmark_statistics` on :attr:`spectra_`."""
+        """Run :func:`benchmark_statistics` on :attr:`spectra_`.
+
+        ``null`` is forwarded; only ``log_l2`` honours ``null='wald'``,
+        other statistics ignore it.
+        """
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .benchmark().")
         return benchmark_statistics(
@@ -347,6 +360,7 @@ class _ComparatorBase:
             self.groups,
             gene_names=self.gene_names,
             statistics=statistics,
+            null=null,
             n_perm=n_perm,
             random_state=random_state,
             n_perm_max=n_perm_max,
