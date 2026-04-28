@@ -61,6 +61,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `quadsv/ tests/`).
 
 ### Removed
+- **Breaking**: `statistic="hotelling_lw"` and `statistic="mmd_rbf"` paths
+  retired from `compare_two_groups`, `compare_two_groups_masked`,
+  `benchmark_statistics`, and the comparator API. The benchmark sweep
+  showed both were impractically slow (per-gene matrix inversions /
+  pairwise kernels at >30 min/cell on a 3 000-gene panel) and were
+  consistently dominated on sensitivity by `log_l2 + null='wald'` or
+  `cauchy_welch`. `_AVAILABLE_STATISTICS` now reads `("log_l2",
+  "cauchy_welch")`. Callers passing the removed names will hit the
+  existing `ValueError("Unknown statistic ...")` validator. The internal
+  `_stat_hotelling_lw`, `_stat_mmd_rbf`, and `_ledoit_wolf_shrinkage`
+  helpers were also deleted (~57 LOC).
 - The six legacy-path shim modules `quadsv.fft`, `quadsv.nufft`,
   `quadsv.detector`, `quadsv.detector_grid`,
   `quadsv._detector_base`, and `quadsv.multisample`. Use the

@@ -568,13 +568,14 @@ class TestLogL2WaldNull:
             df_b.sort_values("Feature")["P_value"].to_numpy(),
         )
 
-    @pytest.mark.parametrize("stat", ["cauchy_welch", "hotelling_lw", "mmd_rbf"])
-    def test_wald_rejects_non_log_l2_statistic(self, stat):
+    def test_wald_rejects_non_log_l2_statistic(self):
         rng = np.random.default_rng(3)
         spectra = np.exp(rng.standard_normal((6, 50, 20)))
         groups = np.array([0, 0, 0, 1, 1, 1])
         with pytest.raises(ValueError, match="null='wald' is only supported"):
-            compare_two_groups(spectra, groups, statistic=stat, null="wald")
+            compare_two_groups(
+                spectra, groups, statistic="cauchy_welch", null="wald"
+            )
 
     def test_unknown_null_raises(self):
         rng = np.random.default_rng(4)
@@ -618,7 +619,7 @@ class TestTwoGroupPower:
 
 
 class TestStatisticAliases:
-    @pytest.mark.parametrize("stat", ["log_l2", "cauchy_welch", "hotelling_lw", "mmd_rbf"])
+    @pytest.mark.parametrize("stat", ["log_l2", "cauchy_welch"])
     def test_each_statistic_runs(self, stat):
         rng = np.random.default_rng(0)
         spectra = rng.uniform(0.1, 5.0, size=(6, 8, 6))
@@ -698,7 +699,7 @@ class TestBenchmark:
         spectra = rng.uniform(0.1, 5.0, size=(8, 12, 8))
         groups = np.array([0, 0, 0, 0, 1, 1, 1, 1])
         out = benchmark_statistics(spectra, groups, n_perm=50, random_state=0)
-        assert set(out.keys()) == {"log_l2", "hotelling_lw", "mmd_rbf", "cauchy_welch"}
+        assert set(out.keys()) == {"log_l2", "cauchy_welch"}
         for _stat, df in out.items():
             assert df.shape[0] == 12
             assert df["P_value"].between(0, 1).all()

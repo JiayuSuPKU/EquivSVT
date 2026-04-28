@@ -76,7 +76,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_AVAILABLE_STATISTICS = ("log_l2", "hotelling_lw", "mmd_rbf", "cauchy_welch")
+_AVAILABLE_STATISTICS = ("log_l2", "cauchy_welch")
 
 # Absolute clipping threshold for ``center='zscore'`` (both the FFT per-sample
 # helper :func:`compute_sample_spectrum` and the NUFFT comparator loop use
@@ -976,78 +976,13 @@ def _cauchy_combine(pvals: np.ndarray, axis: int = -1) -> np.ndarray:
     return 0.5 - np.arctan(T) / np.pi
 
 
-def _ledoit_wolf_shrinkage(X: np.ndarray) -> np.ndarray:
-    """Simple Ledoit-Wolf shrinkage estimator for a single (n, p) sample."""
-    n, p = X.shape
-    Xc = X - X.mean(axis=0, keepdims=True)
-    S = Xc.T @ Xc / max(n - 1, 1)
-    mu = np.trace(S) / p
-    target = mu * np.eye(p)
-    # Shrinkage intensity (Ledoit-Wolf 2004 simplified).
-    diff = S - target
-    d2 = (diff**2).sum()
-    b2 = 0.0
-    for i in range(n):
-        z = Xc[i : i + 1].T @ Xc[i : i + 1] - S
-        b2 += (z**2).sum()
-    b2 = min(b2 / (n**2), d2)
-    delta = b2 / max(d2, 1e-30)
-    return (1 - delta) * S + delta * target
-
-
-def _stat_hotelling_lw(group_a: np.ndarray, group_b: np.ndarray) -> np.ndarray:
-    """Regularized Hotelling T² with Ledoit-Wolf pooled covariance. Per-gene."""
-    n_genes = group_a.shape[1]
-    out = np.empty(n_genes)
-    n_a, n_b = group_a.shape[0], group_b.shape[0]
-    for g in range(n_genes):
-        Xa = group_a[:, g, :]
-        Xb = group_b[:, g, :]
-        Sa = _ledoit_wolf_shrinkage(Xa)
-        Sb = _ledoit_wolf_shrinkage(Xb)
-        S_pool = ((n_a - 1) * Sa + (n_b - 1) * Sb) / max(n_a + n_b - 2, 1)
-        diff = Xa.mean(axis=0) - Xb.mean(axis=0)
-        try:
-            inv_S = np.linalg.pinv(S_pool)
-        except np.linalg.LinAlgError:
-            inv_S = np.eye(S_pool.shape[0])
-        out[g] = (n_a * n_b) / (n_a + n_b) * diff @ inv_S @ diff
-    return out
-
-
-def _stat_mmd_rbf(group_a: np.ndarray, group_b: np.ndarray) -> np.ndarray:
-    """Biased MMD² with RBF kernel + median heuristic bandwidth. Per-gene."""
-    n_genes = group_a.shape[1]
-    out = np.empty(n_genes)
-    for g in range(n_genes):
-        Xa = group_a[:, g, :]
-        Xb = group_b[:, g, :]
-        Z = np.vstack([Xa, Xb])
-        # Pairwise squared distances via broadcasting.
-        diff = Z[:, None, :] - Z[None, :, :]
-        d2 = (diff**2).sum(axis=-1)
-        # Median heuristic on the strictly upper triangle.
-        iu = np.triu_indices(Z.shape[0], k=1)
-        med = np.median(d2[iu]) if iu[0].size else 1.0
-        gamma = 1.0 / max(med, 1e-30)
-        K = np.exp(-gamma * d2)
-        n_a = Xa.shape[0]
-        Kaa = K[:n_a, :n_a].mean()
-        Kbb = K[n_a:, n_a:].mean()
-        Kab = K[:n_a, n_a:].mean()
-        out[g] = Kaa + Kbb - 2.0 * Kab
-    return out
-
-
 _STAT_FNS = {
     "log_l2": _stat_log_l2,
-    "hotelling_lw": _stat_hotelling_lw,
-    "mmd_rbf": _stat_mmd_rbf,
 }
 
 # `cauchy_welch` lives outside _STAT_FNS because it returns a ``(n_genes, K)``
 # per-bin array (not a per-gene scalar) and needs a bespoke runner that turns
-# per-bin permutation p-values into a Cauchy-combined gene-level p-value.
+# per-bin analytic Welch p-values into a Cauchy-combined gene-level p-value.
 
 
 # ---------------------------------------------------------------------------
@@ -1340,13 +1275,15 @@ def compare_two_groups(  # noqa: C901
         (mapped internally to 0/1 in sorted order).
     gene_names : sequence of str, optional
         Names for the gene axis. If None, integer indices are used.
-    statistic : {'log_l2', 'hotelling_lw', 'mmd_rbf', 'cauchy_welch'}, default 'log_l2'
+    statistic : {'log_l2', 'cauchy_welch'}, default 'log_l2'
         Test statistic:
 
         - ``'log_l2'`` — (optionally weighted) L2 distance between mean
-          log-spectra. Global / summary statistic.
-        - ``'hotelling_lw'`` — regularized Hotelling :math:`T^2`.
-        - ``'mmd_rbf'`` — RBF-kernel maximum mean discrepancy.
+          log-spectra. Global / summary statistic. Pair with
+          ``null='wald'`` for an analytic mixture-χ² null that bypasses
+          the small-n permutation BH-floor; ``null='permutation'`` (default)
+          falls back to label permutations with exact enumeration when
+          ``C(n, n_a) ≤ n_perm_max``.
         - ``'cauchy_welch'`` — per-bin Welch two-sided t-test with
           **analytic** (t-distribution) p-values combined across bins via
           Cauchy's combination (Liu & Xie 2020). Analytic is the whole
@@ -1507,7 +1444,7 @@ def benchmark_statistics(
         Same meaning as :func:`compare_two_groups`.
     statistics : sequence of str, default ``_AVAILABLE_STATISTICS``
         Subset of the implemented statistics (``'log_l2'``,
-        ``'hotelling_lw'``, ``'mmd_rbf'``, ``'cauchy_welch'``).
+        ``'cauchy_welch'``).
     null : {'permutation', 'wald', 'liu'}, default 'permutation'
         Forwarded to each invocation of the underlying statistic. Only
         ``'log_l2'`` accepts ``null='wald'``; for any other statistic the
@@ -1617,7 +1554,7 @@ def compare_two_groups_masked(  # noqa: C901
         ``(n_samples, n_genes)`` boolean mask. ``True`` = gene is observed
         in that sample (contributes); ``False`` = gene is absent (ignored).
     gene_names : sequence of str, optional
-    statistic : {'log_l2', 'hotelling_lw', 'mmd_rbf', 'cauchy_welch'}, default 'log_l2'
+    statistic : {'log_l2', 'cauchy_welch'}, default 'log_l2'
     null : {'permutation', 'wald', 'liu'}, default 'permutation'
         Currently only ``'permutation'`` is supported here. The analytic
         Wald path requires a presence-complete gene panel for the
