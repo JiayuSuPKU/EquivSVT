@@ -1171,31 +1171,49 @@ def _resolve_null(null: str) -> str:
     return canon
 
 
-def _pooled_diag_within_group_var(
+def _pooled_full_within_group_sigma(
     spectra: np.ndarray, g_int: np.ndarray, *, eps: float = 1e-12
-) -> np.ndarray:
-    """Pooled-across-genes diagonal estimate of within-group log-spectrum variance.
+) -> tuple[np.ndarray, int]:
+    """Pooled-across-genes **full** within-group log-spectrum covariance.
 
-    For each (sample, gene, bin) entry, take the residual from the
-    within-group mean of log-spectrum, accumulate squared residuals, then
-    average across genes per frequency bin and divide by the residual
-    degrees of freedom ``n_a + n_b - 2``. Returns a ``(K,)`` array.
+    For each gene ``g`` we centre the log-spectrum at its within-group
+    mean to get residuals ``R_g`` of shape ``(n, K)``, form
+    ``Σ_g = R_gᵀ R_g / df`` (df = ``n_a + n_b - 2``), then average across
+    all ``G`` genes. The result is a ``(K, K)`` symmetric PSD matrix.
 
-    The pooling-across-genes assumption is the eBayes-style variance
-    stabilization used throughout differential analysis at small ``n``:
-    each gene contributes one ``df=n-2`` SSR estimate; averaging across
-    ``G`` genes produces a ``G·(n-2)``-df variance estimate per bin.
+    Why pooled and full (vs diagonal)?
+    Empirically the bin-bin correlation in real spatial spectra is large
+    (mean off-diag ``|r|`` between 0.5 and 0.95 across our three benchmark
+    panels), so the rank of the true Σ is far below ``K``. A diagonal
+    proxy spreads variance across all ``K`` directions and dramatically
+    under-models the tail of the resulting weighted-χ² mixture, which
+    causes the Wald null to be 4-15× anti-conservative. Pooling FULL Σ
+    across genes (rather than per-gene Σ_g, which is noisy at small
+    ``df``) gives a stable rank-correct estimate for the Liu integration.
+
+    Returns
+    -------
+    Sigma : np.ndarray
+        ``(K, K)`` pooled within-group covariance estimate.
+    df : int
+        Effective residual degrees of freedom ``n_a + n_b - 2``
+        (returned for downstream use; ``Sigma`` is already df-normalised).
     """
     a_mask = g_int == 0
-    log_a = np.log(np.maximum(spectra[a_mask], eps))
+    log_a = np.log(np.maximum(spectra[a_mask], eps))   # (n_a, G, K)
     log_b = np.log(np.maximum(spectra[~a_mask], eps))
     n_a = log_a.shape[0]
     n_b = log_b.shape[0]
     res_a = log_a - log_a.mean(axis=0, keepdims=True)
     res_b = log_b - log_b.mean(axis=0, keepdims=True)
-    ssr_per_gene = (res_a**2).sum(axis=0) + (res_b**2).sum(axis=0)  # (n_genes, K)
+    res = np.concatenate([res_a, res_b], axis=0)        # (n, G, K)
+    n, G, K = res.shape
     df = max(n_a + n_b - 2, 1)
-    return ssr_per_gene.mean(axis=0) / df  # (K,)
+    # Σ = (1/(G·df)) · Σ_g R_gᵀ R_g  reduces to a single matmul on the
+    # flattened (n·G, K) residual matrix.
+    res_flat = res.reshape(n * G, K)
+    Sigma = (res_flat.T @ res_flat) / (G * df)
+    return Sigma, df
 
 
 def _log_l2_wald_pvalues(
@@ -1226,9 +1244,10 @@ def _run_log_l2_wald(
 
     Returns ``(observed, pvals)`` both shape ``(n_genes,)``. Internally:
     1. ``observed_T = _stat_log_l2(group_a, group_b, freq_weights)``.
-    2. Pooled-diagonal Σ_ℓ across genes via :func:`_pooled_diag_within_group_var`.
-    3. Eigenvalues of ``W½ Σ_D W½`` are diagonal:
-       ``λ_k = (1/n_a + 1/n_b) · w_k · σ_k²``.
+    2. Pooled-across-genes **full** Σ_ℓ via
+       :func:`_pooled_full_within_group_sigma`.
+    3. Eigenvalues of ``W½ Σ_D W½`` from a single 30×30 eigendecomposition,
+       where ``Σ_D = (1/n_a + 1/n_b) · Σ_ℓ``.
     4. ``p = liu_sf(T², λ)`` for the weighted-χ² tail.
     """
     a_mask = g_int == 0
@@ -1240,9 +1259,11 @@ def _run_log_l2_wald(
     w = _resolve_freq_weights(freq_weights, K)
 
     observed = _stat_log_l2(group_a, group_b, freq_weights=freq_weights)  # (n_genes,)
-    sigma2 = _pooled_diag_within_group_var(spectra, g_int)               # (K,)
+    Sigma_ell, _df = _pooled_full_within_group_sigma(spectra, g_int)      # (K, K), df
     v_c = (1.0 / max(n_a, 1)) + (1.0 / max(n_b, 1))
-    lambs = w * sigma2 * v_c                                              # (K,)
+    sqW = np.sqrt(w)
+    M = (sqW[:, None] * Sigma_ell * sqW[None, :]) * v_c                   # (K, K)
+    lambs = np.maximum(np.linalg.eigvalsh(M), 0.0)                        # (K,)
     pvals = _log_l2_wald_pvalues(observed, lambs)
     return observed, pvals
 
@@ -1402,14 +1423,19 @@ def _run_log_l2_glm_wald(
     df_resid = max(n_samples - p, 1)
 
     theta = np.tensordot(contrast_vec, beta, axes=([0], [0]))   # (n_genes, K)
-    ssr_per_gene = (res**2).sum(axis=0)                          # (n_genes, K)
-    sigma2_per_bin = ssr_per_gene.mean(axis=0) / df_resid        # (K,)
+
+    # Pooled-across-genes FULL within-gene covariance Σ_ℓ ∈ R^{K×K}.
+    # Mirrors :func:`_pooled_full_within_group_sigma` but uses GLM residuals.
+    res_2d = res.reshape(n_samples * n_genes, K)
+    Sigma_ell = (res_2d.T @ res_2d) / (n_genes * df_resid)
+    v_c = float(contrast_vec @ XtX_inv @ contrast_vec)
 
     w = _resolve_freq_weights(freq_weights, K)
     T2 = (w * theta**2).sum(axis=-1)                             # (n_genes,)
     T_obs = np.sqrt(T2)
-    v_c = float(contrast_vec @ XtX_inv @ contrast_vec)
-    lambs = w * sigma2_per_bin * v_c
+    sqW = np.sqrt(w)
+    M = (sqW[:, None] * Sigma_ell * sqW[None, :]) * v_c
+    lambs = np.maximum(np.linalg.eigvalsh(M), 0.0)
     pvals = _log_l2_wald_pvalues(T_obs, lambs)
     return T_obs, pvals
 

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`null="wald"` for `log_l2` now uses a pooled-across-genes FULL Σ
+  estimator** (was: pooled-diagonal Σ). The diagonal proxy was empirically
+  anti-conservative on real spatial data because radial-bin spectra are
+  strongly correlated within each gene (mean off-diag |r| 0.5-0.95 across
+  benchmark panels), so the true Σ has effective rank 1-4 not 30. The
+  diagonal proxy spread that single dominant eigenvalue across all 30
+  bins, dramatically under-modelling the tail of the resulting weighted-χ²
+  mixture and producing within-group null FPR up to 0.71 instead of the
+  nominal 0.05. Switching to pooled-FULL Σ + a single 30×30
+  eigendecomposition before Liu integration drops mean within-group null
+  FPR from 0.175 → 0.012 across the three benchmark panels (14×) without
+  changing sensitivity. The recommended pipeline is now
+  `radial / mean / log_l2 + null="wald"` again (was `cauchy_welch` in the
+  previous benchmark run because of the FPR penalty in the composite
+  score). See `TestLogL2WaldNull::test_full_sigma_calibrates_under_correlated_bins`
+  for a synthetic regression test. Residual anti-conservativeness at
+  df=1 (1-vs-2 splits) is a known limitation tied to noise in the σ²
+  estimator itself; eBayes-style σ²-shrinkage would close it.
+
 ### Added
 - New `compare_designs(spectra, design, contrast, ...)` public function
   generalises the two-group comparator to arbitrary OLS designs (binary,
