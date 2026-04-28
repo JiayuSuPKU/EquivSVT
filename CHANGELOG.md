@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New `compare_designs(spectra, design, contrast, ...)` public function
+  generalises the two-group comparator to arbitrary OLS designs (binary,
+  continuous, or multi-factor). Supports analytic Wald null only
+  (`null="wald"`, alias `"liu"`); permutation is intentionally not
+  implemented for the GLM path (use the binary `groups=` API for
+  permutation tests). The two-group case is recovered exactly: passing
+  `design=pd.DataFrame({"g": groups})` with `contrast="g"` produces
+  p-values matching `compare_two_groups(..., null="wald")` to ~1e-10.
+- `ComparatorIrregular` and `ComparatorGrid` constructors accept a new
+  `design=` keyword (mutually exclusive with `groups=`). DataFrames are
+  encoded via patsy (`~ <every column>` formula, treatment-coded
+  categoricals + intercept); ndarrays are used as-is. The
+  back-compat `groups=` keyword is preserved.
+- `Comparator.test_pattern(...)` accepts a new `contrast=` argument: a
+  column name (auto-resolves treatment-coded factor levels), a dict
+  `{column: coefficient}`, or a length-`p` numpy contrast vector.
+  Defaults to `None`, in which case the binary `groups=` path is used.
 - Analytic Wald-type null for `log_l2`: pass `null="wald"` (alias
   `null="liu"`) to `compare_two_groups`, `compare_two_groups_masked`,
   `benchmark_statistics`, or `Comparator.test_pattern`/`.benchmark`.

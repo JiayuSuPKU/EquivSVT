@@ -21,7 +21,11 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 
 import spatialdata as sd
 
-from quadsv.comparators.base import _ComparatorBase, _validate_common, _validate_groups
+from quadsv.comparators.base import (
+    _ComparatorBase,
+    _validate_common,
+    _validate_groups_or_design,
+)
 from quadsv.comparators.multisample import compute_sample_spectrum
 
 __all__ = ["ComparatorGrid"]
@@ -48,7 +52,12 @@ class ComparatorGrid(_ComparatorBase):
     Parameters
     ----------
     samples : sequence of :class:`spatialdata.SpatialData`
-    groups : np.ndarray
+    groups : np.ndarray, optional
+        Two-label group vector, length ``len(samples)``. Pass exactly one
+        of ``groups`` or ``design``.
+    design : pd.DataFrame or np.ndarray, optional
+        Sample-level design matrix for the GLM Wald test path. See
+        :class:`ComparatorIrregular` for the contrast resolution rules.
     bins : str
         SpatialElement key for the bin shapes in each ``sdata``.
     table_name : str
@@ -76,7 +85,7 @@ class ComparatorGrid(_ComparatorBase):
     def __init__(
         self,
         samples: Sequence[Any],
-        groups: np.ndarray,
+        groups: np.ndarray | None = None,
         *,
         bins: str,
         table_name: str,
@@ -84,6 +93,7 @@ class ComparatorGrid(_ComparatorBase):
         row_key: str,
         value_key: str | None = None,
         gene_names: Sequence[str] | None = None,
+        design: "Any | None" = None,
         feature_mode: str = "radial",
         n_radial_bins: int = 30,
         fft_solver: str = "rfft2",
@@ -107,11 +117,12 @@ class ComparatorGrid(_ComparatorBase):
                     f"sample {i} is {type(s).__name__}, expected spatialdata.SpatialData."
                 )
 
-        groups = _validate_groups(groups, len(samples_list))
+        groups, design = _validate_groups_or_design(groups, design, len(samples_list))
         resolved = _resolve_spatialdata_gene_names(samples_list, gene_names, table_name)
 
         self.samples = samples_list
         self.groups = groups
+        self.design = design
         self.gene_names = list(resolved)
         self.feature_mode = feature_mode
         self.n_radial_bins = int(n_radial_bins)

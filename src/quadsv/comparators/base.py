@@ -32,6 +32,7 @@ from quadsv.comparators.multisample import (
     _AVAILABLE_STATISTICS,
     align_spectra_by_rotation,
     benchmark_statistics,
+    compare_designs,
     compare_two_groups,
     compare_two_groups_masked,
     compare_two_groups_scalar,
@@ -61,7 +62,13 @@ class _ComparatorBase:
 
     # --- attribute stubs populated by subclass __init__ ---------------
     samples: list[Any]
-    groups: np.ndarray
+    groups: np.ndarray | None
+    """Binary group labels of length ``n_samples`` when constructed with
+    ``groups=`` (back-compat path); ``None`` when constructed with
+    ``design=``."""
+    design: "Any | None"
+    """Original ``design`` argument (DataFrame or ndarray); ``None`` when
+    constructed with ``groups=``."""
     gene_names: list[str]
     feature_mode: str
     center: str | None
@@ -273,26 +280,64 @@ class _ComparatorBase:
         self,
         statistic: str = "log_l2",
         null: str = "permutation",
+        contrast: "str | dict[str, float] | np.ndarray | None" = None,
         n_perm: int = 1000,
         random_state: int | None = None,
         freq_weights: np.ndarray | None = None,
         n_perm_max: int = 10000,
     ) -> Any:
-        """Two-group spectral-pattern test on :attr:`spectra_`.
+        """Spectral-pattern test on :attr:`spectra_`.
 
-        Dispatches to
-        :func:`quadsv.comparators.multisample.compare_two_groups_masked`
-        when any ``(sample, gene)`` pair is marked absent in :attr:`presence_`
-        (e.g. when ``presence_threshold > 0``), otherwise to
-        :func:`~quadsv.comparators.multisample.compare_two_groups`.
+        Dispatches between three execution paths:
 
-        ``null`` selects the null-distribution method:
-        ``'permutation'`` (default, back-compat) or ``'wald'`` (alias
-        ``'liu'``) for the analytic Wald-type test. Only ``log_l2`` accepts
-        ``null='wald'``; the masked path does not yet support it.
+        - **Binary, permutation null** (`groups=` constructor path,
+          ``null="permutation"``, ``contrast=None``): the back-compat
+          two-group permutation test via
+          :func:`~quadsv.comparators.multisample.compare_two_groups`
+          (or its masked variant when any presence flag is False).
+        - **Binary, Wald null** (`groups=` constructor path,
+          ``null="wald"``, ``contrast=None``): the analytic Wald test for
+          the same binary indicator.
+        - **GLM Wald** (`design=` constructor path **or** explicit
+          ``contrast=``): the generalized analytic Wald test via
+          :func:`~quadsv.comparators.multisample.compare_designs`.
+
+        ``contrast`` is required when the comparator was constructed with
+        ``design=``. When ``contrast`` is supplied alongside the binary
+        ``groups=`` path the design is constructed on the fly from
+        ``groups`` (single-column DataFrame) so the same contrast resolution
+        rules apply.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .test_pattern().")
+
+        use_glm = (contrast is not None) or (self.groups is None)
+        if use_glm:
+            null_canon = null if null in ("wald", "liu") else null
+            if null_canon not in ("wald", "liu"):
+                raise NotImplementedError(
+                    "Only null='wald' (alias 'liu') is supported when "
+                    "contrast= is provided or the comparator was constructed "
+                    "with design=. Pass null='wald' or use the binary "
+                    "groups= path with null='permutation'."
+                )
+            if contrast is None:
+                raise ValueError(
+                    "test_pattern() requires `contrast=` when the comparator "
+                    "was constructed with `design=`."
+                )
+            design = self.design if self.design is not None else _groups_to_design(self.groups)
+            return compare_designs(
+                self.spectra_,
+                design,
+                contrast,
+                gene_names=self.gene_names,
+                statistic=statistic,
+                null=null,
+                freq_weights=freq_weights,
+            )
+
+        # Binary path (groups was set, contrast is None).
         use_masked = self.presence_ is not None and not self.presence_.all()
         if use_masked:
             return compare_two_groups_masked(
@@ -328,9 +373,21 @@ class _ComparatorBase:
         random_state: int | None = None,
         n_perm_max: int = 10000,
     ) -> Any:
-        """Classical DE test on the DC component (per-sample per-gene grid mean)."""
+        """Classical DE test on the DC component (per-sample per-gene grid mean).
+
+        Currently the binary-groups path only — call only when the
+        comparator was constructed with ``groups=``.
+        """
         if self.dc_ is None:
             raise RuntimeError("Call .fit() before .test_expression().")
+        if self.groups is None:
+            raise NotImplementedError(
+                "test_expression() currently requires the binary `groups=` "
+                "constructor path. The DC-component DE test does not yet "
+                "support a general design matrix; use a downstream tool "
+                "(e.g., scanpy.tl.rank_genes_groups) on the per-sample DC "
+                "values for now."
+            )
         return compare_two_groups_scalar(
             self.dc_,
             self.groups,
@@ -351,10 +408,16 @@ class _ComparatorBase:
         """Run :func:`benchmark_statistics` on :attr:`spectra_`.
 
         ``null`` is forwarded; only ``log_l2`` honours ``null='wald'``,
-        other statistics ignore it.
+        other statistics ignore it. Requires the binary ``groups=``
+        constructor path.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .benchmark().")
+        if self.groups is None:
+            raise NotImplementedError(
+                "benchmark() currently requires the binary `groups=` "
+                "constructor path."
+            )
         return benchmark_statistics(
             self.spectra_,
             self.groups,
@@ -379,6 +442,72 @@ def _validate_groups(groups: np.ndarray, n_samples: int) -> np.ndarray:
     if np.unique(groups).size != 2:
         raise ValueError("groups must contain exactly two distinct labels.")
     return groups
+
+
+def _groups_to_design(groups: np.ndarray) -> "Any":
+    """Wrap a 1-D groups array in a single-column pandas DataFrame.
+
+    The resulting DataFrame is consumed by patsy in
+    :func:`compare_designs` to build a design matrix
+    ``[intercept, group[T.<level>]]``. The contrast string ``"group"``
+    then auto-resolves to the indicator column.
+
+    pandas is only imported here (rather than at module import time) so
+    that callers using the array-only constructor signatures don't pay
+    the import cost.
+    """
+    import pandas as pd  # local import: optional dep for the DataFrame path
+
+    return pd.DataFrame({"group": np.asarray(groups)})
+
+
+def _validate_groups_or_design(
+    groups: "np.ndarray | None",
+    design: "pd.DataFrame | np.ndarray | None",
+    n_samples: int,
+) -> tuple["np.ndarray | None", "Any | None"]:
+    """Validate that exactly one of ``groups`` or ``design`` is supplied.
+
+    Returns ``(groups_or_None, design_or_None)`` — leaves the original
+    object intact for downstream use; subclasses store both. The caller
+    can build the actual numeric design matrix via
+    :func:`quadsv.comparators.multisample._build_design_matrix` when needed.
+    """
+    if groups is None and design is None:
+        raise ValueError(
+            "Exactly one of `groups` or `design` must be supplied at construction."
+        )
+    if groups is not None and design is not None:
+        raise ValueError(
+            "Pass either `groups` or `design`, not both."
+        )
+    if groups is not None:
+        return _validate_groups(groups, n_samples), None
+    # design is not None
+    # Light validation only; the heavy lifting (patsy / column resolution)
+    # happens lazily at test_pattern() time so we don't load patsy unless
+    # the GLM path is actually used.
+    try:
+        import pandas as _pd  # noqa: F401
+    except ImportError:
+        _pd = None
+    if _pd is not None and isinstance(design, _pd.DataFrame):
+        if len(design) != n_samples:
+            raise ValueError(
+                f"design DataFrame length {len(design)} != n_samples={n_samples}."
+            )
+    elif isinstance(design, np.ndarray):
+        if design.ndim != 2 or design.shape[0] != n_samples:
+            raise ValueError(
+                f"design ndarray must be (n_samples, p) = ({n_samples}, p), "
+                f"got {design.shape}."
+            )
+    else:
+        raise TypeError(
+            f"design must be a pandas DataFrame or numpy ndarray, "
+            f"got {type(design).__name__}."
+        )
+    return None, design
 
 
 def _validate_common(

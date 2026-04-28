@@ -15,7 +15,11 @@ import scipy.sparse as sp
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
-from quadsv.comparators.base import _ComparatorBase, _validate_common, _validate_groups
+from quadsv.comparators.base import (
+    _ComparatorBase,
+    _validate_common,
+    _validate_groups_or_design,
+)
 from quadsv.comparators.multisample import _ZSCORE_CLIP
 
 __all__ = ["ComparatorIrregular"]
@@ -42,8 +46,18 @@ class ComparatorIrregular(_ComparatorBase):
     Parameters
     ----------
     samples : sequence of :class:`anndata.AnnData`
-    groups : np.ndarray
-        Two-label group vector, length ``len(samples)``.
+    groups : np.ndarray, optional
+        Two-label group vector, length ``len(samples)``. Pass exactly one
+        of ``groups`` or ``design``.
+    design : pd.DataFrame or np.ndarray, optional
+        Sample-level design matrix for the GLM Wald test path. A DataFrame
+        is auto-encoded via patsy (``~ <every column>`` formula, with
+        treatment-coded categoricals + intercept); a numpy array of shape
+        ``(n_samples, p)`` is used as-is. Pair with
+        ``test_pattern(contrast=..., null="wald")`` to test a 1-DOF linear
+        contrast. The two-group ``groups=`` API is preserved for
+        back-compat and uses the same Wald math under the hood when
+        called with ``null="wald"``.
     gene_names : sequence of str, optional
         If None, inferred from the first sample; every other sample must share
         the same ``var_names``.
@@ -76,9 +90,10 @@ class ComparatorIrregular(_ComparatorBase):
     def __init__(
         self,
         samples: Sequence[Any],
-        groups: np.ndarray,
+        groups: np.ndarray | None = None,
         gene_names: Sequence[str] | None = None,
         *,
+        design: "Any | None" = None,
         feature_mode: str = "radial",
         n_radial_bins: int = 30,
         obsm_key: str = "spatial",
@@ -104,11 +119,12 @@ class ComparatorIrregular(_ComparatorBase):
             if not isinstance(s, _ad.AnnData):
                 raise TypeError(f"sample {i} is {type(s).__name__}, expected anndata.AnnData.")
 
-        groups = _validate_groups(groups, len(samples_list))
+        groups, design = _validate_groups_or_design(groups, design, len(samples_list))
         resolved = _resolve_anndata_gene_names(samples_list, gene_names, layer=layer)
 
         self.samples = samples_list
         self.groups = groups
+        self.design = design
         self.gene_names = list(resolved)
         self.feature_mode = feature_mode
         self.n_radial_bins = int(n_radial_bins)

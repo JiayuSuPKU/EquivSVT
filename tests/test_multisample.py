@@ -12,6 +12,7 @@ from quadsv.comparators.multisample import (
     align_spectra_by_rotation,
     apply_rotations_to_spectra,
     benchmark_statistics,
+    compare_designs,
     compare_two_groups,
     compare_two_groups_masked,
     compare_two_groups_scalar,
@@ -596,6 +597,143 @@ class TestLogL2WaldNull:
             compare_two_groups_masked(
                 spectra, groups, presence, statistic="log_l2", null="wald"
             )
+
+
+class TestCompareDesignsAndGLMWald:
+    """`compare_designs` GLM Wald path + `ComparatorIrregular(design=)`."""
+
+    def test_binary_design_matches_groups_path_byte_close(self):
+        """Two-group Wald via groups= and via design= must agree to ~1e-10.
+
+        This is the central calibration anchor: the GLM Wald path with a
+        single binary indicator literally recovers the binary Wald math
+        from Commit 1, modulo float64 round-off in the OLS solve.
+        """
+        import pandas as pd
+
+        rng = np.random.default_rng(0)
+        spectra = np.exp(rng.standard_normal((8, 200, 25)))
+        groups = np.array(["WT"] * 4 + ["TG"] * 4)
+
+        df_g = compare_two_groups(
+            spectra, groups, statistic="log_l2", null="wald"
+        ).sort_values("Feature").reset_index(drop=True)
+
+        design = pd.DataFrame({"genotype": groups})
+        df_d = compare_designs(
+            spectra, design, contrast="genotype", null="wald"
+        ).sort_values("Feature").reset_index(drop=True)
+
+        np.testing.assert_allclose(
+            df_g["P_value"].to_numpy(), df_d["P_value"].to_numpy(), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            df_g["Statistic"].to_numpy(), df_d["Statistic"].to_numpy(), atol=1e-10
+        )
+
+    def test_continuous_contrast_recovers_planted_signal(self):
+        """A linear time-trend planted on the first few genes should be
+        recovered by `contrast='time'`.
+        """
+        import pandas as pd
+
+        rng = np.random.default_rng(7)
+        n, n_genes, K = 8, 100, 25
+        x = np.linspace(0.0, 1.0, n)
+        beta = np.zeros((n_genes, K))
+        beta[:5, :3] = 5.0  # planted on low-frequency bins of first 5 genes
+        log_y = beta[None, :, :] * x[:, None, None] + 0.3 * rng.standard_normal((n, n_genes, K))
+        spectra = np.exp(log_y)
+        design = pd.DataFrame({"time": x})
+        df = compare_designs(spectra, design, contrast="time", null="wald")
+        top10 = set(df.head(10)["Feature"].tolist())
+        assert {"0", "1", "2", "3", "4"} <= top10, f"missing planted: {top10}"
+
+    def test_dict_contrast_normalization(self):
+        """A dict contrast spec must produce the same result as the
+        equivalent ndarray.
+        """
+        import pandas as pd
+
+        rng = np.random.default_rng(2)
+        spectra = np.exp(rng.standard_normal((8, 30, 20)))
+        design = pd.DataFrame({"a": [0, 1, 0, 1, 0, 1, 0, 1], "b": np.arange(8)})
+        df_dict = compare_designs(
+            spectra, design, contrast={"a": 1.0}, null="wald"
+        ).sort_values("Feature").reset_index(drop=True)
+        df_str = compare_designs(
+            spectra, design, contrast="a", null="wald"
+        ).sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(
+            df_dict["P_value"].to_numpy(), df_str["P_value"].to_numpy()
+        )
+
+    def test_ndarray_design_with_intercept_only(self):
+        """Numpy design matrix (caller-built) flows through compare_designs."""
+        rng = np.random.default_rng(3)
+        n, n_genes, K = 6, 20, 18
+        spectra = np.exp(rng.standard_normal((n, n_genes, K)))
+        # Design = [intercept, group_indicator]
+        X = np.column_stack([np.ones(n), [0, 0, 0, 1, 1, 1]])
+        df = compare_designs(
+            spectra, X, contrast=np.array([0.0, 1.0]), null="wald"
+        )
+        assert df.shape[0] == n_genes
+        assert df["P_value"].between(0, 1).all()
+
+    def test_compare_designs_rejects_permutation_null(self):
+        import pandas as pd
+
+        rng = np.random.default_rng(0)
+        spectra = np.exp(rng.standard_normal((6, 10, 12)))
+        design = pd.DataFrame({"g": [0, 0, 0, 1, 1, 1]})
+        with pytest.raises(NotImplementedError, match="Permutation null"):
+            compare_designs(
+                spectra, design, contrast="g", null="permutation"
+            )
+
+    def test_compare_designs_rejects_non_log_l2(self):
+        import pandas as pd
+
+        rng = np.random.default_rng(0)
+        spectra = np.exp(rng.standard_normal((6, 10, 12)))
+        design = pd.DataFrame({"g": [0, 0, 0, 1, 1, 1]})
+        with pytest.raises(ValueError, match="only supports statistic='log_l2'"):
+            compare_designs(
+                spectra, design, contrast="g", statistic="cauchy_welch", null="wald"
+            )
+
+    def test_invalid_groups_and_design_both_supplied(self):
+        rng = np.random.default_rng(0)
+        coords = rng.uniform(0, 100, size=(50, 2))
+        ad_obj = _grid_to_adata(rng.uniform(size=(3, 8, 8)), gene_names=[f"g{i}" for i in range(3)])
+        # Build 4 simple AnnData samples for the constructor.
+        samples = []
+        for _ in range(4):
+            samples.append(
+                _grid_to_adata(
+                    rng.uniform(size=(5, 8, 8)),
+                    gene_names=[f"g{i}" for i in range(5)],
+                )
+            )
+        import pandas as pd
+
+        groups = np.array([0, 0, 1, 1])
+        design = pd.DataFrame({"x": [0.1, 0.2, 0.3, 0.4]})
+        with pytest.raises(ValueError, match="not both"):
+            ComparatorIrregular(samples, groups=groups, design=design)
+
+    def test_invalid_neither_groups_nor_design(self):
+        rng = np.random.default_rng(0)
+        samples = [
+            _grid_to_adata(
+                rng.uniform(size=(5, 8, 8)),
+                gene_names=[f"g{i}" for i in range(5)],
+            )
+            for _ in range(4)
+        ]
+        with pytest.raises(ValueError, match="Exactly one of"):
+            ComparatorIrregular(samples)
 
 
 class TestTwoGroupPower:

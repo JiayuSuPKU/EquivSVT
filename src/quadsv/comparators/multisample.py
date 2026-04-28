@@ -71,6 +71,7 @@ __all__ = [
     "compare_two_groups",
     "compare_two_groups_masked",
     "compare_two_groups_scalar",
+    "compare_designs",
     "benchmark_statistics",
 ]
 
@@ -1247,6 +1248,173 @@ def _run_log_l2_wald(
 
 
 # ---------------------------------------------------------------------------
+# Step 4b'' — generalized GLM Wald path for log_l2 (design matrix + contrast)
+# ---------------------------------------------------------------------------
+
+
+def _build_design_matrix(
+    design: "pd.DataFrame | np.ndarray", n_samples: int
+) -> tuple[np.ndarray, list[str]]:
+    """Convert ``design`` to a ``(n_samples, p)`` numeric matrix + column labels.
+
+    - ``np.ndarray`` of shape ``(n_samples, p)`` is accepted as-is; columns
+      are labelled ``x0, x1, ...``. The caller is responsible for including
+      an intercept column if desired.
+    - ``pd.DataFrame``: encoded via :func:`patsy.dmatrix` with the formula
+      ``~ <col1> + <col2> + ...``, which adds an intercept and one-hot
+      encodes categoricals (Treatment contrast against the first level).
+      If patsy is not installed, raise ``ImportError`` with an install hint.
+    """
+    if isinstance(design, np.ndarray):
+        X = np.asarray(design, dtype=float)
+        if X.ndim != 2 or X.shape[0] != n_samples:
+            raise ValueError(
+                f"design ndarray must be (n_samples, p) = ({n_samples}, p), "
+                f"got {X.shape}."
+            )
+        return X, [f"x{i}" for i in range(X.shape[1])]
+
+    if not isinstance(design, pd.DataFrame):
+        raise TypeError(
+            f"design must be a numpy ndarray or pandas DataFrame, "
+            f"got {type(design).__name__}."
+        )
+    if len(design) != n_samples:
+        raise ValueError(
+            f"design DataFrame length {len(design)} does not match "
+            f"n_samples={n_samples}."
+        )
+    try:
+        import patsy
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "Building a design matrix from a pandas DataFrame requires patsy. "
+            "Install via `pip install patsy` or pass a pre-built numpy "
+            "design matrix instead."
+        ) from e
+    formula = "~ " + " + ".join(str(c) for c in design.columns)
+    X_pat = patsy.dmatrix(formula, design, return_type="dataframe")
+    return X_pat.to_numpy().astype(float), list(X_pat.columns)
+
+
+def _resolve_contrast(
+    contrast: "str | dict[str, float] | np.ndarray", design_columns: Sequence[str]
+) -> np.ndarray:
+    """Map the user-supplied contrast spec to a length-``p`` numeric vector.
+
+    - ``str``: column name in the design matrix. Auto-resolves patsy
+      treatment-coded factors (e.g., ``"genotype"`` → ``"genotype[T.TG]"``)
+      when there is exactly one matching column. For multi-level factors
+      with >1 matching column this raises ``ValueError`` (multi-DOF
+      contrasts are out of scope; pass an explicit dict or ndarray).
+    - ``dict``: maps column-name → coefficient; missing columns get 0.
+    - ``ndarray`` of shape ``(p,)``: used as-is.
+    """
+    p = len(design_columns)
+    if isinstance(contrast, np.ndarray):
+        c = np.asarray(contrast, dtype=float)
+        if c.shape != (p,):
+            raise ValueError(
+                f"contrast ndarray must have length p={p}, got shape {c.shape}."
+            )
+        return c
+    if isinstance(contrast, str):
+        if contrast in design_columns:
+            target = contrast
+        else:
+            matches = [col for col in design_columns if col.startswith(contrast + "[T.")]
+            if not matches:
+                raise ValueError(
+                    f"Contrast '{contrast}' not found in design columns "
+                    f"{list(design_columns)}."
+                )
+            if len(matches) > 1:
+                raise ValueError(
+                    f"Contrast '{contrast}' is ambiguous — matches "
+                    f"{matches}. Pass an explicit dict or ndarray (multi-DOF "
+                    f"contrasts are out of scope)."
+                )
+            target = matches[0]
+        c = np.zeros(p, dtype=float)
+        c[list(design_columns).index(target)] = 1.0
+        return c
+    if isinstance(contrast, dict):
+        c = np.zeros(p, dtype=float)
+        for k, v in contrast.items():
+            if k not in design_columns:
+                raise ValueError(
+                    f"Contrast key '{k}' not in design columns "
+                    f"{list(design_columns)}."
+                )
+            c[list(design_columns).index(k)] = float(v)
+        return c
+    raise TypeError(
+        f"Contrast must be a str, dict, or ndarray; got {type(contrast).__name__}."
+    )
+
+
+def _run_log_l2_glm_wald(
+    spectra: np.ndarray,
+    X: np.ndarray,
+    contrast_vec: np.ndarray,
+    freq_weights: np.ndarray | None,
+    *,
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Wald-type analytic ``log_l2`` test for a general design matrix.
+
+    Per gene per bin we fit ``log y = X β + ε`` by OLS, take the linear
+    contrast ``θ = cᵀβ``, and test ``H₀: θ = 0`` aggregated across bins
+    via the same weighted-L2 quadratic form. Under H₀ the eigenvalues of
+    the null distribution are
+    ``λ_k = w_k · σ_k² · cᵀ(XᵀX)⁻¹c`` (diagonal because Σ is taken
+    diagonal and pooled across genes), and the tail is integrated via
+    Liu's mixture-χ² approximation — same machinery as the binary case
+    in :func:`_run_log_l2_wald`. The two-group case literally recovers
+    the binary path: ``X = [1, 1_A]``, ``c = [0, 1]``, ``v_c = 1/n_a + 1/n_b``.
+
+    Returns
+    -------
+    observed : np.ndarray
+        ``(n_genes,)`` per-gene statistic ``√Σ_k w_k θ_k²``.
+    pvals : np.ndarray
+        ``(n_genes,)`` Wald p-values via Liu.
+    """
+    n_samples, n_genes, K = spectra.shape
+    p = X.shape[1]
+    if X.shape[0] != n_samples:
+        raise ValueError(
+            f"design first dim {X.shape[0]} != n_samples {n_samples}."
+        )
+    if contrast_vec.shape != (p,):
+        raise ValueError(
+            f"contrast length {contrast_vec.shape} != design cols ({p},)."
+        )
+
+    Y = np.log(np.maximum(spectra, eps))   # (n, G, K)
+    Y_flat = Y.reshape(n_samples, n_genes * K)
+    XtX = X.T @ X
+    XtX_inv = np.linalg.pinv(XtX)
+    beta_flat = XtX_inv @ (X.T @ Y_flat)             # (p, G*K)
+    res_flat = Y_flat - X @ beta_flat                # (n, G*K)
+    beta = beta_flat.reshape(p, n_genes, K)
+    res = res_flat.reshape(n_samples, n_genes, K)
+    df_resid = max(n_samples - p, 1)
+
+    theta = np.tensordot(contrast_vec, beta, axes=([0], [0]))   # (n_genes, K)
+    ssr_per_gene = (res**2).sum(axis=0)                          # (n_genes, K)
+    sigma2_per_bin = ssr_per_gene.mean(axis=0) / df_resid        # (K,)
+
+    w = _resolve_freq_weights(freq_weights, K)
+    T2 = (w * theta**2).sum(axis=-1)                             # (n_genes,)
+    T_obs = np.sqrt(T2)
+    v_c = float(contrast_vec @ XtX_inv @ contrast_vec)
+    lambs = w * sigma2_per_bin * v_c
+    pvals = _log_l2_wald_pvalues(T_obs, lambs)
+    return T_obs, pvals
+
+
+# ---------------------------------------------------------------------------
 # Step 4c — public test functions
 # ---------------------------------------------------------------------------
 
@@ -1745,6 +1913,98 @@ def compare_two_groups_scalar(
     )
     _apply_bh_correction(df)
     return df.sort_values("Statistic", ascending=False).reset_index(drop=True)
+
+
+def compare_designs(
+    spectra: np.ndarray,
+    design: "pd.DataFrame | np.ndarray",
+    contrast: "str | dict[str, float] | np.ndarray",
+    gene_names: Sequence[str] | None = None,
+    statistic: str = "log_l2",
+    null: str = "wald",
+    freq_weights: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Generalized two-group / continuous-covariate test via a design matrix.
+
+    Generalises :func:`compare_two_groups` from binary group labels to an
+    arbitrary GLM design matrix and a single-DOF linear contrast. The
+    binary case is recovered exactly by passing
+    ``design=pd.DataFrame({"group": groups})`` and ``contrast="group"``;
+    p-values match :func:`compare_two_groups` to machine precision.
+
+    Parameters
+    ----------
+    spectra : np.ndarray
+        ``(n_samples, n_genes, K)`` spectral features (raw, not logged).
+    design : pd.DataFrame or np.ndarray
+        Sample-level metadata. ``DataFrame`` columns are auto-encoded via
+        :mod:`patsy` (treatment-coded categoricals + intercept);
+        ``ndarray`` is passed through as the design matrix verbatim
+        (caller responsible for the intercept column).
+    contrast : str, dict, or np.ndarray
+        Linear-contrast specification:
+
+        - ``str`` — name of a design column. Auto-resolves treatment-coded
+          categoricals (e.g., ``"genotype"`` matches ``"genotype[T.TG]"``).
+          Multi-DOF (3+ level factor) contrasts must be passed as an
+          explicit dict or ndarray.
+        - ``dict[str, float]`` — coefficient per design column.
+        - ``np.ndarray`` of length ``p`` — raw contrast vector.
+    gene_names : sequence of str, optional
+    statistic : {'log_l2'}, default 'log_l2'
+        Currently only ``log_l2`` is supported in the GLM path.
+    null : {'wald', 'liu'}, default 'wald'
+        Only the analytic Wald-type null is supported here. Permutation
+        nulls for continuous covariates are intentionally deferred (naive
+        row permutation breaks the X-y joint distribution under nuisance
+        covariates; correct alternatives like Freedman–Lane add complexity
+        without a clear payoff over the analytic Wald). Pass
+        ``null="permutation"`` only via :func:`compare_two_groups` with
+        ``groups=`` for the binary case.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``Feature``, ``Statistic``, ``P_value``, ``P_adj`` —
+        same schema as :func:`compare_two_groups`.
+
+    Raises
+    ------
+    ValueError
+        If shapes are inconsistent or ``contrast`` cannot be resolved.
+    NotImplementedError
+        If ``null='permutation'`` is requested.
+    """
+    null_canon = _resolve_null(null)
+    if null_canon != "wald":
+        raise NotImplementedError(
+            "compare_designs currently only supports null='wald' (alias 'liu'). "
+            "Permutation null for the GLM path is intentionally deferred — "
+            "use the binary groups= API on compare_two_groups for "
+            "permutation-based tests."
+        )
+    if statistic != "log_l2":
+        raise ValueError(
+            f"compare_designs currently only supports statistic='log_l2', "
+            f"got '{statistic}'."
+        )
+    if spectra.ndim != 3:
+        raise ValueError(f"spectra must be 3D (n_samples, n_genes, K), got {spectra.shape}.")
+    n_samples, n_genes, _ = spectra.shape
+
+    X, design_columns = _build_design_matrix(design, n_samples)
+    contrast_vec = _resolve_contrast(contrast, design_columns)
+
+    observed, pvals = _run_log_l2_glm_wald(spectra, X, contrast_vec, freq_weights)
+
+    if gene_names is None:
+        gene_names = [str(i) for i in range(n_genes)]
+    df = pd.DataFrame(
+        {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
+    )
+    _apply_bh_correction(df)
+    df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
+    return df
 
 
 # ---------------------------------------------------------------------------
