@@ -9,7 +9,7 @@ import scipy.sparse as sp
 from scipy.special import gamma, kv
 from scipy.stats import chi2, norm
 
-from quadsv.kernels import Kernel
+from quadsv.kernels.base import Kernel
 
 __all__ = ["FFTKernel", "power_spectrum_2d"]
 

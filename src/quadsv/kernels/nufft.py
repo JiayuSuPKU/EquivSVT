@@ -55,7 +55,7 @@ import scipy.fft
 import scipy.sparse as sp
 from scipy.stats import chi2, norm
 
-from quadsv.kernels import Kernel
+from quadsv.kernels.base import Kernel
 from quadsv.kernels.fft import FFTKernel
 
 __all__ = [
