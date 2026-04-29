@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **sci benchmark switched to section-level samples.** Each Lu et al.
+  (GSE256397) Visium array carries four disjoint cryosections of the
+  same (timepoint, distance) on one capture area. New helper
+  `scripts/comparator_benchmark/split_sci_sections.py` clusters spots
+  via DBSCAN (`eps=110`, `min_samples=10`; cleanly separates 4/4
+  sections on every non-empty slide with 0 noise spots) and writes
+  per-section `.h5ad` to `data/sci/adata_sections/` with a matching
+  `metadata_sections.csv`. The benchmark `sci` panel now defaults to
+  section-level (16 sham vs 12 t72 sub-AnnData, residual df 26 vs 5
+  previously); the legacy slide-level view is preserved as
+  `--panels sci_slides`. Within-condition split nulls are
+  slide-preserving (all 4 sections from a slide go to the same arm)
+  to avoid pseudo-replication contamination of the H₀ baseline.
+  Empirical comparison: `cauchy_welch` sci-panel sensitivity halves
+  on `2d/mean` (rank-pct 0.28 → 0.14) and quarters on `2d/zscore`
+  (0.49 → 0.11) — Welch-Satterthwaite df becomes well-behaved at
+  section sample size. The recommended `log_l2 + wald` configs are
+  panel-stable across the slide/section change. See
+  `scripts/comparator_benchmark/README.md` §3, §4.5 for the full
+  comparison.
 - **Effective rank / spatial-pattern diversity primitives.** Three new
   public functions and a comparator method for diagnosing how
   concentrated a sample's or cohort's spatial-frequency content is:
