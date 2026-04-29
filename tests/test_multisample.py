@@ -585,6 +585,30 @@ class TestLogL2WaldNull:
         with pytest.raises(ValueError, match="Unknown null"):
             compare_two_groups(spectra, groups, statistic="log_l2", null="bootstrap")
 
+    def test_small_df_emits_user_warning(self):
+        """At residual df < 3 (n_a + n_b ≤ 4), the Wald path should warn the
+        user that σ̂² is noisy and recommend cauchy_welch.
+        """
+        rng = np.random.default_rng(0)
+        # 1v2 split → df = 1 + 2 - 2 = 1; should warn.
+        spectra = np.exp(rng.standard_normal((3, 50, 20)))
+        groups = np.array([0, 1, 1])
+        with pytest.warns(UserWarning, match="log_l2 \\+ null='wald' at residual df=1"):
+            compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
+        # 2v2 split → df = 2; still below the floor, should warn.
+        spectra = np.exp(rng.standard_normal((4, 50, 20)))
+        groups = np.array([0, 0, 1, 1])
+        with pytest.warns(UserWarning, match="log_l2 \\+ null='wald' at residual df=2"):
+            compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
+        # 3v3 split → df = 4; should NOT warn.
+        spectra = np.exp(rng.standard_normal((6, 50, 20)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        # warnings.simplefilter('error') to fail if any warning leaks.
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error", UserWarning)
+            compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
+
     def test_full_sigma_calibrates_under_correlated_bins(self):
         """When bins are highly correlated within each gene, the diagonal-Σ
         Wald is anti-conservative; the full-Σ implementation must remain

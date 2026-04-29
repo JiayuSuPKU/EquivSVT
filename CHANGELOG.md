@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`null="wald"` (`log_l2`) now emits a `UserWarning` when residual df
+  is below 3** (i.e., `n_a + n_b ≤ 4`). The warning explains that the
+  σ̂² estimator has ≥ 67% relative noise in that regime so per-test
+  calibration may be anti-conservative, and recommends switching to
+  `statistic="cauchy_welch"` for stricter calibration. Suppress with
+  the standard `warnings.filterwarnings("ignore", ...)` recipe if you
+  accept the calibration risk. Added `TestLogL2WaldNull::test_small_df_emits_user_warning`.
 - **`null="wald"` for `log_l2` now uses a pooled-across-genes FULL Σ
   estimator** (was: pooled-diagonal Σ). The diagonal proxy was empirically
   anti-conservative on real spatial data because radial-bin spectra are

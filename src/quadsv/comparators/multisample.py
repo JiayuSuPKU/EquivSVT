@@ -45,6 +45,7 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+import warnings
 from collections.abc import Sequence
 from typing import Any
 
@@ -1171,6 +1172,33 @@ def _resolve_null(null: str) -> str:
     return canon
 
 
+# Minimum residual df below which we issue a calibration warning for the
+# Wald path. At df=1 the σ̂² estimator has a 100% relative noise (var = 2σ⁴),
+# at df=2 it's 50%; both can produce occasional anti-conservative spikes.
+# df ≥ 3 keeps σ̂² noise under ~67% and matches the conventional small-n
+# floor used by limma / DESeq2 / edgeR.
+_WALD_MIN_DF_NO_WARN = 3
+
+
+def _maybe_warn_small_df_wald(df_resid: int) -> None:
+    """Warn the user when running the Wald path at very small residual df.
+
+    Suppress with ``warnings.filterwarnings('ignore',
+    message='log_l2 + null=.wald.')`` if you accept the calibration risk.
+    """
+    if df_resid < _WALD_MIN_DF_NO_WARN:
+        rel_noise_pct = 100.0 * (2.0 / max(df_resid, 1)) ** 0.5
+        warnings.warn(
+            f"log_l2 + null='wald' at residual df={df_resid}: "
+            f"σ̂² estimator has ~{rel_noise_pct:.0f}% relative noise, "
+            f"so the Wald null may be anti-conservative on a per-test basis. "
+            f"For n_a + n_b ≤ 4, prefer statistic='cauchy_welch' for stricter "
+            f"calibration (at the cost of some sensitivity).",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def _pooled_full_within_group_sigma(
     spectra: np.ndarray, g_int: np.ndarray, *, eps: float = 1e-12
 ) -> tuple[np.ndarray, int]:
@@ -1259,7 +1287,8 @@ def _run_log_l2_wald(
     w = _resolve_freq_weights(freq_weights, K)
 
     observed = _stat_log_l2(group_a, group_b, freq_weights=freq_weights)  # (n_genes,)
-    Sigma_ell, _df = _pooled_full_within_group_sigma(spectra, g_int)      # (K, K), df
+    Sigma_ell, df_resid = _pooled_full_within_group_sigma(spectra, g_int) # (K, K), df
+    _maybe_warn_small_df_wald(df_resid)
     v_c = (1.0 / max(n_a, 1)) + (1.0 / max(n_b, 1))
     sqW = np.sqrt(w)
     M = (sqW[:, None] * Sigma_ell * sqW[None, :]) * v_c                   # (K, K)
@@ -1421,6 +1450,7 @@ def _run_log_l2_glm_wald(
     beta = beta_flat.reshape(p, n_genes, K)
     res = res_flat.reshape(n_samples, n_genes, K)
     df_resid = max(n_samples - p, 1)
+    _maybe_warn_small_df_wald(df_resid)
 
     theta = np.tensordot(contrast_vec, beta, axes=([0], [0]))   # (n_genes, K)
 
@@ -1491,12 +1521,22 @@ def compare_two_groups(  # noqa: C901
         ``'liu'``) uses an analytic Wald-type test for the L2 quadratic
         form: under H₀ the statistic ``T² = D'WD`` is distributed as a
         weighted sum of χ²₁ variables whose tail is integrated via Liu's
-        approximation (see :func:`quadsv.statistics.liu_sf`). The pooled
-        within-group variance is estimated diagonally per frequency bin
-        and averaged across all genes for stability at small ``n``.
-        Currently ``null='wald'`` is only supported for
-        ``statistic='log_l2'``; raises ``ValueError`` otherwise.
-        ``cauchy_welch`` ignores this argument.
+        approximation (see :func:`quadsv.statistics.liu_sf`). Currently
+        ``null='wald'`` is only supported for ``statistic='log_l2'``;
+        raises ``ValueError`` otherwise. ``cauchy_welch`` ignores this
+        argument.
+
+        **Sample-size guidance** (residual df = ``n_a + n_b - 2``):
+
+        - df ≥ 4 (n_a + n_b ≥ 6): ``'wald'`` recommended — strong
+          calibration + sensitivity; sweeps the top of our benchmark.
+        - df ≥ 3 (n_a + n_b ≥ 5): ``'wald'`` acceptable.
+        - df < 3 (n_a + n_b ≤ 4): ``'wald'`` emits a ``UserWarning``;
+          σ̂² has ≥ 67% relative noise so per-test calibration may be
+          anti-conservative. Prefer ``statistic='cauchy_welch'``
+          (per-bin Welch t with proper df-corrected denominator) or
+          stay with ``null='permutation'`` if the cohort allows
+          enough exact relabellings.
     n_perm : int, default 1000
         Number of label permutations for the null distribution. **Ignored**
         when ``statistic='cauchy_welch'`` or ``null='wald'``.
