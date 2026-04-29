@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`compare_two_groups_masked` now supports `null="wald"`** for
+  `statistic="log_l2"`. Implementation uses a mask-aware pooled
+  covariance estimator (new `_pooled_full_within_group_sigma_masked`)
+  that accumulates per-gene `R_g.T @ R_g` over each gene's present
+  (sample, gene) cells, and per-gene noncentrality scaling
+  `v_{c,g} = 1/n_a_g + 1/n_b_g` adjusts the eigenvalues for that
+  gene's specific cohort. Cross-bin correlation structure is shared
+  across genes (same A3 assumption already in use). Empirical
+  calibration on synthetic missingness 0–50% on the ad_pig cohort
+  yields raw FPR 0.025–0.13 (matching the unmasked Wald baseline) and
+  BH-adjusted FPR 0.004–0.07; tests 3–12× more genes than the
+  pre-filter workaround. Five new regression tests in
+  `TestLogL2WaldNull`. The previous `NotImplementedError` for
+  `null="wald"` on the masked path is removed.
+
 ### Changed
 - **`null="wald"` (`log_l2`) now emits a `UserWarning` when residual df
   is below 3** (i.e., `n_a + n_b ≤ 4`). The warning explains that the

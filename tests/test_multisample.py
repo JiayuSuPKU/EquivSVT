@@ -643,17 +643,109 @@ class TestLogL2WaldNull:
             f"Full-Σ Wald should be roughly uniform; KS_p={ks_p:.3g} fpr05={fpr05:.3f}"
         )
 
-    def test_masked_path_rejects_wald(self):
+    def test_masked_wald_parity_with_unmasked_when_complete(self):
+        """When presence is all True, masked Wald should match unmasked Wald."""
         rng = np.random.default_rng(5)
-        n_samples, n_genes, K = 6, 30, 20
+        n_samples, n_genes, K = 6, 100, 20
         spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
         groups = np.array([0, 0, 0, 1, 1, 1])
         presence = np.ones((n_samples, n_genes), dtype=bool)
-        # Make one cell absent so the masked path is the natural choice.
-        presence[0, 0] = False
-        with pytest.raises(NotImplementedError, match="null='wald' is not yet supported"):
+        df_un = compare_two_groups(
+            spectra, groups, statistic="log_l2", null="wald"
+        ).sort_values("Feature").reset_index(drop=True)
+        df_m = compare_two_groups_masked(
+            spectra, groups, presence, statistic="log_l2", null="wald"
+        ).sort_values("Feature").reset_index(drop=True)
+        # Statistics must match modulo float64 round-off.
+        np.testing.assert_allclose(
+            df_un["Statistic"].to_numpy(), df_m["Statistic"].to_numpy(), atol=1e-12
+        )
+        np.testing.assert_allclose(
+            df_un["P_value"].to_numpy(), df_m["P_value"].to_numpy(), atol=1e-12
+        )
+
+    def test_masked_wald_calibration_under_synthetic_missingness(self):
+        """Under H0 with random missingness, masked Wald p-values should
+        give Pr(p<.05) within a few percent of nominal α.
+
+        Constructs a true-H0 cohort (synthetic iid Gaussian spectra, random
+        labels) and compares the FPR with and without 25% per-cell
+        missingness. The masked path should retain calibration; the
+        ratio of FPRs (masked / unmasked) should be in [0.5, 2.0].
+        """
+        rng = np.random.default_rng(0)
+        n_samples, n_genes, K = 8, 800, 20
+        spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
+        groups = np.array([0]*4 + [1]*4)
+
+        # Unmasked baseline
+        df_full = compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
+        fpr_full = (df_full["P_value"] < 0.05).mean()
+
+        # 25% missingness, masked path
+        presence = rng.uniform(size=(n_samples, n_genes)) >= 0.25
+        df_m = compare_two_groups_masked(
+            spectra, groups, presence, statistic="log_l2", null="wald",
+            min_samples_per_group=2,
+        )
+        valid = df_m["P_value"].notna()
+        # We need a meaningful test set
+        assert valid.sum() > 100, f"only {valid.sum()} testable genes after masking"
+        fpr_m = (df_m.loc[valid, "P_value"] < 0.05).mean()
+
+        # Both should be near nominal — and similar to each other
+        assert 0.0 < fpr_m < 0.20, f"masked FPR={fpr_m:.3f} far from nominal"
+        assert 0.5 * fpr_full < fpr_m < 2.0 * fpr_full + 0.02, (
+            f"masked vs unmasked FPR mismatch: masked={fpr_m:.3f} unmasked={fpr_full:.3f}"
+        )
+
+    def test_masked_wald_skips_genes_with_insufficient_presence(self):
+        """Genes whose present count in either arm < min_samples_per_group
+        should report NaN p_value (consistent with permutation path)."""
+        rng = np.random.default_rng(7)
+        n_samples, n_genes, K = 6, 20, 12
+        spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        presence = np.ones((n_samples, n_genes), dtype=bool)
+        # Make gene 0: only 1 sample present in group A → should be skipped.
+        presence[1:3, 0] = False  # group A has only sample 0 present
+        df = compare_two_groups_masked(
+            spectra, groups, presence, statistic="log_l2", null="wald",
+            min_samples_per_group=2,
+        )
+        # Find the row for gene "0"
+        row = df[df["Feature"] == "0"].iloc[0]
+        assert np.isnan(row["P_value"]), f"expected NaN, got {row['P_value']}"
+        assert row["n_obs_A"] == 1
+        # Other genes with full presence should have valid p-values
+        valid_genes = df[df["Feature"] != "0"]
+        assert valid_genes["P_value"].notna().all()
+
+    def test_masked_wald_raises_when_no_eligible_genes(self):
+        """If no gene meets min_samples_per_group, raise ValueError with
+        a helpful message instead of silently returning NaNs."""
+        rng = np.random.default_rng(8)
+        n_samples, n_genes, K = 6, 10, 12
+        spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        # Wipe out group A in every gene
+        presence = np.ones((n_samples, n_genes), dtype=bool)
+        presence[0:3, :] = False
+        with pytest.raises(ValueError, match="no genes meet"):
             compare_two_groups_masked(
-                spectra, groups, presence, statistic="log_l2", null="wald"
+                spectra, groups, presence, statistic="log_l2", null="wald",
+                min_samples_per_group=2,
+            )
+
+    def test_masked_wald_rejects_non_log_l2(self):
+        rng = np.random.default_rng(9)
+        n_samples, n_genes, K = 6, 10, 12
+        spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        presence = np.ones((n_samples, n_genes), dtype=bool)
+        with pytest.raises(ValueError, match="null='wald' is only supported"):
+            compare_two_groups_masked(
+                spectra, groups, presence, statistic="cauchy_welch", null="wald",
             )
 
 

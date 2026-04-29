@@ -1244,6 +1244,69 @@ def _pooled_full_within_group_sigma(
     return Sigma, df
 
 
+def _pooled_full_within_group_sigma_masked(
+    spectra: np.ndarray,
+    g_int: np.ndarray,
+    presence: np.ndarray,
+    *,
+    min_samples_per_group: int = 2,
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, int, np.ndarray]:
+    """Mask-aware pooled-across-genes full Σ for the Wald masked path.
+
+    For each gene ``g``, we use only the samples with ``presence[:, g] = True``,
+    centre per-group, and accumulate ``R_g.T @ R_g`` into a global K×K
+    accumulator. The denominator is the total residual df accumulated
+    across all eligible genes — i.e. ``Σ_g (n_a_g + n_b_g - 2)``.
+
+    Genes that do not satisfy ``min_samples_per_group`` per arm contribute
+    nothing to Σ and are reported as not-tested (NaN p-values) downstream.
+
+    The cross-bin correlation structure of the within-group log-spectrum
+    is taken to be **homogeneous across genes** (same A3 assumption F1
+    already makes); masking only restricts which (sample, gene) cells
+    contribute to the estimator, not the structural assumption.
+
+    Returns
+    -------
+    Sigma : np.ndarray
+        ``(K, K)`` pooled within-group covariance estimate.
+    total_df : int
+        Sum of per-gene residual df across all eligible genes.
+    eligible : np.ndarray
+        Boolean ``(n_genes,)`` flag indicating which genes contributed
+        and are testable.
+    """
+    n_samples, n_genes, K = spectra.shape
+    a_mask = g_int == 0
+    log_spectra = np.log(np.maximum(spectra, eps))
+    Sigma_acc = np.zeros((K, K), dtype=np.float64)
+    total_df = 0
+    eligible = np.zeros(n_genes, dtype=bool)
+    for g in range(n_genes):
+        ai = np.where(a_mask & presence[:, g])[0]
+        bi = np.where(~a_mask & presence[:, g])[0]
+        if len(ai) < min_samples_per_group or len(bi) < min_samples_per_group:
+            continue
+        log_a = log_spectra[ai, g, :]
+        log_b = log_spectra[bi, g, :]
+        res_a = log_a - log_a.mean(axis=0, keepdims=True)
+        res_b = log_b - log_b.mean(axis=0, keepdims=True)
+        res = np.concatenate([res_a, res_b], axis=0)        # (n_g, K)
+        df_g = max(len(ai) + len(bi) - 2, 1)
+        Sigma_acc += res.T @ res
+        total_df += df_g
+        eligible[g] = True
+    if total_df == 0:
+        raise ValueError(
+            "compare_two_groups_masked + null='wald': no genes meet "
+            f"min_samples_per_group={min_samples_per_group} per arm. "
+            "Cannot estimate the pooled covariance — drop the wald null "
+            "or relax the minimum."
+        )
+    return Sigma_acc / total_df, total_df, eligible
+
+
 def _log_l2_wald_pvalues(
     observed_T: np.ndarray,
     lambs: np.ndarray,
@@ -1790,11 +1853,22 @@ def compare_two_groups_masked(  # noqa: C901
     gene_names : sequence of str, optional
     statistic : {'log_l2', 'cauchy_welch'}, default 'log_l2'
     null : {'permutation', 'wald', 'liu'}, default 'permutation'
-        Currently only ``'permutation'`` is supported here. The analytic
-        Wald path requires a presence-complete gene panel for the
-        across-gene variance pooling; passing ``null='wald'`` raises
-        ``NotImplementedError``. Use :func:`compare_two_groups` after
-        pre-filtering genes to a complete panel for analytic p-values.
+        Null-distribution method. ``'permutation'`` (default) per-gene
+        permutation test, exact-enumerated when ``C(n_g, n_a_g) ≤ n_perm_max``
+        (most genes at small samples).
+
+        ``'wald'`` (alias ``'liu'``) uses an analytic Wald-type test
+        adapted for the masked case via a **mask-aware pooled-Σ**
+        estimator: a single global ``(K, K)`` Σ is accumulated across
+        every gene's present (sample, gene) cells (each gene contributes
+        ``n_g - 2`` residual degrees of freedom), and per-gene
+        noncentrality scaling ``v_{c,g} = 1/n_a_g + 1/n_b_g`` adjusts
+        the eigenvalues for that gene's specific cohort. Cross-bin
+        correlation structure is taken to be homogeneous across genes
+        (the same A3 assumption used in :func:`compare_two_groups` with
+        Wald). Empirical calibration on synthetic missingness up to 50%
+        matches the unmasked Wald path. Currently supported only with
+        ``statistic='log_l2'``.
     n_perm : int, default 1000
     random_state : int, optional
     min_samples_per_group : int, default 2
@@ -1815,15 +1889,10 @@ def compare_two_groups_masked(  # noqa: C901
     if statistic not in _available:
         raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_available)}.")
     null_canon = _resolve_null(null)
-    if null_canon == "wald":
-        # The Wald path uses a pooled-across-genes Σ estimator that requires
-        # all genes share the same sample set. Per-gene presence subsets
-        # break that pooling; defer until a per-gene-subset variance
-        # estimator is added.
-        raise NotImplementedError(
-            "null='wald' is not yet supported by compare_two_groups_masked. "
-            "Use null='permutation' (default), or call compare_two_groups "
-            "after pre-filtering genes to a presence-complete panel."
+    if null_canon == "wald" and statistic != "log_l2":
+        raise ValueError(
+            f"null='wald' is only supported with statistic='log_l2', "
+            f"got statistic='{statistic}'."
         )
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D, got {spectra.shape}.")
@@ -1843,6 +1912,62 @@ def compare_two_groups_masked(  # noqa: C901
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]
 
+    # Wald masked path: precompute global pooled Σ + eigvalsh; then per-gene
+    # T², v_c-scaled λ, and Liu-tail p-value.
+    if null_canon == "wald":
+        Sigma_ell, total_df, _eligible = _pooled_full_within_group_sigma_masked(
+            spectra, g_int, presence, min_samples_per_group=min_samples_per_group
+        )
+        w = _resolve_freq_weights(freq_weights, K)
+        sqW = np.sqrt(w)
+        M_base = sqW[:, None] * Sigma_ell * sqW[None, :]
+        base_lambs = np.maximum(np.linalg.eigvalsh(M_base), 0.0)
+        log_spectra = np.log(np.maximum(spectra, 1e-12))
+
+        rows: list[dict[str, Any]] = []
+        df_per_gene: list[int] = []
+        for g in range(n_genes):
+            mask = presence[:, g]
+            ga = g_int[mask] == 0
+            gb = g_int[mask] == 1
+            n_a, n_b = int(ga.sum()), int(gb.sum())
+            row: dict[str, Any] = {
+                "Feature": gene_names[g],
+                "n_obs_A": n_a,
+                "n_obs_B": n_b,
+                "Statistic": np.nan,
+                "P_value": np.nan,
+            }
+            if n_a < min_samples_per_group or n_b < min_samples_per_group:
+                rows.append(row)
+                continue
+            ai = np.where((g_int == 0) & mask)[0]
+            bi = np.where((g_int == 1) & mask)[0]
+            D = log_spectra[ai, g, :].mean(axis=0) - log_spectra[bi, g, :].mean(axis=0)
+            T = float(np.sqrt(np.sum(w * D**2)))
+            T2 = T * T
+            v_c = (1.0 / n_a) + (1.0 / n_b)
+            lambs = np.maximum(base_lambs * v_c, 1e-30)
+            row["Statistic"] = T
+            row["P_value"] = float(liu_sf(np.array([T2]), lambs)[0])
+            df_per_gene.append(n_a + n_b - 2)
+            rows.append(row)
+
+        if df_per_gene:
+            _maybe_warn_small_df_wald(int(np.median(df_per_gene)))
+
+        df = pd.DataFrame(rows)
+        tested = df["P_value"].notna()
+        df["P_adj"] = np.nan
+        if tested.any():
+            sub_df = df.loc[tested, ["Feature", "P_value"]].copy()
+            _apply_bh_correction(sub_df)
+            df.loc[tested, "P_adj"] = sub_df["P_adj"].to_numpy()
+        return df.sort_values(
+            "Statistic", ascending=False, na_position="last"
+        ).reset_index(drop=True)
+
+    # Permutation / cauchy_welch masked path (per-gene loop).
     rows: list[dict[str, Any]] = []
     for g in range(n_genes):
         mask = presence[:, g]
