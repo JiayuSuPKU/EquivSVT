@@ -42,6 +42,11 @@ from quadsv.comparators.multisample import (
     residualize_against_covariates,
     shape_normalize,
 )
+from quadsv.statistics import (
+    effective_rank as _effective_rank,
+    gene_pattern_diversity as _gene_pattern_diversity,
+    within_group_pattern_diversity as _within_group_pattern_diversity,
+)
 
 __all__: list[str] = []
 
@@ -395,6 +400,69 @@ class _ComparatorBase:
             n_perm=n_perm,
             random_state=random_state,
             n_perm_max=n_perm_max,
+        )
+
+    def effective_rank(
+        self,
+        level: str = "within_group",
+        weights: np.ndarray | None = None,
+    ) -> "float | np.ndarray":
+        """Effective rank ``K_eff`` of the spectrum covariance.
+
+        Quantifies how concentrated the spatial-frequency content is along
+        the eigen-directions of the relevant covariance matrix.
+        ``K_eff = (Σλ)² / Σλ²`` — bounded by 1 (rank-1, all power on a
+        single direction → Wald test reduces to a 1-DoF test) and ``K``
+        (uniformly spread, Liu's CLT smoothing is most accurate).
+
+        Parameters
+        ----------
+        level : {'within_group', 'per_sample'}, default 'within_group'
+            ``'within_group'``: returns a single ``K_eff`` for the pooled
+            within-group covariance (the same Σ used by ``log_l2 +
+            null='wald'``). Useful for diagnosing whether the analytic
+            null should be trusted on this cohort. Requires
+            ``self.groups``.
+
+            ``'per_sample'``: returns an ``(n_samples,)`` array — the
+            effective rank of each sample's gene-wise spectrum
+            covariance. High variability across samples means
+            sample-to-sample heterogeneity in spatial-pattern structure,
+            which is a separate concern from cross-condition difference.
+
+        weights : np.ndarray, optional
+            Per-bin weights (same semantics as ``freq_weights``). When
+            given, returns the effective rank of
+            ``W^{1/2} Σ W^{1/2}`` — useful for analysing how a
+            frequency-weighted L2 statistic redistributes its power.
+
+        Returns
+        -------
+        float (when ``level='within_group'``) or np.ndarray of shape
+        ``(n_samples,)`` (when ``level='per_sample'``).
+        """
+        if self.spectra_ is None:
+            raise RuntimeError("Call .fit() before .effective_rank().")
+        if level == "within_group":
+            if self.groups is None:
+                raise ValueError(
+                    "level='within_group' requires the binary `groups=` "
+                    "constructor path. Use level='per_sample' for the "
+                    "design= constructor path."
+                )
+            return _within_group_pattern_diversity(
+                self.spectra_, self.groups, weights=weights
+            )
+        if level == "per_sample":
+            n_samples = self.spectra_.shape[0]
+            return np.array(
+                [
+                    _gene_pattern_diversity(self.spectra_[i], weights=weights)
+                    for i in range(n_samples)
+                ]
+            )
+        raise ValueError(
+            f"level must be 'within_group' or 'per_sample', got {level!r}."
         )
 
     def benchmark(

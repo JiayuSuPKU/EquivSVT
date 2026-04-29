@@ -10,6 +10,9 @@ from quadsv.kernels import Kernel
 __all__ = [
     "auto_chunk_size",
     "compute_null_params",
+    "effective_rank",
+    "gene_pattern_diversity",
+    "within_group_pattern_diversity",
     "liu_sf",
     "spatial_q_test",
     "spatial_r_test",
@@ -22,6 +25,197 @@ _DELTA = 1e-10
 # 8-core host with joblib parallelism this keeps aggregate peak RAM
 # around 16 GiB (2 GiB × 8), comfortable on most modern laptops.
 _DEFAULT_CHUNK_BUDGET = 2 * (1 << 30)
+
+
+# ---------------------------------------------------------------------------
+# Effective rank / spectral-pattern diversity
+# ---------------------------------------------------------------------------
+
+
+def effective_rank(
+    cov: np.ndarray,
+    weights: np.ndarray | None = None,
+) -> float:
+    r"""Effective rank (participation ratio) of a covariance matrix.
+
+    Computes
+
+    .. math::
+        K_\mathrm{eff} \;=\; \frac{\big(\sum_k \lambda_k\big)^2}{\sum_k \lambda_k^2}
+
+    where :math:`\lambda_k` are the eigenvalues of ``cov`` (or, when
+    ``weights`` is given, of :math:`W^{1/2} \mathrm{cov}\, W^{1/2}` with
+    :math:`W = \mathrm{diag}(w)`). The result is bounded by 1 (rank-1,
+    all variance on a single direction) and ``K = cov.shape[0]``
+    (uniformly spread, all eigenvalues equal). It coincides with the
+    standard inverse Herfindahl index of the (normalised) eigenvalue
+    distribution and quantifies the "effective number of independent
+    components" of a quadratic-form statistic
+    :math:`T^2 = X^\top \mathrm{cov} X` where :math:`X \sim \mathcal{N}(0,I)`.
+
+    Parameters
+    ----------
+    cov : np.ndarray
+        Symmetric ``(K, K)`` covariance matrix. Negative eigenvalues
+        from numerical noise are clipped to 0.
+    weights : np.ndarray, optional
+        Non-negative weights of length ``K``. When provided, returns the
+        effective rank of the weighted form :math:`W^{1/2} \mathrm{cov}\,W^{1/2}`,
+        useful for analysing how a frequency-weighted L2 statistic
+        actually distributes its sensitivity across eigen-directions.
+
+    Returns
+    -------
+    float
+        Effective rank in ``[1, K]``. Returns ``nan`` when the trace
+        is non-positive (degenerate covariance).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> effective_rank(np.eye(10))
+    10.0
+    >>> # Rank-1 outer product
+    >>> v = np.zeros(10); v[0] = 1.0
+    >>> effective_rank(np.outer(v, v))
+    1.0
+    """
+    if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+        raise ValueError(f"cov must be a square 2D matrix, got shape {cov.shape}.")
+    K = cov.shape[0]
+    if weights is None:
+        eigvals = np.linalg.eigvalsh(cov)
+    else:
+        w = np.asarray(weights, dtype=float)
+        if w.shape != (K,):
+            raise ValueError(f"weights must have length K={K}, got shape {w.shape}.")
+        if np.any(w < 0):
+            raise ValueError("weights must be non-negative.")
+        sqW = np.sqrt(w)
+        M = (sqW[:, None] * cov) * sqW[None, :]
+        eigvals = np.linalg.eigvalsh(M)
+    eigvals = np.maximum(eigvals, 0.0)
+    s = float(eigvals.sum())
+    if s <= 0:
+        return float("nan")
+    return float(s * s / float((eigvals**2).sum()))
+
+
+def gene_pattern_diversity(
+    spectra: np.ndarray,
+    weights: np.ndarray | None = None,
+    *,
+    eps: float = 1e-12,
+) -> float:
+    r"""Spatial-pattern diversity across genes within a single sample.
+
+    Quantifies how heterogeneous the per-gene spatial-frequency profiles
+    are within one sample. Computes the cross-gene covariance of the
+    log-spectra,
+
+    .. math::
+        \hat\Sigma_\mathrm{genes} \;=\; \frac{1}{G - 1}
+            \sum_g \big(\ell_g - \bar\ell\big)\big(\ell_g - \bar\ell\big)^\top
+
+    where :math:`\ell_g \in \mathbb{R}^K` is gene :math:`g`'s
+    radially-binned log-spectrum and :math:`\bar\ell` the mean across
+    genes, then returns ``effective_rank(Σ_genes, weights)``.
+
+    Interpretation:
+
+    - **Low diversity** (:math:`K_\mathrm{eff} \approx 1`): most genes
+      share the same spatial-frequency profile — the sample's spatial
+      patterns collapse onto a single dominant mode (e.g. all "smooth"
+      or all "punctate").
+    - **High diversity** (:math:`K_\mathrm{eff} \approx K`): genes vary
+      widely in their spatial structure — the sample carries a rich
+      mix of spatial scales.
+
+    Parameters
+    ----------
+    spectra : np.ndarray
+        ``(n_genes, K)`` raw spectrum matrix (typically a single sample's
+        radially-binned spectrum). Log is taken internally with an ``eps``
+        floor.
+    weights : np.ndarray, optional
+        Per-bin weights, same semantics as :func:`effective_rank`.
+    eps : float, default 1e-12
+        Floor for ``log(spectra)`` to handle exact-zero bins.
+    """
+    if spectra.ndim != 2:
+        raise ValueError(
+            f"spectra must be (n_genes, K), got shape {spectra.shape}."
+        )
+    log_s = np.log(np.maximum(spectra, eps))
+    centred = log_s - log_s.mean(axis=0, keepdims=True)
+    G = log_s.shape[0]
+    cov = (centred.T @ centred) / max(G - 1, 1)
+    return effective_rank(cov, weights=weights)
+
+
+def within_group_pattern_diversity(
+    spectra: np.ndarray,
+    groups: np.ndarray,
+    weights: np.ndarray | None = None,
+    *,
+    eps: float = 1e-12,
+) -> float:
+    r"""Spatial-pattern diversity of the within-group residual covariance.
+
+    For a cohort of samples partitioned into two groups, computes the
+    pooled-across-genes within-group covariance of log-spectra
+    (the same estimator used by ``log_l2 + null='wald'`` in the
+    comparator), then returns its effective rank.
+
+    Interpretation:
+
+    - **Low diversity** (:math:`K_\mathrm{eff} \approx 1`): within-group
+      sample-to-sample variation aligns with one spatial-frequency
+      direction. Wald-type tests on this cohort effectively reduce to a
+      1-DoF test → high power per direction but very sensitive to
+      estimation noise in that single eigenvalue.
+    - **High diversity** (:math:`K_\mathrm{eff} \approx K`): noise
+      spreads over many directions; Wald's analytic null is more
+      accurate (CLT smoothing).
+
+    Parameters
+    ----------
+    spectra : np.ndarray
+        ``(n_samples, n_genes, K)`` spectrum tensor (raw, not logged).
+    groups : np.ndarray
+        ``(n_samples,)`` with exactly two distinct labels.
+    weights : np.ndarray, optional
+        Per-bin weights, same semantics as :func:`effective_rank`.
+    eps : float, default 1e-12
+        Floor for ``log(spectra)``.
+
+    Returns
+    -------
+    float
+        Effective rank of the pooled within-group covariance.
+    """
+    if spectra.ndim != 3:
+        raise ValueError(
+            f"spectra must be (n_samples, n_genes, K), got shape {spectra.shape}."
+        )
+    groups = np.asarray(groups)
+    uniq = np.unique(groups)
+    if uniq.size != 2:
+        raise ValueError(
+            f"groups must contain exactly two distinct labels, got {uniq}."
+        )
+    g_int = (groups == uniq[1]).astype(int)
+    a_mask = g_int == 0
+    log_a = np.log(np.maximum(spectra[a_mask], eps))
+    log_b = np.log(np.maximum(spectra[~a_mask], eps))
+    res_a = log_a - log_a.mean(axis=0, keepdims=True)
+    res_b = log_b - log_b.mean(axis=0, keepdims=True)
+    res = np.concatenate([res_a, res_b], axis=0)
+    n_total, G, K = res.shape
+    df = max(int(a_mask.sum()) + int((~a_mask).sum()) - 2, 1)
+    res_flat = res.reshape(n_total * G, K)
+    Sigma = (res_flat.T @ res_flat) / (G * df)
+    return effective_rank(Sigma, weights=weights)
 
 
 def auto_chunk_size(

@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Effective rank / spatial-pattern diversity primitives.** Three new
+  public functions and a comparator method for diagnosing how
+  concentrated a sample's or cohort's spatial-frequency content is:
+  - `quadsv.effective_rank(cov, weights=None)` — primitive computing
+    `K_eff = (Σλ)² / Σλ²` for a covariance matrix, bounded by 1
+    (rank-1, all power on one direction → Wald reduces to a 1-DoF
+    test, very sensitive to estimation noise) and K (uniformly spread
+    → CLT smoothing applies). Optional per-bin weights for analysing
+    weighted-L2 statistics.
+  - `quadsv.gene_pattern_diversity(spectra)` — single-sample heterogeneity:
+    K_eff of the cross-gene spectrum covariance. Low K_eff means the
+    sample's genes share a single dominant spatial-frequency profile;
+    high K_eff means a rich mix of spatial scales.
+  - `quadsv.within_group_pattern_diversity(spectra, groups)` —
+    cohort-level heterogeneity: K_eff of the pooled within-group
+    residual covariance (the same Σ used by `log_l2 + null='wald'`).
+    Low K_eff is a warning that the Wald analytic null may be
+    miscalibrated due to estimation noise concentrated in a single
+    direction.
+  - `Comparator.effective_rank(level='within_group' | 'per_sample')` —
+    convenience accessor on a fitted comparator. Useful for diagnosing
+    why two cohorts have different post-Wald p-value distributions.
+  Empirical reference values on the benchmark panels (within-group):
+  ad_pig 4.05, brain_dev 1.15, sci 1.29 — directly explains the
+  ranking of post-F1 QQ-deviation across panels (sci worst, ad_pig
+  best). 10 new tests in `TestEffectiveRank`.
 - **`compare_two_groups_masked` now supports `null="wald"`** for
   `statistic="log_l2"`. Implementation uses a mask-aware pooled
   covariance estimator (new `_pooled_full_within_group_sigma_masked`)

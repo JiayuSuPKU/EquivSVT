@@ -48,9 +48,12 @@ from quadsv.kernels.nufft import NUFFTKernel
 from quadsv.statistics import (
     auto_chunk_size,
     compute_null_params,
+    effective_rank,
+    gene_pattern_diversity,
     liu_sf,
     spatial_q_test,
     spatial_r_test,
+    within_group_pattern_diversity,
 )
 
 # The :class:`~quadsv.kernels.Kernel` and
@@ -71,6 +74,10 @@ __all__ = [
     "compute_null_params",
     "auto_chunk_size",
     "liu_sf",
+    # Effective-rank / spatial-pattern diversity
+    "effective_rank",
+    "gene_pattern_diversity",
+    "within_group_pattern_diversity",
     # Detectors
     "DetectorIrregular",
     "DetectorGrid",

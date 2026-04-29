@@ -886,6 +886,139 @@ class TestCompareDesignsAndGLMWald:
             ComparatorIrregular(samples)
 
 
+class TestEffectiveRank:
+    """K_eff (effective rank / participation ratio) primitives + accessors."""
+
+    def test_effective_rank_identity_equals_K(self):
+        """K_eff(I_K) = K — uniformly spread eigenvalues."""
+        from quadsv import effective_rank
+        for K in [3, 10, 30]:
+            assert abs(effective_rank(np.eye(K)) - K) < 1e-12
+
+    def test_effective_rank_rank_one_equals_one(self):
+        """K_eff of an outer product vv^T is 1."""
+        from quadsv import effective_rank
+        rng = np.random.default_rng(0)
+        v = rng.standard_normal(15)
+        cov = np.outer(v, v)
+        assert abs(effective_rank(cov) - 1.0) < 1e-10
+
+    def test_effective_rank_bounds(self):
+        """1 ≤ K_eff ≤ K for any PSD covariance."""
+        from quadsv import effective_rank
+        rng = np.random.default_rng(1)
+        for _ in range(20):
+            K = rng.integers(2, 30)
+            X = rng.standard_normal((50, K))
+            cov = X.T @ X / 50
+            ke = effective_rank(cov)
+            assert 1.0 - 1e-10 <= ke <= K + 1e-10, f"K_eff={ke} not in [1, {K}]"
+
+    def test_effective_rank_with_weights_changes_value(self):
+        """Non-uniform weights skew the effective rank."""
+        from quadsv import effective_rank
+        K = 20
+        cov = np.eye(K)
+        # Uniform weights → still K
+        ke_uniform = effective_rank(cov, weights=np.ones(K) / K)
+        assert abs(ke_uniform - K) < 1e-10
+        # Concentrate all weight on one bin → K_eff drops to 1
+        w_concentrated = np.zeros(K)
+        w_concentrated[0] = 1.0
+        ke_concentrated = effective_rank(cov, weights=w_concentrated)
+        assert abs(ke_concentrated - 1.0) < 1e-10
+
+    def test_effective_rank_invalid_inputs(self):
+        from quadsv import effective_rank
+        with pytest.raises(ValueError, match="square 2D matrix"):
+            effective_rank(np.zeros((5, 4)))
+        with pytest.raises(ValueError, match="non-negative"):
+            effective_rank(np.eye(5), weights=np.array([1, 1, 1, 1, -1]))
+
+    def test_gene_pattern_diversity_low_vs_high_heterogeneity(self):
+        """Constant spectra + rank-1 perturbation → K_eff close to 1.
+        Iid noise across genes → K_eff close to K."""
+        from quadsv import gene_pattern_diversity
+        rng = np.random.default_rng(0)
+        K = 10
+        # Rank-1 heterogeneity: each gene gets the same shape, scaled by a
+        # gene-specific factor. After centering log → all residuals along
+        # one direction → K_eff ≈ 1.
+        shape = np.linspace(1, 5, K)
+        gene_scales = rng.uniform(0.5, 2.0, size=200)
+        spectra_rank1 = np.exp(np.log(shape)[None, :] + np.log(gene_scales)[:, None])
+        ke_rank1 = gene_pattern_diversity(spectra_rank1)
+        assert ke_rank1 < 1.5, f"expected K_eff close to 1, got {ke_rank1:.2f}"
+        # Iid: each (gene, bin) is independent log-normal → K_eff close to K
+        spectra_iid = np.exp(rng.standard_normal((200, K)))
+        ke_iid = gene_pattern_diversity(spectra_iid)
+        assert ke_iid > K * 0.5, f"expected K_eff > {K/2}, got {ke_iid:.2f}"
+
+    def test_gene_pattern_diversity_random_spectra_near_K(self):
+        from quadsv import gene_pattern_diversity
+        rng = np.random.default_rng(2)
+        spectra = np.exp(rng.standard_normal((500, 20)))
+        ke = gene_pattern_diversity(spectra)
+        # iid log-normal across genes — covariance ≈ I/G after centring →
+        # K_eff close to K=20
+        assert ke > 15.0, f"expected K_eff close to 20, got {ke:.2f}"
+
+    def test_within_group_pattern_diversity_real_data_like(self):
+        """Synthetic cohort with rank-1 within-group structure: K_eff ≈ 1."""
+        from quadsv import within_group_pattern_diversity
+        rng = np.random.default_rng(3)
+        n_a, n_b, G, K = 4, 4, 800, 20
+        # Per-sample shared scalar noise across all bins → near rank-1 Σ
+        scalar = rng.standard_normal((n_a + n_b, G, 1))
+        spectra = np.exp(scalar)  # All bins identical → singular Σ
+        groups = np.array([0]*n_a + [1]*n_b)
+        ke = within_group_pattern_diversity(spectra, groups)
+        assert ke < 2.0, f"expected K_eff close to 1, got {ke:.2f}"
+
+        # Independent noise per bin → near rank-K Σ
+        spectra_iid = np.exp(rng.standard_normal((n_a + n_b, G, K)))
+        ke_iid = within_group_pattern_diversity(spectra_iid, groups)
+        assert ke_iid > K * 0.5, f"expected K_eff > {K/2}, got {ke_iid:.2f}"
+
+    def test_comparator_effective_rank_within_group(self):
+        from quadsv.comparators import ComparatorIrregular
+        rng = np.random.default_rng(4)
+        n_per = 4
+        spectra = np.exp(rng.standard_normal((2*n_per, 200, 20)))
+        # Wrap into AnnData via the test helper
+        adatas = []
+        for i in range(2*n_per):
+            adatas.append(_grid_to_adata(rng.uniform(size=(200, 8, 8)),
+                                          gene_names=[f"g{j}" for j in range(200)]))
+        groups = np.array([0]*n_per + [1]*n_per)
+        cmp = ComparatorIrregular(adatas, groups=groups, gene_names=[f"g{j}" for j in range(200)],
+                                   feature_mode="radial", n_radial_bins=15, center="mean",
+                                   presence_threshold=0.0, min_samples_per_group=2)
+        cmp.fit(n_jobs=1, progress=False)
+        ke = cmp.effective_rank(level="within_group")
+        assert isinstance(ke, float)
+        assert 1.0 - 1e-9 <= ke <= 15.0 + 1e-9
+
+    def test_comparator_effective_rank_per_sample(self):
+        from quadsv.comparators import ComparatorIrregular
+        rng = np.random.default_rng(5)
+        n_per = 3
+        adatas = []
+        n_total = 2 * n_per
+        for i in range(n_total):
+            adatas.append(_grid_to_adata(rng.uniform(size=(150, 8, 8)),
+                                          gene_names=[f"g{j}" for j in range(150)]))
+        groups = np.array([0]*n_per + [1]*n_per)
+        cmp = ComparatorIrregular(adatas, groups=groups, gene_names=[f"g{j}" for j in range(150)],
+                                   feature_mode="radial", n_radial_bins=12, center="mean",
+                                   presence_threshold=0.0, min_samples_per_group=2)
+        cmp.fit(n_jobs=1, progress=False)
+        ke_arr = cmp.effective_rank(level="per_sample")
+        assert ke_arr.shape == (n_total,)
+        assert np.all(ke_arr >= 1.0 - 1e-9)
+        assert np.all(ke_arr <= 12.0 + 1e-9)
+
+
 class TestTwoGroupPower:
     def test_implanted_difference_is_recovered(self):
         rng = np.random.default_rng(7)

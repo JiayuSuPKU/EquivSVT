@@ -38,6 +38,10 @@ EXPECTED_ALL: list[str] = [
     "compute_null_params",
     "auto_chunk_size",
     "liu_sf",
+    # Effective-rank / spatial-pattern diversity
+    "effective_rank",
+    "gene_pattern_diversity",
+    "within_group_pattern_diversity",
     # Detectors
     "DetectorIrregular",
     "DetectorGrid",
@@ -97,6 +101,9 @@ _CANONICAL_PATHS: dict[str, tuple[str, str]] = {
     "compute_null_params": ("quadsv.statistics", "compute_null_params"),
     "auto_chunk_size": ("quadsv.statistics", "auto_chunk_size"),
     "liu_sf": ("quadsv.statistics", "liu_sf"),
+    "effective_rank": ("quadsv.statistics", "effective_rank"),
+    "gene_pattern_diversity": ("quadsv.statistics", "gene_pattern_diversity"),
+    "within_group_pattern_diversity": ("quadsv.statistics", "within_group_pattern_diversity"),
     "DetectorIrregular": ("quadsv.detectors.irregular", "DetectorIrregular"),
     "DetectorGrid": ("quadsv.detectors.grid", "DetectorGrid"),
     "ComparatorIrregular": ("quadsv.comparators", "ComparatorIrregular"),
