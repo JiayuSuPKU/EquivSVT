@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **Breaking: `center` argument retired across the comparator API.**
+  `ComparatorIrregular`, `ComparatorGrid`, and `compute_sample_spectrum`
+  no longer accept `center`. Per-gene mean centering (`center='mean'`,
+  the previous default) is now the only spectrum normalization path —
+  it removes DC from the spectrum and orthogonalizes the AC pattern test
+  against the DC `compare_two_groups_scalar` DE test, which the
+  benchmark sweep showed dominated `center='zscore'` and `center=None`
+  on every panel. `_ZSCORE_CLIP` constant, the `zscore_clip` parameter
+  on `compute_sample_spectrum`, and the per-bin `_ZSCORE_CLIP` clamp
+  in the NUFFT comparator loop are also deleted (~50 LOC). Callers
+  passing `center=` will hit `TypeError: unexpected keyword argument`.
+  `_ComparatorBase.center` attribute removed; `_validate_common`
+  signature shrinks by one argument.
+- **Breaking: `benchmark_statistics` function retired.** The thin
+  `compare_two_groups`-with-shared-permutations wrapper was unused;
+  callers should invoke `compare_two_groups` directly with both
+  `statistic="log_l2"` and `statistic="cauchy_welch"` to A/B compare
+  on the same fitted spectra. The matching `Comparator.benchmark()`
+  method is also removed. ~95 LOC.
+
+### Changed
+- Benchmark sweep grid shrank from 2 × 2 × 3 = 12 configs to 2 × 2 = 4
+  configs (statistic × feature_mode). Sweep wall-clock dropped from
+  ~5.5 min to ~2 min on the same 3-panel × 19-sample-set workload.
+  Recommended pipeline is now **`feature_mode="2d"` + `statistic="log_l2"`
+  + `null="wald"`** (composite −0.051; `radial / log_l2` tied within
+  0.003). Outdated benchmark output files (`bench_F1_perm_*`,
+  `bench_sci_smoke_*`) and exploratory diagnostic figures
+  (`diag_hierarchical_sigma`, `diag_linear_shrinkage_alpha_sweep`,
+  `diag_masked_wald_proposal`, `diag_per_panel_sigma_structure`,
+  `sci_slide_layouts`) were cleaned up; the legacy
+  `run_comparator_panel.py` per-panel runner and the
+  `HIERARCHICAL_SIGMA_AND_MASKED_WALD.md` design memo (subsumed by
+  the comparator_benchmark/README.md §4 narrative) were also deleted.
+
 ### Added
 - **sci benchmark switched to section-level samples.** Each Lu et al.
   (GSE256397) Visium array carries four disjoint cryosections of the

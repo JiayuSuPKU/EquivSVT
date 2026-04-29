@@ -20,7 +20,6 @@ from quadsv.comparators.base import (
     _validate_common,
     _validate_groups_or_design,
 )
-from quadsv.comparators.multisample import _ZSCORE_CLIP
 
 __all__ = ["ComparatorIrregular"]
 
@@ -72,7 +71,6 @@ class ComparatorIrregular(_ComparatorBase):
         k-grid is auto-inferred from coords via
         :func:`quadsv.kernels.nufft._infer_grid_from_coords`.
     freq_edges : np.ndarray, optional
-    center : {'mean', 'zscore', None}, default 'mean'
     eps : float, default 1e-6
         NUFFT tolerance.
     presence_threshold : float, default 0.0
@@ -102,7 +100,6 @@ class ComparatorIrregular(_ComparatorBase):
         grid_shape: tuple[int, int] | None = None,
         spacing: tuple[float, float] | None = None,
         freq_edges: np.ndarray | None = None,
-        center: str | None = "mean",
         eps: float = 1e-6,
         presence_threshold: float = 0.0,
         min_samples_per_group: int = 2,
@@ -110,7 +107,7 @@ class ComparatorIrregular(_ComparatorBase):
         workers: int | None = None,
     ) -> None:
         fft_solver = _validate_common(
-            center, feature_mode, "fft2", presence_threshold, min_samples_per_group
+            feature_mode, "fft2", presence_threshold, min_samples_per_group
         )
         samples_list = list(samples)
         if len(samples_list) == 0:
@@ -129,7 +126,6 @@ class ComparatorIrregular(_ComparatorBase):
         self.feature_mode = feature_mode
         self.n_radial_bins = int(n_radial_bins)
         self.fft_solver = fft_solver
-        self.center = center
         self.workers = workers
         self.freq_edges = None if freq_edges is None else np.asarray(freq_edges, dtype=float)
         self.presence_threshold = float(presence_threshold)
@@ -202,29 +198,15 @@ class ComparatorIrregular(_ComparatorBase):
             if sp.issparse(X_src):
                 dc = np.asarray(X_src.mean(axis=0)).ravel()
                 nnz_per = np.asarray((X_src != 0).sum(axis=0)).ravel()
-                if self.center == "zscore":
-                    sq = X_src.multiply(X_src)
-                    sq_mean = np.asarray(sq.mean(axis=0)).ravel()
-                    sd_arr = np.sqrt(np.maximum(sq_mean - dc**2, 0.0))
-                else:
-                    sd_arr = None
                 X_csc = X_src.tocsc()
                 X_dense = None
             else:
                 X_dense = np.asarray(X_src, dtype=np.float64)
                 dc = X_dense.mean(axis=0)
                 nnz_per = (X_dense != 0).sum(axis=0)
-                sd_arr = X_dense.std(axis=0) if self.center == "zscore" else None
                 X_csc = None
 
             presence_i = (nnz_per / max(n_spots, 1)) >= self.presence_threshold
-
-            if self.center == "zscore":
-                positive = sd_arr[sd_arr > 0] if sd_arr is not None else np.empty(0)
-                sd_floor = float(np.median(positive)) * 0.1 if positive.size else 1.0
-                sd_safe = np.maximum(sd_arr, sd_floor) if sd_arr is not None else None
-            else:
-                sd_safe = None
 
             ny, nx = grid_i
             spec_stack = np.empty((n_genes, ny, nx), dtype=np.float64)
@@ -237,11 +219,11 @@ class ComparatorIrregular(_ComparatorBase):
                 else:
                     block = X_dense[:, cols].astype(np.float64, copy=True)
 
-                if self.center == "mean":
-                    block -= dc[None, cols]
-                elif self.center == "zscore":
-                    block = (block - dc[None, cols]) / sd_safe[None, cols]
-                    np.clip(block, -_ZSCORE_CLIP, _ZSCORE_CLIP, out=block)
+                # Per-gene mean centering: removes the DC bin and prevents
+                # per-sample mean-shift leakage into low-frequency bins. The
+                # raw DC scalars are preserved on ``self.dc_`` for the
+                # complementary :meth:`test_expression` path.
+                block -= dc[None, cols]
 
                 p_chunk = power_spectrum_2d_nufft(
                     pts,

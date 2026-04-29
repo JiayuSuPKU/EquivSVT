@@ -45,9 +45,9 @@ Five-step pipeline
 
 .. dropdown:: DC vs AC: separating expression level from pattern shape
 
-   By default the pipeline mean-centres each gene's spatial signal
-   before the FFT (``center="mean"``). This splits the information
-   cleanly into two orthogonal pieces.
+   The pipeline always mean-centres each gene's spatial signal before
+   the FFT, splitting the information cleanly into two orthogonal
+   pieces.
 
    The **DC scalar** is the per-sample grid mean, i.e. total
    normalised expression. It is tested across groups with
@@ -58,7 +58,7 @@ Five-step pipeline
    The **AC spectrum** is the pattern shape, with DC exactly zero.
    It is tested with
    :meth:`~quadsv.ComparatorIrregular.test_pattern` using one of
-   the four statistics listed below.
+   the two statistics listed below.
 
    The two tests carry complementary information. A gene may be
    "only DE" (same pattern, different magnitude), "only pattern"
@@ -66,13 +66,8 @@ Five-step pipeline
    them side by side and inspect where the hits overlap and where
    they separate.
 
-   ``center="zscore"`` makes the pattern test scale-invariant
-   (it ignores overall amplitude). ``center=None`` disables the
-   split. This is legacy behaviour and lets DC and nearby bins
-   leak between the two tests.
-
-The four pattern-test statistics ship out of the box and share a
-single permutation null, so they are directly comparable:
+The two pattern-test statistics ship out of the box and share a
+common dispatch, so they are directly comparable:
 
 .. list-table::
    :header-rows: 1
@@ -81,18 +76,19 @@ single permutation null, so they are directly comparable:
    * - Statistic
      - What it measures
    * - ``log_l2`` (default)
-     - L2 distance between the two groups' mean log-spectra.
-   * - ``hotelling_lw``
-     - Regularised Hotelling :math:`T^2` with Ledoit-Wolf
-       covariance.
-   * - ``mmd_rbf``
-     - Maximum mean discrepancy with an RBF kernel.
-   * - ``max_welch``
-     - Max per-bin Welch t-statistic. Useful as an interpretable
-       omnibus.
+     - Quadratic form ``T² = D'WD`` on log-spectra differences.
+       Supports both ``null="permutation"`` and analytic
+       ``null="wald"`` (Liu mixture-χ² tail). The Wald null bypasses
+       the BH-FDR floor that the exact permutation test hits at
+       small per-arm n.
+   * - ``cauchy_welch``
+     - Cauchy combination of per-bin Welch t-statistics. Analytic
+       null is built in; remains well-calibrated at very small n.
 
-Use :func:`quadsv.comparators.multisample.benchmark_statistics` to
-score all four on the same data.
+Both run through :func:`quadsv.comparators.multisample.compare_two_groups`
+(or :meth:`quadsv.ComparatorIrregular.test_pattern` for the class API);
+flip ``statistic="log_l2"`` ↔ ``statistic="cauchy_welch"`` to compare on
+the same fitted spectra.
 
 
 Picking a class
@@ -256,9 +252,10 @@ See also
 - :doc:`/guides/scaling` for how the FFT and NUFFT routines scale.
 - :class:`quadsv.ComparatorIrregular` and
   :class:`quadsv.ComparatorGrid` for the class reference.
-- :func:`quadsv.comparators.multisample.compare_two_groups` and
-  :func:`quadsv.comparators.multisample.benchmark_statistics` for
-  the array-level primitives.
+- :func:`quadsv.comparators.multisample.compare_two_groups`,
+  :func:`quadsv.comparators.multisample.compare_two_groups_masked`,
+  and :func:`quadsv.comparators.multisample.compare_designs` for the
+  array-level primitives.
 - :func:`quadsv.kernels.fft.power_spectrum_2d` and
   :func:`quadsv.kernels.nufft.power_spectrum_2d_nufft` for the
   spectrum primitives.

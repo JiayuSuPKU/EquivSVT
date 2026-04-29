@@ -78,7 +78,7 @@ class ComparatorGrid(_ComparatorBase):
 
     Other Parameters
     ----------------
-    feature_mode, n_radial_bins, fft_solver, workers, freq_edges, center, presence_threshold, min_samples_per_group
+    feature_mode, n_radial_bins, fft_solver, workers, freq_edges, presence_threshold, min_samples_per_group
         See :class:`_ComparatorBase`.
     """
 
@@ -100,13 +100,12 @@ class ComparatorGrid(_ComparatorBase):
         workers: int | None = None,
         spacing: tuple[float, float] | None = None,
         freq_edges: np.ndarray | None = None,
-        center: str | None = "mean",
         presence_threshold: float = 0.0,
         min_samples_per_group: int = 2,
         fft_chunk_size: int = 256,
     ) -> None:
         fft_solver = _validate_common(
-            center, feature_mode, fft_solver, presence_threshold, min_samples_per_group
+            feature_mode, fft_solver, presence_threshold, min_samples_per_group
         )
         samples_list = list(samples)
         if len(samples_list) == 0:
@@ -127,7 +126,6 @@ class ComparatorGrid(_ComparatorBase):
         self.feature_mode = feature_mode
         self.n_radial_bins = int(n_radial_bins)
         self.fft_solver = fft_solver
-        self.center = center
         self.workers = workers
         self.freq_edges = None if freq_edges is None else np.asarray(freq_edges, dtype=float)
         self.presence_threshold = float(presence_threshold)
@@ -200,13 +198,12 @@ class ComparatorGrid(_ComparatorBase):
             spec_stack = np.empty((n_genes, ny, expected_kx), dtype=np.float64)
             for start in range(0, n_genes, chunk):
                 stop = min(start + chunk, n_genes)
-                # Reuse the shared helper; it applies the sparse-gene zscore
-                # guard identically to the NUFFT path.
+                # Reuse the shared helper; it always mean-centres each gene
+                # before the FFT.
                 spec_chunk = compute_sample_spectrum(
                     raster[start:stop],
                     fft_solver=self._spectrum_fft_solver,
                     workers=self.workers,
-                    center=self.center,
                     return_dc=False,
                 )
                 spec_stack[start:stop] = spec_chunk

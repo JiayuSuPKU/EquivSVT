@@ -29,9 +29,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
 
 from quadsv.comparators.multisample import (
-    _AVAILABLE_STATISTICS,
     align_spectra_by_rotation,
-    benchmark_statistics,
     compare_designs,
     compare_two_groups,
     compare_two_groups_masked,
@@ -58,7 +56,7 @@ class _ComparatorBase:
 
     Concrete subclasses must populate ``self.samples``, ``self.groups``,
     ``self.gene_names``, ``self._grid_shapes``, ``self.spacings``,
-    ``self._spectrum_fft_solver``, ``self.feature_mode``, ``self.center``,
+    ``self._spectrum_fft_solver``, ``self.feature_mode``,
     ``self.n_radial_bins``, ``self.fft_solver``, ``self.workers``,
     ``self.freq_edges``, ``self.presence_threshold``,
     ``self.min_samples_per_group`` in their ``__init__``, then implement
@@ -76,7 +74,6 @@ class _ComparatorBase:
     constructed with ``groups=``."""
     gene_names: list[str]
     feature_mode: str
-    center: str | None
     n_radial_bins: int
     fft_solver: str  # user-visible choice; see _spectrum_fft_solver for the effective one
     workers: int | None
@@ -148,9 +145,8 @@ class _ComparatorBase:
         self
         """
         logger.info(
-            "Computing per-sample spectra (n_samples=%d, center=%s)...",
+            "Computing per-sample spectra (n_samples=%d, mean-centered)...",
             len(self._grid_shapes),
-            self.center,
         )
         self._raw_2d_spectra, self.dc_, self.presence_ = self._compute_spectra(
             n_jobs=n_jobs, progress=progress
@@ -465,38 +461,6 @@ class _ComparatorBase:
             f"level must be 'within_group' or 'per_sample', got {level!r}."
         )
 
-    def benchmark(
-        self,
-        statistics: Sequence[str] = _AVAILABLE_STATISTICS,
-        null: str = "permutation",
-        n_perm: int = 1000,
-        random_state: int | None = None,
-        n_perm_max: int = 10000,
-    ) -> dict[str, Any]:
-        """Run :func:`benchmark_statistics` on :attr:`spectra_`.
-
-        ``null`` is forwarded; only ``log_l2`` honours ``null='wald'``,
-        other statistics ignore it. Requires the binary ``groups=``
-        constructor path.
-        """
-        if self.spectra_ is None:
-            raise RuntimeError("Call .fit() before .benchmark().")
-        if self.groups is None:
-            raise NotImplementedError(
-                "benchmark() currently requires the binary `groups=` "
-                "constructor path."
-            )
-        return benchmark_statistics(
-            self.spectra_,
-            self.groups,
-            gene_names=self.gene_names,
-            statistics=statistics,
-            null=null,
-            n_perm=n_perm,
-            random_state=random_state,
-            n_perm_max=n_perm_max,
-        )
-
 
 # ---------------------------------------------------------------------------
 # Shared input-validation helpers
@@ -579,14 +543,11 @@ def _validate_groups_or_design(
 
 
 def _validate_common(
-    center: str | None,
     feature_mode: str,
     fft_solver: str,
     presence_threshold: float,
     min_samples_per_group: int,
 ) -> str:
-    if center not in ("mean", "zscore", None):
-        raise ValueError(f"center must be 'mean', 'zscore', or None, got {center!r}.")
     if feature_mode not in ("radial", "2d"):
         raise ValueError(f"feature_mode must be 'radial' or '2d', got '{feature_mode}'.")
     if feature_mode == "2d" and fft_solver != "fft2":

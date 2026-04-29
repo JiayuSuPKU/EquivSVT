@@ -11,7 +11,6 @@ from quadsv.comparators import ComparatorIrregular
 from quadsv.comparators.multisample import (
     align_spectra_by_rotation,
     apply_rotations_to_spectra,
-    benchmark_statistics,
     compare_designs,
     compare_two_groups,
     compare_two_groups_masked,
@@ -992,7 +991,7 @@ class TestEffectiveRank:
                                           gene_names=[f"g{j}" for j in range(200)]))
         groups = np.array([0]*n_per + [1]*n_per)
         cmp = ComparatorIrregular(adatas, groups=groups, gene_names=[f"g{j}" for j in range(200)],
-                                   feature_mode="radial", n_radial_bins=15, center="mean",
+                                   feature_mode="radial", n_radial_bins=15,
                                    presence_threshold=0.0, min_samples_per_group=2)
         cmp.fit(n_jobs=1, progress=False)
         ke = cmp.effective_rank(level="within_group")
@@ -1010,7 +1009,7 @@ class TestEffectiveRank:
                                           gene_names=[f"g{j}" for j in range(150)]))
         groups = np.array([0]*n_per + [1]*n_per)
         cmp = ComparatorIrregular(adatas, groups=groups, gene_names=[f"g{j}" for j in range(150)],
-                                   feature_mode="radial", n_radial_bins=12, center="mean",
+                                   feature_mode="radial", n_radial_bins=12,
                                    presence_threshold=0.0, min_samples_per_group=2)
         cmp.fit(n_jobs=1, progress=False)
         ke_arr = cmp.effective_rank(level="per_sample")
@@ -1114,20 +1113,6 @@ class TestStatisticAliases:
             )
 
 
-class TestBenchmark:
-    def test_benchmark_returns_one_df_per_statistic(self):
-        rng = np.random.default_rng(0)
-        spectra = rng.uniform(0.1, 5.0, size=(8, 12, 8))
-        groups = np.array([0, 0, 0, 0, 1, 1, 1, 1])
-        out = benchmark_statistics(spectra, groups, n_perm=50, random_state=0)
-        assert set(out.keys()) == {"log_l2", "cauchy_welch"}
-        for _stat, df in out.items():
-            assert df.shape[0] == 12
-            assert df["P_value"].between(0, 1).all()
-        # cauchy_welch specifically carries per-bin p-values.
-        assert "P_value_per_bin" in out["cauchy_welch"].columns
-
-
 # ---------------------------------------------------------------------------
 # End-to-end: ComparatorIrregular
 # ---------------------------------------------------------------------------
@@ -1193,36 +1178,25 @@ class TestComparatorIrregularEndToEnd:
 
 
 class TestMeanCenteringMakesDcZero:
+    """The FFT pipeline always mean-centres each gene's grid so the
+    spectral DC bin is exactly zero — this orthogonalises the AC pattern
+    test against the DC :func:`compare_two_groups_scalar` DE test."""
+
     def test_mean_center_yields_dc_zero(self):
-        """With center='mean', the spectrum's k=0 bin is numerically zero."""
+        """The k=0 bin of the spectrum is numerically zero by construction."""
         rng = np.random.default_rng(0)
         sample = rng.standard_normal((3, 12, 14)) + 5.0  # non-zero mean
-        spec = compute_sample_spectrum(sample, fft_solver="fft2", center="mean")
+        spec = compute_sample_spectrum(sample, fft_solver="fft2")
         # The DC bin is at index (0, 0) for both fft2 and rfft2 layouts.
         np.testing.assert_allclose(spec[:, 0, 0], 0.0, atol=1e-18)
 
     def test_return_dc_reports_per_gene_grid_means(self):
         rng = np.random.default_rng(1)
         sample = rng.standard_normal((4, 8, 10)) + np.arange(4)[:, None, None]
-        spec, dc = compute_sample_spectrum(sample, center="mean", return_dc=True)
+        spec, dc = compute_sample_spectrum(sample, return_dc=True)
         np.testing.assert_allclose(dc, sample.mean(axis=(1, 2)), rtol=1e-12)
         # Spectrum shape preserved.
         assert spec.shape[0] == 4
-
-    def test_zscore_makes_std_unity(self):
-        rng = np.random.default_rng(2)
-        sample = 3.0 * rng.standard_normal((2, 16, 16)) + 7.0
-        spec = compute_sample_spectrum(sample, fft_solver="fft2", center="zscore")
-        # After z-scoring, total power (Parseval) ≈ N * (N * variance) / N = N.
-        # i.e. sum(|X̂|²) / N == N_cells (since std is 1).
-        n_cells = 16 * 16
-        per_gene_total = spec.sum(axis=(1, 2)) / n_cells
-        np.testing.assert_allclose(per_gene_total, n_cells, rtol=1e-6)
-
-    def test_no_centering_preserves_dc(self):
-        img = 2.5 * np.ones((8, 8))[None, :, :]
-        spec = compute_sample_spectrum(img, fft_solver="fft2", center=None)
-        assert spec[0, 0, 0] == pytest.approx((2.5 * 8 * 8) ** 2)
 
 
 class TestScalarTestCalibration:
@@ -1273,7 +1247,6 @@ class TestDeAndPatternOrthogonality:
             groups,
             gene_names=gene_names,
             n_radial_bins=8,
-            center="mean",
         ).fit()
 
         de = cmp.test_expression(n_perm=400, random_state=0)
@@ -1289,19 +1262,14 @@ class TestDeAndPatternOrthogonality:
         # is identical between groups by construction.
         assert pat_g0.P_value > 0.05
 
-    def test_center_none_keeps_dc_nonzero_mean_makes_it_zero(self):
-        """Direct structural check: with `center='mean'` the DC bin is exactly 0
-        in the returned spectrum (so no DE signal can leak into the pattern
-        test), whereas with `center=None` it carries the mean-squared power.
-        This is a more direct test than rerunning the full pattern statistic,
-        which already strips DC via ``exclude_dc=True``.
-        """
+    def test_dc_bin_always_zero_under_mean_centering(self):
+        """The pipeline always mean-centres before FFT, so the DC bin is
+        exactly zero in the returned spectrum — no DE signal can leak into
+        the pattern test."""
         rng = np.random.default_rng(2)
         sample = rng.standard_normal((3, 12, 12)) + 4.0  # non-zero mean
-        spec_mean = compute_sample_spectrum(sample, fft_solver="fft2", center="mean")
-        spec_none = compute_sample_spectrum(sample, fft_solver="fft2", center=None)
-        np.testing.assert_allclose(spec_mean[:, 0, 0], 0.0, atol=1e-18)
-        assert np.all(spec_none[:, 0, 0] > 0.0)
+        spec = compute_sample_spectrum(sample, fft_solver="fft2")
+        np.testing.assert_allclose(spec[:, 0, 0], 0.0, atol=1e-18)
 
 
 class TestComparatorIrregularDcAccess:

@@ -22,9 +22,8 @@ Pipeline
 4. **Batch correction** — :func:`normalize_by_background` cancels per-slide
    gain/sensitivity differences; :func:`residualize_against_covariates` regresses out
    user-supplied covariate spectra (cell-type proportions, tissue domains, etc.).
-5. **Two-group test per gene** — :func:`compare_two_groups` (or
-   :func:`benchmark_statistics` for an apples-to-apples comparison of all four)
-   produces a per-gene table with a permutation p-value and BH-FDR.
+5. **Two-group test per gene** — :func:`compare_two_groups` produces a
+   per-gene table with a permutation (or analytic Wald) p-value and BH-FDR.
 
 This module only contains **array-level primitives**. The two high-level
 wrapper classes that drive the pipeline on :class:`anndata.AnnData` /
@@ -73,19 +72,11 @@ __all__ = [
     "compare_two_groups_masked",
     "compare_two_groups_scalar",
     "compare_designs",
-    "benchmark_statistics",
 ]
 
 logger = logging.getLogger(__name__)
 
 _AVAILABLE_STATISTICS = ("log_l2", "cauchy_welch")
-
-# Absolute clipping threshold for ``center='zscore'`` (both the FFT per-sample
-# helper :func:`compute_sample_spectrum` and the NUFFT comparator loop use
-# this). Guards against sparse genes producing arbitrarily large standardized
-# values that dominate the pattern test. ±6σ covers > 99.99% of the Normal
-# distribution so this is a gentle cap, not a heavy truncation.
-_ZSCORE_CLIP = 6.0
 
 
 # ---------------------------------------------------------------------------
@@ -97,17 +88,15 @@ def compute_sample_spectrum(
     sample: np.ndarray,
     fft_solver: str = "rfft2",
     workers: int | None = None,
-    center: str | None = "mean",
     return_dc: bool = False,
-    zscore_clip: float | None = 6.0,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Compute the 2D power spectrum of every gene in a single sample.
 
-    By default the spatial signal is **mean-centred per gene** before the FFT so
-    that the resulting power spectrum carries only the *AC* component of the
-    pattern — i.e. the ``k=0`` (DC) bin is exactly zero and low-``k`` leakage from
-    per-sample mean shifts is eliminated. The separated DC scalars (the per-sample
+    The spatial signal is **mean-centred per gene** before the FFT so that the
+    resulting power spectrum carries only the *AC* component of the pattern —
+    i.e. the ``k=0`` (DC) bin is exactly zero and low-``k`` leakage from per-
+    sample mean shifts is eliminated. The separated DC scalars (the per-sample
     per-gene grid means) can be returned alongside the spectrum with
     ``return_dc=True`` and are the natural target for a *classical differential
     expression* test complementary to the spectral pattern test.
@@ -120,36 +109,9 @@ def compute_sample_spectrum(
         FFT routine forwarded to :func:`quadsv.kernels.fft.power_spectrum_2d`.
     workers : int, optional
         Parallel workers forwarded to :mod:`scipy.fft`.
-    center : {'mean', 'zscore', None}, default 'mean'
-        Per-gene centering applied to the spatial signal *before* the FFT.
-
-        - ``'mean'`` (default): subtract the grid mean. Ensures the DC bin is 0
-          and the spectrum is statistically orthogonal to a DE test on the per-
-          gene grid means.
-        - ``'zscore'``: subtract the mean and divide by the standard deviation.
-          Also removes overall magnitude, so the spectrum becomes scale-invariant
-          (pure pattern shape). Sparse genes are **heavily down-weighted**
-          by the guard described below.
-        - ``None``: no centering; spectrum includes DC.
     return_dc : bool, default False
         If True, also return a ``(n_genes,)`` array of per-gene grid means (DC
         scalars of the *uncentered* signal).
-    zscore_clip : float or None, default 6.0
-        Only active when ``center='zscore'``. Two-part guard against
-        sparse / near-constant genes producing extreme-outlier z-scores
-        that dominate the pattern test:
-
-        1. The per-gene std is floored at the median non-zero std across
-           genes (robust, data-driven floor); genes with all-zero or
-           numerically-zero std are effectively zeroed out. This prevents
-           sparse genes with a single non-zero pixel from blowing up to
-           arbitrarily large z-scores.
-        2. After standardization, values are clipped to
-           ``[-zscore_clip, +zscore_clip]``.
-
-        Pass ``None`` to disable both guards (reproduces the pre-fix
-        behavior). Integer values < 3 are not recommended — heavy
-        clipping biases the spectrum towards low frequencies.
 
     Returns
     -------
@@ -160,34 +122,14 @@ def compute_sample_spectrum(
     Raises
     ------
     ValueError
-        If ``sample`` is not 3D or ``center`` is unknown.
+        If ``sample`` is not 3D.
     """
     if sample.ndim != 3:
         raise ValueError(f"sample must be 3D (n_genes, ny, nx), got shape {sample.shape}")
-    if center not in ("mean", "zscore", None):
-        raise ValueError(f"center must be 'mean', 'zscore', or None, got {center!r}.")
 
     # DC scalars always come from the *uncentered* grid.
     dc = sample.mean(axis=(1, 2))
-
-    if center == "mean":
-        work = sample - dc[:, None, None]
-    elif center == "zscore":
-        sd = sample.std(axis=(1, 2))  # (n_genes,)
-        if zscore_clip is not None:
-            # Robust floor: median of the positive per-gene stds. Sparse / near
-            # constant genes get floored at this typical scale, so the ratio
-            # (value - mean) / std does not explode.
-            positive = sd[sd > 0]
-            floor = float(np.median(positive)) if positive.size else 1.0
-            sd_safe = np.maximum(sd, floor * 0.1)
-        else:
-            sd_safe = np.clip(sd, 1e-12, None)
-        work = (sample - dc[:, None, None]) / sd_safe[:, None, None]
-        if zscore_clip is not None:
-            np.clip(work, -float(zscore_clip), float(zscore_clip), out=work)
-    else:
-        work = sample
+    work = sample - dc[:, None, None]
 
     # Move feature axis to last so power_spectrum_2d treats it as M.
     moved = np.moveaxis(work, 0, -1)
@@ -1719,101 +1661,6 @@ def compare_two_groups(  # noqa: C901
     return df
 
 
-def benchmark_statistics(
-    spectra: np.ndarray,
-    groups: np.ndarray,
-    gene_names: Sequence[str] | None = None,
-    statistics: Sequence[str] = _AVAILABLE_STATISTICS,
-    null: str = "permutation",
-    n_perm: int = 1000,
-    random_state: int | None = None,
-    n_perm_max: int = 10000,
-) -> dict[str, pd.DataFrame]:
-    """
-    Run several statistics on the same data with a **shared** permutation null.
-
-    All statistics use the same ``perm_indices``, so per-gene p-values are directly
-    comparable (same Monte-Carlo noise, same exchanges).
-
-    Parameters
-    ----------
-    spectra, groups, gene_names, n_perm, random_state
-        Same meaning as :func:`compare_two_groups`.
-    statistics : sequence of str, default ``_AVAILABLE_STATISTICS``
-        Subset of the implemented statistics (``'log_l2'``,
-        ``'cauchy_welch'``).
-    null : {'permutation', 'wald', 'liu'}, default 'permutation'
-        Forwarded to each invocation of the underlying statistic. Only
-        ``'log_l2'`` accepts ``null='wald'``; for any other statistic the
-        argument is silently ignored (``'cauchy_welch'`` is always
-        analytic, others always permutation). Defaults preserve back-compat.
-
-    Returns
-    -------
-    dict
-        Mapping ``stat_name -> DataFrame`` (each DataFrame as in
-        :func:`compare_two_groups`; ``'cauchy_welch'`` carries the extra
-        ``P_value_per_bin`` column).
-
-    Raises
-    ------
-    ValueError
-        If any statistic name is unknown or input shapes are inconsistent.
-    """
-    _available = set(_STAT_FNS) | {"cauchy_welch"}
-    for s in statistics:
-        if s not in _available:
-            raise ValueError(f"Unknown statistic '{s}'. Options: {sorted(_available)}.")
-    null_canon = _resolve_null(null)
-    if spectra.ndim != 3:
-        raise ValueError(f"spectra must be 3D (n_samples, n_genes, K), got {spectra.shape}.")
-    n_samples, n_genes, _ = spectra.shape
-    groups = np.asarray(groups)
-    uniq = np.unique(groups)
-    if uniq.size != 2:
-        raise ValueError(f"groups must contain exactly two distinct values, got {uniq}.")
-    g_int = (groups == uniq[1]).astype(int)
-
-    rng = np.random.default_rng(random_state)
-    perm_labels, is_exact = _exchangeable_group_labels(g_int, n_perm, rng, n_perm_max=n_perm_max)
-    if is_exact:
-        logger.info(
-            "Exact permutation test: enumerated %d distinct relabellings.",
-            perm_labels.shape[0],
-        )
-    if gene_names is None:
-        gene_names = [str(i) for i in range(n_genes)]
-
-    out: dict[str, pd.DataFrame] = {}
-    for s in statistics:
-        if s == "cauchy_welch":
-            observed, combined_p, per_bin_p = _run_cauchy_welch_analytic(spectra, g_int)
-            summary = observed.max(axis=-1)
-            df = pd.DataFrame(
-                {
-                    "Feature": list(gene_names),
-                    "Statistic": summary,
-                    "P_value": combined_p,
-                    "P_value_per_bin": list(per_bin_p),
-                }
-            )
-        elif s == "log_l2" and null_canon == "wald":
-            observed, pvals = _run_log_l2_wald(spectra, g_int, freq_weights=None)
-            df = pd.DataFrame(
-                {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
-            )
-        else:
-            observed, null_dist = _run_statistic_with_perm(s, spectra, g_int, perm_labels)
-            pvals = _permutation_pvalue(observed, null_dist)
-            df = pd.DataFrame(
-                {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
-            )
-        _apply_bh_correction(df)
-        df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
-        out[s] = df
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Step 4d — scalar (DE-style) two-group test
 # ---------------------------------------------------------------------------
@@ -2034,9 +1881,10 @@ def compare_two_groups_scalar(
     Per-gene two-sample test on scalar per-sample values (classical DE).
 
     The natural companion to :func:`compare_two_groups`: tested on the DC scalars
-    (per-gene grid means) produced by :func:`compute_sample_spectrum` when
-    ``center='mean'``, the result is statistically independent of the spectral
-    pattern test because DC and AC are orthogonal by construction.
+    (per-gene grid means) produced by :func:`compute_sample_spectrum`, the
+    result is statistically independent of the spectral pattern test because
+    DC and AC are orthogonal by construction (the FFT pipeline always mean-
+    centres each gene's grid before computing power).
 
     Parameters
     ----------
