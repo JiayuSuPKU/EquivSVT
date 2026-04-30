@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "quadsv"
-version = "0.1.1"
+dynamic = ["version"]
 description = "Consistent and scalable spatial pattern detection via quadratic forms."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,43 +43,46 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=1.20.0",
-    "scipy>=1.7.0",
-    "scikit-learn>=1.0.0",
-    "pandas>=1.3.0",
-    "scanpy>=1.9.0",
-    "joblib>=1.0.0",
-    "tqdm>=4.60.0",
+    # scanpy transitively pulls anndata, numpy, scipy, scikit-learn, and
+    # pandas — we track scanpy's own floor rather than restate them.
+    "scanpy>=1.9",
+    "spatialdata>=0.1",   # FFT rasterization + SpatialData IO
+    "finufft>=2.2",       # NUFFT backend
+    "joblib>=1.2",
+    "tqdm>=4.60",
 ]
 
 [project.optional-dependencies]
+# `dev` is the superset for local development: includes everything needed to
+# run tests, lint, build, and iterate in notebooks.
 dev = [
-    "pytest>=7.0.0",
-    "pytest-cov>=3.0.0",
-    "jupyter>=1.0.0",
-    "matplotlib>=3.5.0",
-    "black>=22.0.0",
-    "ruff>=0.1.0",
-    "build>=1.0.0",
-    "twine>=4.0.0",
+    # Testing
+    "pytest>=7.0",
+    "pytest-cov>=3.0",
+    "pytest-xdist>=3.0",
+    # Linting / formatting
+    "black>=22.0",
+    "ruff>=0.1",
+    # Packaging
+    "build>=1.0",
+    "twine>=4.0",
+    # Interactive / plotting
+    "jupyter>=1.0",
+    "matplotlib>=3.5",
+    # GO analysis
+    "gprofiler-official>=1.0",
 ]
+# `docs` builds the Sphinx HTML site. Napoleon ships with Sphinx so the
+# standalone `sphinxcontrib-napoleon` package is not needed.
 docs = [
-    "sphinx>=4.5.0",
-    "pydata-sphinx-theme>=0.13.0",
-    "sphinx-autodoc-typehints>=1.12.0",
-    "sphinxcontrib-napoleon>=0.7",
-    "tomli>=1.0.0;python_version<'3.11'",
-    "myst-parser>=0.18.0",
+    "sphinx>=5.0",
+    "sphinx-book-theme>=1.1",
+    "sphinx-autoapi>=3.0",
+    "sphinx-autodoc-typehints>=1.19",
+    "sphinx-design>=0.5",                 # ``.. dropdown::`` directives
+    "myst-parser>=0.18",
     "sphinx-autobuild>=2021.3.14",
-]
-spatial = [
-    "anndata>=0.8.0",
-    "spatialdata>=0.1.0",
-]
-test = [
-    "pytest>=7.0.0",
-    "pytest-cov>=3.0.0",
-    "pytest-xdist>=3.0.0",
+    "tomli>=2.0;python_version<'3.11'",   # tomllib fallback in docs/conf.py
 ]
 
 [project.urls]
@@ -90,7 +93,7 @@ Repository = "https://github.com/JiayuSuPKU/EquivSVT"
 
 [tool.black]
 line-length = 100
-target-version = ['py310', 'py311']
+target-version = ['py310', 'py311', 'py312']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -143,12 +146,11 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["quadsv"]
+source = ["src/quadsv"]
 branch = true
 omit = [
     "*/tests/*",
     "*/__init__.py",
-    "*/setup.py",
 ]
 
 [tool.coverage.report]
@@ -164,6 +166,15 @@ exclude_lines = [
 precision = 2
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["quadsv*"]
-exclude = ["tests*", "data*", "figures*"]
+where = ["src"]
+
+# Derive the package version from git tags. On a clean release commit
+# tagged ``vX.Y.Z`` the version is ``X.Y.Z``; between tags it is
+# ``X.Y.(Z+1).devN+g<sha>[.dYYYYMMDD]`` per PEP 440. On install / build
+# the resolved version is written to ``src/quadsv/_version.py`` so the
+# runtime ``__version__`` lookup works without git (sdist, wheel, shallow
+# clones). ``fallback_version`` is used only when both git AND the
+# generated file are missing — keep it in sync with the last release.
+[tool.setuptools_scm]
+version_file = "src/quadsv/_version.py"
+fallback_version = "0.1.1"

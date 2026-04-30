@@ -1,110 +1,158 @@
 # Configuration file for the Sphinx documentation builder.
-# For full options, see the Sphinx documentation at https://www.sphinx-doc.org/en/master/config
-
-import os
-import sys
+from datetime import datetime
+from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
 
-# Add quadsv source directory to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-# Read version from pyproject.toml
 try:
-    import tomllib  # Python 3.11+
-except ImportError:
-    import tomli as tomllib  # Fallback for Python 3.10
+    # Python 3.11+
+    import tomllib  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    import tomli as tomllib  # type: ignore[no-redef]
 
-project_root = Path(__file__).parent.parent
-pyproject_path = project_root / 'pyproject.toml'
+# -- Project information -----------------------------------------------------
 
-if pyproject_path.exists():
-    with open(pyproject_path, 'rb') as f:
-        pyproject_data = tomllib.load(f)
-    version_str = pyproject_data['project']['version']
-else:
-    version_str = '0.1.0'  # Fallback version
 
-# Project information
-project = 'quadsv'
-copyright = '2026, Jiayu Su'
-author = 'Jiayu Su'
-version = version_str
-release = version_str
+def _load_project_info() -> tuple[str, str, str]:
+    """Load (name, author, version) from installed metadata or pyproject.toml."""
+    try:
+        info = metadata("quadsv")
+        return info["Name"], info["Author"], info["Version"]
+    except PackageNotFoundError:
+        pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        with pyproject_path.open("rb") as f:
+            pyproject = tomllib.load(f)
+        project_cfg = pyproject.get("project", {})
+        name = project_cfg.get("name", "quadsv")
+        version = project_cfg.get("version", "0.0.0")
+        authors = project_cfg.get("authors", [])
+        author = authors[0].get("name", "") if authors and isinstance(authors[0], dict) else ""
+        return name, author, version
 
-# General configuration
+
+project_name, author, version = _load_project_info()
+project = project_name
+copyright = f"{datetime.now():%Y}, {author}"
+release = version
+
+# -- General configuration ---------------------------------------------------
+
 extensions = [
-    'sphinx.ext.autodoc',        # Auto-generate API docs from docstrings
-    'sphinx.ext.napoleon',        # NumPy-style docstring parsing
-    'sphinx.ext.mathjax',         # Math equation rendering
-    'sphinx.ext.viewcode',        # Link to source code
-    'sphinx.ext.intersphinx',     # Cross-reference other projects
-    'myst_parser',                # Markdown support (.md files)
+    "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.intersphinx",
+    "sphinx.ext.autosectionlabel",
+    "sphinx.ext.mathjax",
+    "sphinx.ext.viewcode",
+    "autoapi.extension",
+    "sphinx.ext.napoleon",
+    "myst_parser",
+    "sphinx_design",  # provides ``.. dropdown::`` directives
 ]
 
-# Source file patterns
-source_suffix = {
-    '.rst': 'restructuredtext',
-    '.md': 'markdown',
-}
+# MyST configuration
+myst_enable_extensions = [
+    "dollarmath",
+    "colon_fence",
+]
 
-# HTML theme
-html_theme = 'pydata_sphinx_theme'
-html_theme_options = {
-    "navbar_align": "left",
-    "logo": {
-        "text": "quadsv",
-    },
-    "search_bar_text": "Search documentation...",
-    "show_toc_level": 2,
-    "navigation_depth": 3,
-    "show_nav_level": 2,
-    "secondary_sidebar_items": ["page-toc", "edit-this-page"],
-}
+# AutoAPI configuration
+autoapi_dirs = ["../src/quadsv"]
+autoapi_add_toctree_entry = False
+autoapi_python_class_content = "class"
+autoapi_ignore = ["**/.ipynb_checkpoints/*", "**/*-checkpoint.py"]
+autoapi_options = [
+    "members",
+    "undoc-members",
+    "show-inheritance",
+    "show-module-summary",
+]
+autoapi_member_order = "groupwise"
 
-# Sidebar options
-html_sidebars = {
-    "**": ["search-field", "sidebar-nav-bs", "page-toc"]
-}
-
-# HTML output options
-html_output_path = '_build/html'
-html_static_path = ['_static']
-
-# Napoleon (Google/NumPy docstring) options
+# Napoleon configuration
+napoleon_numpy_docstring = True
 napoleon_use_param = True
 napoleon_use_rtype = True
 napoleon_include_init_with_doc = True
 napoleon_include_private_with_doc = False
-napoleon_include_special_with_doc = True
+napoleon_include_special_with_doc = False
+# Render "Attributes" sections as :ivar: fields rather than separate
+# .. attribute:: directives. This avoids duplicate object description warnings
+# from autoapi which already emits its own .. py:attribute:: entries.
+napoleon_use_ivar = True
 
 # Autodoc options
 autodoc_default_options = {
-    'members': True,
-    'member-order': 'bysource',
-    'special-members': '__init__',
-    'undoc-members': False,
-    'show-inheritance': True,
+    "members": True,
+    "member-order": "bysource",
+    "special-members": "__init__",
+    "undoc-members": False,
+    "show-inheritance": True,
+}
+# Treat single-backtick interpreted text as literal to avoid accidental
+# ambiguous cross-references from docstring tokens like `n` or `n_factors`.
+default_role = "literal"
+autodoc_typehints = "description"
+autodoc_typehints_format = "short"
+python_use_unqualified_type_names = True
+
+# Autosectionlabel configuration
+autosectionlabel_prefix_document = True
+
+# Source file patterns
+source_suffix = {
+    ".rst": "restructuredtext",
+    ".md": "markdown",
 }
 
-# Intersphinx mapping (for cross-references)
+templates_path = ["_templates"]
+exclude_patterns = ["_build", "_templates", "Thumbs.db", ".DS_Store"]
+
+# -- Intersphinx mapping -----------------------------------------------------
+
 intersphinx_mapping = {
-    'python': ('https://docs.python.org/3', None),
-    'numpy': ('https://numpy.org/doc/stable/', None),
-    'scipy': ('https://docs.scipy.org/doc/scipy/', None),
-    'pandas': ('https://pandas.pydata.org/docs/', None),
+    "numpy": ("https://numpy.org/doc/stable/", None),
+    "scipy": ("https://docs.scipy.org/doc/scipy/", None),
+    "pandas": ("https://pandas.pydata.org/docs/", None),
+    "sphinx": ("https://www.sphinx-doc.org/en/master/", None),
+    "anndata": ("https://anndata.readthedocs.io/en/stable/", None),
+    "spatialdata": ("https://spatialdata.scverse.org/en/latest/", None),
+    "scanpy": ("https://scanpy.readthedocs.io/en/stable/", None),
 }
+intersphinx_disabled_domains = ["std"]
 
 # LaTeX options for math rendering (MathJax 4)
 mathjax4_config = {
-    'tex': {
-        'inlinemath': [['$', '$'], ['\\(', '\\)']],
-        'displaymath': [['$$', '$$'], ['\\[', '\\]']],
+    "tex": {
+        "inlinemath": [["$", "$"], ["\\(", "\\)"]],
+        "displaymath": [["$$", "$$"], ["\\[", "\\]"]],
     }
 }
 
-# Try to generate plots with matplotlib
-plot_gallery = False
-plot_html_show_source_link = False
+# -- Options for HTML output --------------------------------------------------
 
-# Suppress certain warnings
-suppress_warnings = ['ref.citation']
+html_theme = "sphinx_book_theme"
+html_theme_options = {
+    "logo": {
+        "text": "quadsv",
+    },
+    "search_bar_text": "Search...",
+    "show_toc_level": 4,
+    "navigation_depth": 4,
+    "repository_url": "https://github.com/JiayuSuPKU/EquivSVT",
+    "use_repository_button": True,
+}
+
+# Custom static assets: only register the directory if it actually exists,
+# so a fresh CI checkout (where ``docs/_static/`` is gitignored) doesn't
+# emit a ``html_static_path entry '_static' does not exist`` warning that
+# the ``-W`` flag turns into a fatal error.
+import os as _os
+
+if _os.path.isdir(_os.path.join(_os.path.dirname(__file__), "_static")):
+    html_static_path = ["_static"]
+else:
+    html_static_path = []
+
+# -- Suppress certain warnings ------------------------------------------------
+
+suppress_warnings = ["ref.citation", "autosectionlabel.*", "duplicate_object"]

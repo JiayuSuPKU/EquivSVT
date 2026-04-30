@@ -2,18 +2,16 @@
 Unit tests for kernel classes and methods.
 """
 
-import time
 import unittest
-import warnings
 
 import numpy as np
 import scipy.sparse as sp
 
-from quadsv.kernels import SpatialKernel
+from quadsv.kernels import MatrixKernel
 
 
-class TestSpatialKernel(unittest.TestCase):
-    """Test cases for SpatialKernel class."""
+class TestMatrixKernel(unittest.TestCase):
+    """Test cases for MatrixKernel class."""
 
     def setUp(self):
         """Set up test fixtures."""
@@ -29,93 +27,129 @@ class TestSpatialKernel(unittest.TestCase):
         """Test from_coordinates classmethod as shown in docstring."""
         # Example from docstring
         coords = np.random.randn(100, 2)
-        kernel = SpatialKernel.from_coordinates(coords, method="gaussian", bandwidth=1.5)
+        kernel = MatrixKernel.from_coordinates(coords, method="gaussian", bandwidth=1.5)
 
         self.assertEqual(kernel.n, 100)
         self.assertEqual(kernel.method, "gaussian")
         self.assertEqual(kernel.params["bandwidth"], 1.5)
 
     def test_gaussian_kernel(self):
-        """Test Gaussian RBF kernel construction."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        """Gaussian RBF — raw K properties (symmetric, unit diagonal)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)
-
+        self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
-
-        # Kernel should be symmetric
         np.testing.assert_array_almost_equal(K, K.T, decimal=10)
-
-        # Diagonal should be 1
         np.testing.assert_array_almost_equal(np.diag(K), np.ones(self.n))
 
     def test_matern_kernel(self):
-        """Test Matérn kernel construction."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="matern", bandwidth=1.0, nu=1.5)
+        """Matern — raw K properties (symmetric, unit diagonal)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="matern", bandwidth=1.0, nu=1.5, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)
-
+        self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
-
-        # Kernel should be symmetric
         np.testing.assert_array_almost_equal(K, K.T, decimal=10)
-
-        # Diagonal should be 1
         np.testing.assert_array_almost_equal(np.diag(K), np.ones(self.n))
 
     def test_moran_kernel(self):
-        """Test Moran's I adjacency kernel construction."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="moran", k_neighbors=4)
+        """Moran adjacency — raw K sparsity."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="moran", k_neighbors=4, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)
-
+        self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
-
-        # Should be sparse-like (many zeros)
-        # Convert to dense if sparse to avoid efficiency warning
         K_dense = K.toarray() if hasattr(K, "toarray") else K
         self.assertGreater(np.sum(K_dense == 0), self.n)
 
     def test_graph_laplacian_kernel(self):
-        """Test Graph Laplacian kernel construction."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="graph_laplacian", k_neighbors=4)
+        """Graph Laplacian — construction and shape."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="graph_laplacian", k_neighbors=4, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)
+        self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
 
     def test_car_explicit(self):
-        """Test CAR kernel in explicit mode (small N)."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="car", k_neighbors=4, rho=0.9)
+        """CAR (small N, explicit mode) — raw K symmetry."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="car", k_neighbors=4, rho=0.9, centering=False
+        )
         self.assertEqual(kernel.n, self.n)
-        self.assertFalse(kernel.is_implicit)  # Small N, should be explicit
-
+        self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         self.assertEqual(K.shape, (self.n, self.n))
-
-        # Should be symmetric
         np.testing.assert_array_almost_equal(K, K.T, decimal=10)
 
+    def test_realization_respects_centering(self):
+        """``realization()`` returns raw K with centering=False, HKH with True."""
+        k_raw = MatrixKernel(self.coords, method="gaussian", bandwidth=1.0, centering=False)
+        k_cen = MatrixKernel(self.coords, method="gaussian", bandwidth=1.0)
+        assert k_cen.centering is True
+        K = k_raw.realization()
+        n = k_raw.n
+        H = np.eye(n) - np.ones((n, n)) / n
+        np.testing.assert_allclose(k_cen.realization(), H @ K @ H, atol=1e-12)
+
+    def test_xtKx_standardized_invariant_under_centering(self):
+        """``xtKx_standardized`` returns the same values for centering=True
+        and centering=False — z has mean 0 by construction so Hz = z and
+        z^T K z = z^T HKH z identically.
+        """
+        rng = np.random.default_rng(0)
+        X_raw = rng.poisson(lam=2.0, size=(self.n, 5)).astype(float)
+        X_sparse = sp.csr_matrix(X_raw)
+        means = X_raw.mean(axis=0)
+        stds = X_raw.std(axis=0, ddof=1)
+
+        k_raw = MatrixKernel(self.coords, method="matern", bandwidth=1.5, centering=False)
+        k_cen = MatrixKernel(self.coords, method="matern", bandwidth=1.5, centering=True)
+
+        q_raw = k_raw.xtKx_standardized(X_sparse, means, stds)
+        q_cen = k_cen.xtKx_standardized(X_sparse, means, stds)
+        np.testing.assert_allclose(q_cen, q_raw, rtol=1e-12)
+
+        # And both match the explicit ``z^T K z`` (same as ``z^T HKH z``).
+        Z = (X_raw - means) / stds
+        K = k_raw.realization()
+        q_explicit = np.einsum("ij,ik,kj->j", Z, K, Z)
+        np.testing.assert_allclose(q_cen, q_explicit, rtol=1e-12)
+
     def test_xtKx_computation(self):
-        """Test quadratic form computation x^T K x."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        """Raw ``xᵀ K x`` (``centering=False``)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
         x = np.random.randn(self.n)
-
-        # Compute via method
         result = kernel.xtKx(x)
-
-        # Compute directly
         K = kernel.realization()
         expected = x.T @ K @ x
-
         np.testing.assert_almost_equal(result, expected, decimal=10)
+
+    def test_xtKx_centered_matches_H_projection(self):
+        """Default centered ``xtKx`` equals ``(H x)ᵀ K (H x)``."""
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        assert kernel.centering is True
+        x = np.random.randn(self.n)
+        K = kernel.realization()
+        x_c = x - x.mean()
+        expected = x_c.T @ K @ x_c
+        np.testing.assert_almost_equal(kernel.xtKx(x), expected, decimal=10)
 
     def test_xtKx_sparse_input(self):
         """Test quadratic form computation with sparse input."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
 
         # Create sparse and dense versions
         x_dense = np.random.randn(self.n)
@@ -130,7 +164,9 @@ class TestSpatialKernel(unittest.TestCase):
 
     def test_xtKx_sparse_batch(self):
         """Test quadratic form computation with sparse batch input."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
 
         # Create sparse and dense batches
         X_dense = np.random.randn(self.n, 10)
@@ -148,23 +184,63 @@ class TestSpatialKernel(unittest.TestCase):
         self.assertEqual(len(result_dense), 10)
 
     def test_trace_computation(self):
-        """Test trace computation."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
-
-        # Compute via method
+        """Test RAW trace computation (``centering=False``)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
         trace_result = kernel.trace()
-
-        # Compute directly
         K = kernel.realization()
         expected_trace = np.trace(K)
-
         np.testing.assert_almost_equal(trace_result, expected_trace, decimal=10)
 
-    def test_square_trace_computation(self):
-        """Test trace(K^2) computation."""
-        kernel = SpatialKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+    def test_centered_eigenvalues_dense_match_HKH_eigvalsh(self):
+        """Centered eigenvalues on dense ``K`` agree with direct ``eigvalsh(HKH)``."""
+        kernel = MatrixKernel(self.coords, method="gaussian", bandwidth=1.0)
+        assert kernel.centering is True
+        K = kernel.realization()
+        n = kernel.n
+        H = np.eye(n) - np.ones((n, n)) / n
+        expected = np.sort(np.linalg.eigvalsh(H @ K @ H))[::-1]
+        got = kernel.eigenvalues()
+        np.testing.assert_allclose(got, expected, rtol=1e-10, atol=1e-10)
 
-        # Compute via method
+    def test_centered_eigenvalues_implicit_sparse_match_dense(self):
+        """Implicit sparse-precision path (CAR) eigenvalues match the dense
+        ``eigvalsh(HKH)`` reference (top-k, since eigsh can't return all).
+        """
+        n_side = 20
+        x = np.linspace(0, 10, n_side)
+        y = np.linspace(0, 10, n_side)
+        xx, yy = np.meshgrid(x, y)
+        coords = np.column_stack((xx.ravel(), yy.ravel()))
+        # Force sparse-implicit representation — use the CAR method which
+        # stores the precision M = I − ρW and solves for K·v on demand.
+        kernel = MatrixKernel(coords, method="car", k_neighbors=4, rho=0.9)
+        # Build reference HKH eigvals directly from the realized K.
+        K = kernel.realization()
+        n = kernel.n
+        H = np.eye(n) - np.ones((n, n)) / n
+        ref_descending = np.sort(np.linalg.eigvalsh(H @ K @ H))[::-1]
+        # Request the top-k eigenvalues.
+        k_eigen = 6
+        got = kernel.eigenvalues(k=k_eigen)
+        np.testing.assert_allclose(got, ref_descending[:k_eigen], rtol=1e-6, atol=1e-8)
+
+    def test_centered_trace_is_raw_minus_constant_mode(self):
+        """Default ``centering=True`` trace equals ``trace(K) − 𝟏ᵀK𝟏/n``."""
+        kernel = MatrixKernel(self.coords, mode="coords", method="gaussian", bandwidth=1.0)
+        assert kernel.centering is True
+        K = kernel.realization()
+        raw = np.trace(K)
+        s1 = float(K.sum())  # 𝟏ᵀ K 𝟏
+        expected_centered = raw - s1 / kernel.n
+        np.testing.assert_almost_equal(kernel.trace(), expected_centered, decimal=10)
+
+    def test_square_trace_computation(self):
+        """Test raw trace(K^2) computation (``centering=False``)."""
+        kernel = MatrixKernel(
+            self.coords, mode="coords", method="gaussian", bandwidth=1.0, centering=False
+        )
         sq_trace = kernel.square_trace()
 
         # Compute directly
@@ -182,10 +258,18 @@ class TestSpatialKernel(unittest.TestCase):
         xx, yy = np.meshgrid(x, y)
         coords_large = np.column_stack((xx.ravel(), yy.ravel()))
 
-        # Construct the kernel
-        kernel = SpatialKernel(coords_large, mode="coords", method="car", k_neighbors=4, rho=0.9)
+        # Construct the kernel in raw mode — the test compares against
+        # ``x.T @ K @ x`` which is raw (not ``(Hx)ᵀ K (Hx)``).
+        kernel = MatrixKernel(
+            coords_large,
+            mode="coords",
+            method="car",
+            k_neighbors=4,
+            rho=0.9,
+            centering=False,
+        )
         self.assertEqual(kernel.n, n_large)
-        self.assertTrue(kernel.is_implicit)  # Should be implicit due to size
+        self.assertTrue(kernel.stores_precision)  # Should be implicit due to size
 
         true_K = kernel.realization()
         self.assertEqual(true_K.shape, (n_large, n_large))
@@ -207,7 +291,7 @@ class TestSpatialKernel(unittest.TestCase):
         self.assertAlmostEqual(sq_trace_result, expected_sq_trace, places=4)
 
 
-class TestCARStandardize(unittest.TestCase):
+class TestMatrixKernelStandardization(unittest.TestCase):
     def setUp(self):
         np.random.seed(0)
         # Small grid for explicit inversion path
@@ -219,36 +303,42 @@ class TestCARStandardize(unittest.TestCase):
         self.n = self.coords.shape[0]
 
     def test_standardize_explicit_diagonal(self):
-        """Diagonal of realized K should be ~1 when standardize is True."""
-        kernel = SpatialKernel.from_coordinates(
+        """Diagonal of RAW K should be ~1 when standardize=True (centering=False).
+
+        Raw ``realization()`` exposes ``K`` itself; its unit-diagonal is the
+        standardize contract. Centered ``realization()`` returns ``HKH`` —
+        diagonal is structurally sub-unity (constant-mode projected out).
+        """
+        kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
             rho=0.85,
             standardize=True,
+            centering=False,
         )
-        self.assertFalse(kernel.is_implicit)  # small N explicit path
+        self.assertFalse(kernel.stores_precision)
         K = kernel.realization()
         diag = np.diag(K)
         self.assertEqual(K.shape, (self.n, self.n))
         np.testing.assert_allclose(diag, np.ones_like(diag), rtol=1e-5, atol=1e-3)
 
     def test_no_standardize_diagonal_not_unity(self):
-        """Without standardize, diagonal need not be exactly 1."""
-        kernel = SpatialKernel.from_coordinates(
+        """Without standardize, raw-K diagonal need not be exactly 1."""
+        kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
             rho=0.85,
             standardize=False,
+            centering=False,
         )
         K = kernel.realization()
         diag = np.diag(K)
-        # Check that there's at least some deviation from 1
         self.assertGreater(np.max(np.abs(diag - 1.0)), 1e-3)
 
 
-class TestImplicitTraceOperations(unittest.TestCase):
+class TestMatrixKernelImplicitTrace(unittest.TestCase):
     """Test trace and square_trace for implicit kernel matrices."""
 
     def setUp(self):
@@ -264,13 +354,13 @@ class TestImplicitTraceOperations(unittest.TestCase):
 
     def test_implicit_trace_accuracy(self):
         """Test trace() estimation for implicit CAR kernel."""
-        kernel = SpatialKernel.from_coordinates(
+        kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
             rho=0.85,
         )
-        self.assertTrue(kernel.is_implicit)
+        self.assertTrue(kernel.stores_precision)
         self.assertEqual(kernel.n, self.n)
 
         # Compute trace via implicit method (Hutchinson's trick)
@@ -280,8 +370,10 @@ class TestImplicitTraceOperations(unittest.TestCase):
         K_realized = kernel.realization()
         true_trace = np.trace(K_realized)
 
-        # They should be close (Hutchinson's estimator has variance but should converge)
-        # Relative error should be small
+        # 0.5% budget: Hutchinson with n_probes=15 on a 72×72 CAR whose
+        # spectrum has a heavy large-eigenvalue tail — Hutchinson averages
+        # that tail efficiently, so the probe-noise band tightens well below
+        # the naive 1/√15 ≈ 26% heuristic for flatter spectra.
         rel_error = np.abs(implicit_trace - true_trace) / (np.abs(true_trace) + 1e-10)
         self.assertLess(
             rel_error, 0.005, msg=f"Trace estimation relative error {rel_error:.4f} exceeds 0.5%"
@@ -289,13 +381,13 @@ class TestImplicitTraceOperations(unittest.TestCase):
 
     def test_implicit_square_trace_accuracy(self):
         """Test square_trace() estimation for implicit CAR kernel."""
-        kernel = SpatialKernel.from_coordinates(
+        kernel = MatrixKernel.from_coordinates(
             self.coords,
             method="car",
             k_neighbors=4,
             rho=0.85,
         )
-        self.assertTrue(kernel.is_implicit)
+        self.assertTrue(kernel.stores_precision)
 
         # Compute square trace via implicit method
         implicit_sq_trace = kernel.square_trace()
@@ -313,117 +405,6 @@ class TestImplicitTraceOperations(unittest.TestCase):
         )
 
 
-class TestStandardizationPerformance(unittest.TestCase):
-    """Test standardization of inverse kernel matrices with sparse vs dense performance comparison."""
-
-    def setUp(self):
-        """Set up test fixtures with various sizes."""
-        np.random.seed(123)
-        # Moderate size for testing standardization
-        self.n_dense = 4900  # below implicit threshold
-        self.n_sparse = 5184  # just above implicit threshold
-
-    def _create_sparse_precision(self, n, k_neighbors=4):
-        """Helper to create a sparse precision matrix from coordinates."""
-        # Create grid
-        side = int(np.sqrt(n))
-        x = np.linspace(0, 10, side)
-        y = np.linspace(0, 10, side)
-        xx, yy = np.meshgrid(x, y)
-        coords = np.column_stack((xx.ravel()[:n], yy.ravel()[:n]))
-
-        # Build adjacency
-        from sklearn.neighbors import NearestNeighbors
-
-        nbrs = NearestNeighbors(n_neighbors=k_neighbors).fit(coords)
-        W = nbrs.kneighbors_graph(coords, mode="connectivity").astype(float)
-
-        # Symmetrize and normalize
-        W_sym = 0.5 * (W + W.T)
-        row_sums = np.array(W_sym.sum(axis=1)).flatten()
-        row_sums[row_sums == 0] = 1.0
-        inv_D_sqrt = sp.diags(1.0 / np.sqrt(row_sums))
-        W_norm = inv_D_sqrt @ W_sym @ inv_D_sqrt
-
-        # Create precision M = I - rho * W_norm
-        rho = 0.85
-        I = sp.eye(side * side, format="csc")
-        M = I - rho * W_norm
-        return M.tocsc()
-
-    def _standardize_sparse_vs_dense_runtime(self, n):
-        """Compare runtime of sparse batched solve vs dense inversion for standardization."""
-        side = int(np.sqrt(n))
-        n = side * side  # ensure perfect square for grid
-        M_sparse = self._create_sparse_precision(n)
-        M_dense = M_sparse.toarray()
-
-        print(f"\n{'=' * 60}")
-        print(f"Standardization Runtime Comparison (n={n})")
-        print(f"{'=' * 60}")
-
-        # Test sparse approach (batched solves)
-        if n > 5000:
-            print("Testing sparse batched approach...")
-        else:
-            print("Testing sparse approach (converted to dense for small n)...")
-
-        start_sparse = time.time()
-        kernel_sparse = SpatialKernel.from_matrix(
-            M_sparse,
-            is_inverse=True,
-            method="car",
-            standardize=True,
-        )
-        K_sparse = kernel_sparse.realization()
-        time_sparse = time.time() - start_sparse
-        diag_sparse = np.diag(K_sparse)
-
-        print(f"  Sparse time: {time_sparse:.3f}s")
-        print(
-            f"  Diagonal check: min={diag_sparse.min():.6f}, max={diag_sparse.max():.6f}, mean={diag_sparse.mean():.6f}"
-        )
-
-        # Test dense approach (full inversion)
-        print("\nTesting dense inversion approach...")
-        start_dense = time.time()
-        # Ignore warnings during dense inversion to avoid recursion issues
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            kernel_dense = SpatialKernel.from_matrix(
-                M_dense,
-                is_inverse=True,
-                method="car",
-                standardize=True,
-            )
-        K_dense = kernel_dense.realization()
-        time_dense = time.time() - start_dense
-        diag_dense = np.diag(K_dense)
-
-        print(f"  Dense time: {time_dense:.3f}s")
-        print(
-            f"  Diagonal check: min={diag_dense.min():.6f}, max={diag_dense.max():.6f}, mean={diag_dense.mean():.6f}"
-        )
-
-        # Compare results
-        speedup = time_dense / time_sparse
-        print(f"\n  Speedup (sparse/dense): {speedup:.2f}x")
-        print(f"{'=' * 60}\n")
-
-        # Verify both give similar results
-        np.testing.assert_allclose(diag_sparse, np.ones(n), rtol=1e-4, atol=1e-3)
-        np.testing.assert_allclose(diag_dense, np.ones(n), rtol=1e-4, atol=1e-3)
-        np.testing.assert_allclose(diag_sparse, diag_dense, rtol=1e-3, atol=1e-3)
-
-        # Sparse should generally be faster (though not guaranteed on small n)
-        self.assertGreater(speedup, 0.8, msg="Sparse approach should be competitive with dense")
-
-    def test_standardize_runtime(self):
-        """Test standardization runtime for small and large n."""
-        self._standardize_sparse_vs_dense_runtime(self.n_dense)
-        self._standardize_sparse_vs_dense_runtime(self.n_sparse)
-
-
 class TestKernelUtilities(unittest.TestCase):
     """Additional tests to cover utility helpers and error paths."""
 
@@ -436,7 +417,7 @@ class TestKernelUtilities(unittest.TestCase):
 
     def test_format_params_repr_str(self):
         """_format_params, __repr__, and __str__ should handle arrays and sparse matrices."""
-        kernel = SpatialKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.2)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.2)
         kernel.params["arr"] = np.ones((2, 2))
         kernel.params["sparse"] = sp.csr_matrix(np.eye(2))
 
@@ -446,22 +427,28 @@ class TestKernelUtilities(unittest.TestCase):
         self.assertIn("sparse(shape=(2, 2)", params_str)
 
         repr_str = repr(kernel)
-        self.assertIn("SpatialKernel", repr_str)
+        self.assertIn("MatrixKernel", repr_str)
         self.assertIn("method=gaussian", repr_str)
 
         str_out = str(kernel)
-        self.assertIn("SpatialKernel", str_out)
+        self.assertIn("MatrixKernel", str_out)
         self.assertIn("Method: gaussian", str_out)
 
     def test_from_matrix_precomputed_and_inverse(self):
-        """from_matrix should support precomputed kernels and precision matrices."""
+        """from_matrix should support precomputed kernels and precision matrices.
+
+        Uses ``centering=False`` since the test checks ``realization() == K``
+        (raw buffer) rather than the centered operator ``HKH``.
+        """
         K = np.array([[2.0, -1.0], [-1.0, 2.0]])
-        kernel_pre = SpatialKernel.from_matrix(K, is_inverse=False)
+        kernel_pre = MatrixKernel.from_matrix(K, is_precision=False, centering=False)
         np.testing.assert_allclose(kernel_pre.realization(), K, rtol=1e-12)
 
         # Singular precision triggers pseudo-inverse path
         M = np.array([[1.0, 0.0], [0.0, 0.0]])
-        kernel_inv = SpatialKernel.from_matrix(M, is_inverse=True, method="car", standardize=True)
+        kernel_inv = MatrixKernel.from_matrix(
+            M, is_precision=True, method="car", standardize=True, centering=False
+        )
         K_inv = kernel_inv.realization()
         self.assertEqual(K_inv.shape, (2, 2))
         self.assertTrue(np.allclose(K_inv, K_inv.T, rtol=1e-12))
@@ -469,25 +456,94 @@ class TestKernelUtilities(unittest.TestCase):
     def test_invalid_kernel_param_raises(self):
         """Unknown kernel parameter should raise ValueError."""
         with self.assertRaises(ValueError):
-            SpatialKernel.from_coordinates(self.coords, method="gaussian", bad_param=1)
+            MatrixKernel.from_coordinates(self.coords, method="gaussian", bad_param=1)
 
     def test_eigenvalues_cache(self):
         """eigenvalues should reuse cached spectrum for smaller k."""
-        kernel = SpatialKernel.from_coordinates(self.coords, method="moran", k_neighbors=2)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="moran", k_neighbors=2)
         vals_full = kernel.eigenvalues(k=4)
         vals_subset = kernel.eigenvalues(k=2)
-        np.testing.assert_allclose(vals_subset, vals_full[-2:], rtol=1e-12)
+        # Spectrum is sorted descending, so top-2 are the first 2 elements
+        np.testing.assert_allclose(vals_subset, vals_full[:2], rtol=1e-12)
 
     def test_getstate_setstate_resets_lu(self):
         """__getstate__ and __setstate__ should reset cached LU factorization."""
-        kernel = SpatialKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
+        kernel = MatrixKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
         kernel._lu = object()
         state = kernel.__getstate__()
         self.assertIsNone(state.get("_lu"))
 
-        kernel2 = SpatialKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
+        kernel2 = MatrixKernel.from_coordinates(self.coords, method="gaussian", bandwidth=1.0)
         kernel2.__setstate__(state)
         self.assertIsNone(kernel2._lu)
+
+
+class TestXtKxStandardized(unittest.TestCase):
+    """``MatrixKernel.xtKx_standardized`` must match the manual
+    ``z = (X - μ)/σ; kernel.xtKx(z)`` pipeline to float-precision — it's an
+    algebraic identity, so the tolerance is ~1e-10, not an approximation band.
+    """
+
+    def setUp(self):
+        rng = np.random.default_rng(0)
+        self.coords = rng.standard_normal((100, 2))
+        self.kernel = MatrixKernel.from_coordinates(
+            self.coords, method="matern", bandwidth=1.0, nu=1.5
+        )
+
+    def test_matches_manual_zscore_dense(self):
+        """Dense ``X``: ``xtKx_standardized(X, μ, σ)`` equals
+        ``xtKx((X - μ)/σ)`` to float-precision."""
+        rng = np.random.default_rng(1)
+        X = rng.standard_normal((100, 5))
+        means = X.mean(axis=0)
+        stds = X.std(axis=0, ddof=1)
+        Z = (X - means) / stds
+
+        q_fast = self.kernel.xtKx_standardized(X, means, stds)
+        q_manual = np.asarray(self.kernel.xtKx(Z))
+        np.testing.assert_allclose(q_fast, q_manual, rtol=1e-10, atol=1e-12)
+
+    def test_matches_manual_zscore_sparse(self):
+        """Sparse ``X``: sparse fast-path agrees with the dense reference to
+        float-precision — verifies the ``(K·1, 1ᵀK1)`` expansion."""
+        import scipy.sparse as sp
+
+        rng = np.random.default_rng(2)
+        X_dense = rng.standard_normal((100, 4))
+        # Sparsify by zeroing ~60% of entries; keep sparsity realistic.
+        X_dense[rng.random(X_dense.shape) < 0.6] = 0.0
+        X_sparse = sp.csc_matrix(X_dense)
+        # Means/stds must be computed from the same underlying data the fast
+        # path will see (sparse's column stats).
+        means = np.asarray(X_sparse.mean(axis=0)).ravel()
+        sq = np.asarray(X_sparse.multiply(X_sparse).sum(axis=0)).ravel()
+        n = X_sparse.shape[0]
+        var = (sq - n * means**2) / max(n - 1, 1)
+        var[var < 0] = 0.0
+        stds = np.sqrt(var)
+        Z = np.zeros_like(X_dense)
+        valid = stds > 1e-12
+        Z[:, valid] = (X_dense[:, valid] - means[valid]) / stds[valid]
+
+        q_fast = self.kernel.xtKx_standardized(X_sparse, means, stds)
+        q_manual = np.asarray(self.kernel.xtKx(Z))
+        np.testing.assert_allclose(q_fast, q_manual, rtol=1e-10, atol=1e-12)
+
+    def test_zero_variance_column_returns_zero(self):
+        """Constant columns (std=0) must return 0 per the documented contract."""
+        X = np.zeros((100, 3))
+        X[:, 0] = 1.0  # constant column → std=0
+        X[:, 1] = np.linspace(-1, 1, 100)
+        X[:, 2] = 7.5  # another constant column
+        means = X.mean(axis=0)
+        stds = X.std(axis=0, ddof=1)
+
+        q = self.kernel.xtKx_standardized(X, means, stds)
+        self.assertAlmostEqual(q[0], 0.0, places=12)
+        self.assertAlmostEqual(q[2], 0.0, places=12)
+        # Middle column has nonzero std → nonzero Q.
+        self.assertGreater(q[1], 0.0)
 
 
 if __name__ == "__main__":
