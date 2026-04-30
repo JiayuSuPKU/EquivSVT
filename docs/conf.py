@@ -142,7 +142,16 @@ html_theme_options = {
     "use_repository_button": True,
 }
 
-html_static_path = ["_static"]
+# Custom static assets: only register the directory if it actually exists,
+# so a fresh CI checkout (where ``docs/_static/`` is gitignored) doesn't
+# emit a ``html_static_path entry '_static' does not exist`` warning that
+# the ``-W`` flag turns into a fatal error.
+import os as _os
+
+if _os.path.isdir(_os.path.join(_os.path.dirname(__file__), "_static")):
+    html_static_path = ["_static"]
+else:
+    html_static_path = []
 
 # -- Suppress certain warnings ------------------------------------------------
 

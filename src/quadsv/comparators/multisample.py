@@ -1170,13 +1170,13 @@ def _pooled_full_within_group_sigma(
         (returned for downstream use; ``Sigma`` is already df-normalised).
     """
     a_mask = g_int == 0
-    log_a = np.log(np.maximum(spectra[a_mask], eps))   # (n_a, G, K)
+    log_a = np.log(np.maximum(spectra[a_mask], eps))  # (n_a, G, K)
     log_b = np.log(np.maximum(spectra[~a_mask], eps))
     n_a = log_a.shape[0]
     n_b = log_b.shape[0]
     res_a = log_a - log_a.mean(axis=0, keepdims=True)
     res_b = log_b - log_b.mean(axis=0, keepdims=True)
-    res = np.concatenate([res_a, res_b], axis=0)        # (n, G, K)
+    res = np.concatenate([res_a, res_b], axis=0)  # (n, G, K)
     n, G, K = res.shape
     df = max(n_a + n_b - 2, 1)
     # Σ = (1/(G·df)) · Σ_g R_gᵀ R_g  reduces to a single matmul on the
@@ -1234,7 +1234,7 @@ def _pooled_full_within_group_sigma_masked(
         log_b = log_spectra[bi, g, :]
         res_a = log_a - log_a.mean(axis=0, keepdims=True)
         res_b = log_b - log_b.mean(axis=0, keepdims=True)
-        res = np.concatenate([res_a, res_b], axis=0)        # (n_g, K)
+        res = np.concatenate([res_a, res_b], axis=0)  # (n_g, K)
         df_g = max(len(ai) + len(bi) - 2, 1)
         Sigma_acc += res.T @ res
         total_df += df_g
@@ -1292,12 +1292,12 @@ def _run_log_l2_wald(
     w = _resolve_freq_weights(freq_weights, K)
 
     observed = _stat_log_l2(group_a, group_b, freq_weights=freq_weights)  # (n_genes,)
-    Sigma_ell, df_resid = _pooled_full_within_group_sigma(spectra, g_int) # (K, K), df
+    Sigma_ell, df_resid = _pooled_full_within_group_sigma(spectra, g_int)  # (K, K), df
     _maybe_warn_small_df_wald(df_resid)
     v_c = (1.0 / max(n_a, 1)) + (1.0 / max(n_b, 1))
     sqW = np.sqrt(w)
-    M = (sqW[:, None] * Sigma_ell * sqW[None, :]) * v_c                   # (K, K)
-    lambs = np.maximum(np.linalg.eigvalsh(M), 0.0)                        # (K,)
+    M = (sqW[:, None] * Sigma_ell * sqW[None, :]) * v_c  # (K, K)
+    lambs = np.maximum(np.linalg.eigvalsh(M), 0.0)  # (K,)
     pvals = _log_l2_wald_pvalues(observed, lambs)
     return observed, pvals
 
@@ -1308,7 +1308,7 @@ def _run_log_l2_wald(
 
 
 def _build_design_matrix(
-    design: "pd.DataFrame | np.ndarray", n_samples: int
+    design: pd.DataFrame | np.ndarray, n_samples: int
 ) -> tuple[np.ndarray, list[str]]:
     """Convert ``design`` to a ``(n_samples, p)`` numeric matrix + column labels.
 
@@ -1324,20 +1324,17 @@ def _build_design_matrix(
         X = np.asarray(design, dtype=float)
         if X.ndim != 2 or X.shape[0] != n_samples:
             raise ValueError(
-                f"design ndarray must be (n_samples, p) = ({n_samples}, p), "
-                f"got {X.shape}."
+                f"design ndarray must be (n_samples, p) = ({n_samples}, p), " f"got {X.shape}."
             )
         return X, [f"x{i}" for i in range(X.shape[1])]
 
     if not isinstance(design, pd.DataFrame):
         raise TypeError(
-            f"design must be a numpy ndarray or pandas DataFrame, "
-            f"got {type(design).__name__}."
+            f"design must be a numpy ndarray or pandas DataFrame, " f"got {type(design).__name__}."
         )
     if len(design) != n_samples:
         raise ValueError(
-            f"design DataFrame length {len(design)} does not match "
-            f"n_samples={n_samples}."
+            f"design DataFrame length {len(design)} does not match " f"n_samples={n_samples}."
         )
     try:
         import patsy
@@ -1353,7 +1350,7 @@ def _build_design_matrix(
 
 
 def _resolve_contrast(
-    contrast: "str | dict[str, float] | np.ndarray", design_columns: Sequence[str]
+    contrast: str | dict[str, float] | np.ndarray, design_columns: Sequence[str]
 ) -> np.ndarray:
     """Map the user-supplied contrast spec to a length-``p`` numeric vector.
 
@@ -1369,9 +1366,7 @@ def _resolve_contrast(
     if isinstance(contrast, np.ndarray):
         c = np.asarray(contrast, dtype=float)
         if c.shape != (p,):
-            raise ValueError(
-                f"contrast ndarray must have length p={p}, got shape {c.shape}."
-            )
+            raise ValueError(f"contrast ndarray must have length p={p}, got shape {c.shape}.")
         return c
     if isinstance(contrast, str):
         if contrast in design_columns:
@@ -1380,8 +1375,7 @@ def _resolve_contrast(
             matches = [col for col in design_columns if col.startswith(contrast + "[T.")]
             if not matches:
                 raise ValueError(
-                    f"Contrast '{contrast}' not found in design columns "
-                    f"{list(design_columns)}."
+                    f"Contrast '{contrast}' not found in design columns " f"{list(design_columns)}."
                 )
             if len(matches) > 1:
                 raise ValueError(
@@ -1398,14 +1392,11 @@ def _resolve_contrast(
         for k, v in contrast.items():
             if k not in design_columns:
                 raise ValueError(
-                    f"Contrast key '{k}' not in design columns "
-                    f"{list(design_columns)}."
+                    f"Contrast key '{k}' not in design columns " f"{list(design_columns)}."
                 )
             c[list(design_columns).index(k)] = float(v)
         return c
-    raise TypeError(
-        f"Contrast must be a str, dict, or ndarray; got {type(contrast).__name__}."
-    )
+    raise TypeError(f"Contrast must be a str, dict, or ndarray; got {type(contrast).__name__}.")
 
 
 def _run_log_l2_glm_wald(
@@ -1438,26 +1429,22 @@ def _run_log_l2_glm_wald(
     n_samples, n_genes, K = spectra.shape
     p = X.shape[1]
     if X.shape[0] != n_samples:
-        raise ValueError(
-            f"design first dim {X.shape[0]} != n_samples {n_samples}."
-        )
+        raise ValueError(f"design first dim {X.shape[0]} != n_samples {n_samples}.")
     if contrast_vec.shape != (p,):
-        raise ValueError(
-            f"contrast length {contrast_vec.shape} != design cols ({p},)."
-        )
+        raise ValueError(f"contrast length {contrast_vec.shape} != design cols ({p},).")
 
-    Y = np.log(np.maximum(spectra, eps))   # (n, G, K)
+    Y = np.log(np.maximum(spectra, eps))  # (n, G, K)
     Y_flat = Y.reshape(n_samples, n_genes * K)
     XtX = X.T @ X
     XtX_inv = np.linalg.pinv(XtX)
-    beta_flat = XtX_inv @ (X.T @ Y_flat)             # (p, G*K)
-    res_flat = Y_flat - X @ beta_flat                # (n, G*K)
+    beta_flat = XtX_inv @ (X.T @ Y_flat)  # (p, G*K)
+    res_flat = Y_flat - X @ beta_flat  # (n, G*K)
     beta = beta_flat.reshape(p, n_genes, K)
     res = res_flat.reshape(n_samples, n_genes, K)
     df_resid = max(n_samples - p, 1)
     _maybe_warn_small_df_wald(df_resid)
 
-    theta = np.tensordot(contrast_vec, beta, axes=([0], [0]))   # (n_genes, K)
+    theta = np.tensordot(contrast_vec, beta, axes=([0], [0]))  # (n_genes, K)
 
     # Pooled-across-genes FULL within-gene covariance Σ_ℓ ∈ R^{K×K}.
     # Mirrors :func:`_pooled_full_within_group_sigma` but uses GLM residuals.
@@ -1466,7 +1453,7 @@ def _run_log_l2_glm_wald(
     v_c = float(contrast_vec @ XtX_inv @ contrast_vec)
 
     w = _resolve_freq_weights(freq_weights, K)
-    T2 = (w * theta**2).sum(axis=-1)                             # (n_genes,)
+    T2 = (w * theta**2).sum(axis=-1)  # (n_genes,)
     T_obs = np.sqrt(T2)
     sqW = np.sqrt(w)
     M = (sqW[:, None] * Sigma_ell * sqW[None, :]) * v_c
@@ -1629,9 +1616,7 @@ def compare_two_groups(  # noqa: C901
         observed, pvals = _run_log_l2_wald(spectra, g_int, freq_weights)
         if gene_names is None:
             gene_names = [str(i) for i in range(n_genes)]
-        df = pd.DataFrame(
-            {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
-        )
+        df = pd.DataFrame({"Feature": list(gene_names), "Statistic": observed, "P_value": pvals})
         _apply_bh_correction(df)
         df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
         if n_jobs != 1:  # noqa: PLR2004
@@ -1810,9 +1795,9 @@ def compare_two_groups_masked(  # noqa: C901
             sub_df = df.loc[tested, ["Feature", "P_value"]].copy()
             _apply_bh_correction(sub_df)
             df.loc[tested, "P_adj"] = sub_df["P_adj"].to_numpy()
-        return df.sort_values(
-            "Statistic", ascending=False, na_position="last"
-        ).reset_index(drop=True)
+        return df.sort_values("Statistic", ascending=False, na_position="last").reset_index(
+            drop=True
+        )
 
     # Permutation / cauchy_welch masked path (per-gene loop).
     rows: list[dict[str, Any]] = []
@@ -1956,8 +1941,8 @@ def compare_two_groups_scalar(
 
 def compare_designs(
     spectra: np.ndarray,
-    design: "pd.DataFrame | np.ndarray",
-    contrast: "str | dict[str, float] | np.ndarray",
+    design: pd.DataFrame | np.ndarray,
+    contrast: str | dict[str, float] | np.ndarray,
     gene_names: Sequence[str] | None = None,
     statistic: str = "log_l2",
     null: str = "wald",
@@ -2024,8 +2009,7 @@ def compare_designs(
         )
     if statistic != "log_l2":
         raise ValueError(
-            f"compare_designs currently only supports statistic='log_l2', "
-            f"got '{statistic}'."
+            f"compare_designs currently only supports statistic='log_l2', " f"got '{statistic}'."
         )
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, K), got {spectra.shape}.")
@@ -2038,9 +2022,7 @@ def compare_designs(
 
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]
-    df = pd.DataFrame(
-        {"Feature": list(gene_names), "Statistic": observed, "P_value": pvals}
-    )
+    df = pd.DataFrame({"Feature": list(gene_names), "Statistic": observed, "P_value": pvals})
     _apply_bh_correction(df)
     df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
     return df

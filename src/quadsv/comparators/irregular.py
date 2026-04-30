@@ -91,7 +91,7 @@ class ComparatorIrregular(_ComparatorBase):
         groups: np.ndarray | None = None,
         gene_names: Sequence[str] | None = None,
         *,
-        design: "Any | None" = None,
+        design: Any | None = None,
         feature_mode: str = "radial",
         n_radial_bins: int = 30,
         obsm_key: str = "spatial",

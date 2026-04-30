@@ -19,10 +19,13 @@ import logging
 import warnings
 from abc import abstractmethod
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from tqdm.auto import tqdm
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 # Suppress known deprecation warnings from SpatialData dependencies BEFORE importing them.
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask DataFrame.*")
@@ -41,8 +44,9 @@ from quadsv.comparators.multisample import (
     shape_normalize,
 )
 from quadsv.statistics import (
-    effective_rank as _effective_rank,
     gene_pattern_diversity as _gene_pattern_diversity,
+)
+from quadsv.statistics import (
     within_group_pattern_diversity as _within_group_pattern_diversity,
 )
 
@@ -69,7 +73,7 @@ class _ComparatorBase:
     """Binary group labels of length ``n_samples`` when constructed with
     ``groups=`` (back-compat path); ``None`` when constructed with
     ``design=``."""
-    design: "Any | None"
+    design: Any | None
     """Original ``design`` argument (DataFrame or ndarray); ``None`` when
     constructed with ``groups=``."""
     gene_names: list[str]
@@ -281,7 +285,7 @@ class _ComparatorBase:
         self,
         statistic: str = "log_l2",
         null: str = "permutation",
-        contrast: "str | dict[str, float] | np.ndarray | None" = None,
+        contrast: str | dict[str, float] | np.ndarray | None = None,
         n_perm: int = 1000,
         random_state: int | None = None,
         freq_weights: np.ndarray | None = None,
@@ -402,7 +406,7 @@ class _ComparatorBase:
         self,
         level: str = "within_group",
         weights: np.ndarray | None = None,
-    ) -> "float | np.ndarray":
+    ) -> float | np.ndarray:
         """Effective rank ``K_eff`` of the spectrum covariance.
 
         Quantifies how concentrated the spatial-frequency content is along
@@ -446,9 +450,7 @@ class _ComparatorBase:
                     "constructor path. Use level='per_sample' for the "
                     "design= constructor path."
                 )
-            return _within_group_pattern_diversity(
-                self.spectra_, self.groups, weights=weights
-            )
+            return _within_group_pattern_diversity(self.spectra_, self.groups, weights=weights)
         if level == "per_sample":
             n_samples = self.spectra_.shape[0]
             return np.array(
@@ -457,9 +459,7 @@ class _ComparatorBase:
                     for i in range(n_samples)
                 ]
             )
-        raise ValueError(
-            f"level must be 'within_group' or 'per_sample', got {level!r}."
-        )
+        raise ValueError(f"level must be 'within_group' or 'per_sample', got {level!r}.")
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +476,7 @@ def _validate_groups(groups: np.ndarray, n_samples: int) -> np.ndarray:
     return groups
 
 
-def _groups_to_design(groups: np.ndarray) -> "Any":
+def _groups_to_design(groups: np.ndarray) -> Any:
     """Wrap a 1-D groups array in a single-column pandas DataFrame.
 
     The resulting DataFrame is consumed by patsy in
@@ -494,10 +494,10 @@ def _groups_to_design(groups: np.ndarray) -> "Any":
 
 
 def _validate_groups_or_design(
-    groups: "np.ndarray | None",
-    design: "pd.DataFrame | np.ndarray | None",
+    groups: np.ndarray | None,
+    design: pd.DataFrame | np.ndarray | None,
     n_samples: int,
-) -> tuple["np.ndarray | None", "Any | None"]:
+) -> tuple[np.ndarray | None, Any | None]:
     """Validate that exactly one of ``groups`` or ``design`` is supplied.
 
     Returns ``(groups_or_None, design_or_None)`` — leaves the original
@@ -506,13 +506,9 @@ def _validate_groups_or_design(
     :func:`quadsv.comparators.multisample._build_design_matrix` when needed.
     """
     if groups is None and design is None:
-        raise ValueError(
-            "Exactly one of `groups` or `design` must be supplied at construction."
-        )
+        raise ValueError("Exactly one of `groups` or `design` must be supplied at construction.")
     if groups is not None and design is not None:
-        raise ValueError(
-            "Pass either `groups` or `design`, not both."
-        )
+        raise ValueError("Pass either `groups` or `design`, not both.")
     if groups is not None:
         return _validate_groups(groups, n_samples), None
     # design is not None
@@ -525,19 +521,15 @@ def _validate_groups_or_design(
         _pd = None
     if _pd is not None and isinstance(design, _pd.DataFrame):
         if len(design) != n_samples:
-            raise ValueError(
-                f"design DataFrame length {len(design)} != n_samples={n_samples}."
-            )
+            raise ValueError(f"design DataFrame length {len(design)} != n_samples={n_samples}.")
     elif isinstance(design, np.ndarray):
         if design.ndim != 2 or design.shape[0] != n_samples:
             raise ValueError(
-                f"design ndarray must be (n_samples, p) = ({n_samples}, p), "
-                f"got {design.shape}."
+                f"design ndarray must be (n_samples, p) = ({n_samples}, p), " f"got {design.shape}."
             )
     else:
         raise TypeError(
-            f"design must be a pandas DataFrame or numpy ndarray, "
-            f"got {type(design).__name__}."
+            f"design must be a pandas DataFrame or numpy ndarray, " f"got {type(design).__name__}."
         )
     return None, design
 

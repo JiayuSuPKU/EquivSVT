@@ -548,18 +548,14 @@ class TestLogL2WaldNull:
         # Sort both by Feature for safe comparison.
         df_w_s = df_w.sort_values("Feature").reset_index(drop=True)
         df_l_s = df_l.sort_values("Feature").reset_index(drop=True)
-        np.testing.assert_array_equal(
-            df_w_s["P_value"].to_numpy(), df_l_s["P_value"].to_numpy()
-        )
+        np.testing.assert_array_equal(df_w_s["P_value"].to_numpy(), df_l_s["P_value"].to_numpy())
 
     def test_wald_is_deterministic(self):
         rng = np.random.default_rng(2)
         spectra = np.exp(rng.standard_normal((6, 100, 20)))
         groups = np.array([0, 0, 0, 1, 1, 1])
         # Two calls with different seeds (Wald is RNG-free).
-        df_a = compare_two_groups(
-            spectra, groups, statistic="log_l2", null="wald", random_state=0
-        )
+        df_a = compare_two_groups(spectra, groups, statistic="log_l2", null="wald", random_state=0)
         df_b = compare_two_groups(
             spectra, groups, statistic="log_l2", null="wald", random_state=999
         )
@@ -573,9 +569,7 @@ class TestLogL2WaldNull:
         spectra = np.exp(rng.standard_normal((6, 50, 20)))
         groups = np.array([0, 0, 0, 1, 1, 1])
         with pytest.raises(ValueError, match="null='wald' is only supported"):
-            compare_two_groups(
-                spectra, groups, statistic="cauchy_welch", null="wald"
-            )
+            compare_two_groups(spectra, groups, statistic="cauchy_welch", null="wald")
 
     def test_unknown_null_raises(self):
         rng = np.random.default_rng(4)
@@ -604,6 +598,7 @@ class TestLogL2WaldNull:
         groups = np.array([0, 0, 0, 1, 1, 1])
         # warnings.simplefilter('error') to fail if any warning leaks.
         import warnings as _w
+
         with _w.catch_warnings():
             _w.simplefilter("error", UserWarning)
             compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
@@ -625,7 +620,7 @@ class TestLogL2WaldNull:
         shared = rng.standard_normal((n_a + n_b, G, 1)) * 1.0
         # Per-bin independent noise (small).
         per_bin = rng.standard_normal((n_a + n_b, G, K)) * 0.2
-        log_y = shared + per_bin                   # H0: same distribution in both groups
+        log_y = shared + per_bin  # H0: same distribution in both groups
         spectra = np.exp(log_y)
         groups = np.array([0] * n_a + [1] * n_b)
         df = compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
@@ -638,9 +633,9 @@ class TestLogL2WaldNull:
         # KS p > 0.001: histogram should look uniform-ish (with some drift
         # because the H0 model isn't perfectly captured by our pooling
         # — this is a real-data-like scenario, not a textbook iid sim).
-        assert ks_p > 1e-3 or fpr05 < 0.07, (
-            f"Full-Σ Wald should be roughly uniform; KS_p={ks_p:.3g} fpr05={fpr05:.3f}"
-        )
+        assert (
+            ks_p > 1e-3 or fpr05 < 0.07
+        ), f"Full-Σ Wald should be roughly uniform; KS_p={ks_p:.3g} fpr05={fpr05:.3f}"
 
     def test_masked_wald_parity_with_unmasked_when_complete(self):
         """When presence is all True, masked Wald should match unmasked Wald."""
@@ -649,12 +644,16 @@ class TestLogL2WaldNull:
         spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
         groups = np.array([0, 0, 0, 1, 1, 1])
         presence = np.ones((n_samples, n_genes), dtype=bool)
-        df_un = compare_two_groups(
-            spectra, groups, statistic="log_l2", null="wald"
-        ).sort_values("Feature").reset_index(drop=True)
-        df_m = compare_two_groups_masked(
-            spectra, groups, presence, statistic="log_l2", null="wald"
-        ).sort_values("Feature").reset_index(drop=True)
+        df_un = (
+            compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
+            .sort_values("Feature")
+            .reset_index(drop=True)
+        )
+        df_m = (
+            compare_two_groups_masked(spectra, groups, presence, statistic="log_l2", null="wald")
+            .sort_values("Feature")
+            .reset_index(drop=True)
+        )
         # Statistics must match modulo float64 round-off.
         np.testing.assert_allclose(
             df_un["Statistic"].to_numpy(), df_m["Statistic"].to_numpy(), atol=1e-12
@@ -675,7 +674,7 @@ class TestLogL2WaldNull:
         rng = np.random.default_rng(0)
         n_samples, n_genes, K = 8, 800, 20
         spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
-        groups = np.array([0]*4 + [1]*4)
+        groups = np.array([0] * 4 + [1] * 4)
 
         # Unmasked baseline
         df_full = compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
@@ -684,7 +683,11 @@ class TestLogL2WaldNull:
         # 25% missingness, masked path
         presence = rng.uniform(size=(n_samples, n_genes)) >= 0.25
         df_m = compare_two_groups_masked(
-            spectra, groups, presence, statistic="log_l2", null="wald",
+            spectra,
+            groups,
+            presence,
+            statistic="log_l2",
+            null="wald",
             min_samples_per_group=2,
         )
         valid = df_m["P_value"].notna()
@@ -694,9 +697,9 @@ class TestLogL2WaldNull:
 
         # Both should be near nominal — and similar to each other
         assert 0.0 < fpr_m < 0.20, f"masked FPR={fpr_m:.3f} far from nominal"
-        assert 0.5 * fpr_full < fpr_m < 2.0 * fpr_full + 0.02, (
-            f"masked vs unmasked FPR mismatch: masked={fpr_m:.3f} unmasked={fpr_full:.3f}"
-        )
+        assert (
+            0.5 * fpr_full < fpr_m < 2.0 * fpr_full + 0.02
+        ), f"masked vs unmasked FPR mismatch: masked={fpr_m:.3f} unmasked={fpr_full:.3f}"
 
     def test_masked_wald_skips_genes_with_insufficient_presence(self):
         """Genes whose present count in either arm < min_samples_per_group
@@ -709,7 +712,11 @@ class TestLogL2WaldNull:
         # Make gene 0: only 1 sample present in group A → should be skipped.
         presence[1:3, 0] = False  # group A has only sample 0 present
         df = compare_two_groups_masked(
-            spectra, groups, presence, statistic="log_l2", null="wald",
+            spectra,
+            groups,
+            presence,
+            statistic="log_l2",
+            null="wald",
             min_samples_per_group=2,
         )
         # Find the row for gene "0"
@@ -732,7 +739,11 @@ class TestLogL2WaldNull:
         presence[0:3, :] = False
         with pytest.raises(ValueError, match="no genes meet"):
             compare_two_groups_masked(
-                spectra, groups, presence, statistic="log_l2", null="wald",
+                spectra,
+                groups,
+                presence,
+                statistic="log_l2",
+                null="wald",
                 min_samples_per_group=2,
             )
 
@@ -744,7 +755,11 @@ class TestLogL2WaldNull:
         presence = np.ones((n_samples, n_genes), dtype=bool)
         with pytest.raises(ValueError, match="null='wald' is only supported"):
             compare_two_groups_masked(
-                spectra, groups, presence, statistic="cauchy_welch", null="wald",
+                spectra,
+                groups,
+                presence,
+                statistic="cauchy_welch",
+                null="wald",
             )
 
 
@@ -764,14 +779,18 @@ class TestCompareDesignsAndGLMWald:
         spectra = np.exp(rng.standard_normal((8, 200, 25)))
         groups = np.array(["WT"] * 4 + ["TG"] * 4)
 
-        df_g = compare_two_groups(
-            spectra, groups, statistic="log_l2", null="wald"
-        ).sort_values("Feature").reset_index(drop=True)
+        df_g = (
+            compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
+            .sort_values("Feature")
+            .reset_index(drop=True)
+        )
 
         design = pd.DataFrame({"genotype": groups})
-        df_d = compare_designs(
-            spectra, design, contrast="genotype", null="wald"
-        ).sort_values("Feature").reset_index(drop=True)
+        df_d = (
+            compare_designs(spectra, design, contrast="genotype", null="wald")
+            .sort_values("Feature")
+            .reset_index(drop=True)
+        )
 
         np.testing.assert_allclose(
             df_g["P_value"].to_numpy(), df_d["P_value"].to_numpy(), atol=1e-10
@@ -807,15 +826,17 @@ class TestCompareDesignsAndGLMWald:
         rng = np.random.default_rng(2)
         spectra = np.exp(rng.standard_normal((8, 30, 20)))
         design = pd.DataFrame({"a": [0, 1, 0, 1, 0, 1, 0, 1], "b": np.arange(8)})
-        df_dict = compare_designs(
-            spectra, design, contrast={"a": 1.0}, null="wald"
-        ).sort_values("Feature").reset_index(drop=True)
-        df_str = compare_designs(
-            spectra, design, contrast="a", null="wald"
-        ).sort_values("Feature").reset_index(drop=True)
-        np.testing.assert_allclose(
-            df_dict["P_value"].to_numpy(), df_str["P_value"].to_numpy()
+        df_dict = (
+            compare_designs(spectra, design, contrast={"a": 1.0}, null="wald")
+            .sort_values("Feature")
+            .reset_index(drop=True)
         )
+        df_str = (
+            compare_designs(spectra, design, contrast="a", null="wald")
+            .sort_values("Feature")
+            .reset_index(drop=True)
+        )
+        np.testing.assert_allclose(df_dict["P_value"].to_numpy(), df_str["P_value"].to_numpy())
 
     def test_ndarray_design_with_intercept_only(self):
         """Numpy design matrix (caller-built) flows through compare_designs."""
@@ -824,9 +845,7 @@ class TestCompareDesignsAndGLMWald:
         spectra = np.exp(rng.standard_normal((n, n_genes, K)))
         # Design = [intercept, group_indicator]
         X = np.column_stack([np.ones(n), [0, 0, 0, 1, 1, 1]])
-        df = compare_designs(
-            spectra, X, contrast=np.array([0.0, 1.0]), null="wald"
-        )
+        df = compare_designs(spectra, X, contrast=np.array([0.0, 1.0]), null="wald")
         assert df.shape[0] == n_genes
         assert df["P_value"].between(0, 1).all()
 
@@ -837,9 +856,7 @@ class TestCompareDesignsAndGLMWald:
         spectra = np.exp(rng.standard_normal((6, 10, 12)))
         design = pd.DataFrame({"g": [0, 0, 0, 1, 1, 1]})
         with pytest.raises(NotImplementedError, match="Permutation null"):
-            compare_designs(
-                spectra, design, contrast="g", null="permutation"
-            )
+            compare_designs(spectra, design, contrast="g", null="permutation")
 
     def test_compare_designs_rejects_non_log_l2(self):
         import pandas as pd
@@ -848,14 +865,10 @@ class TestCompareDesignsAndGLMWald:
         spectra = np.exp(rng.standard_normal((6, 10, 12)))
         design = pd.DataFrame({"g": [0, 0, 0, 1, 1, 1]})
         with pytest.raises(ValueError, match="only supports statistic='log_l2'"):
-            compare_designs(
-                spectra, design, contrast="g", statistic="cauchy_welch", null="wald"
-            )
+            compare_designs(spectra, design, contrast="g", statistic="cauchy_welch", null="wald")
 
     def test_invalid_groups_and_design_both_supplied(self):
         rng = np.random.default_rng(0)
-        coords = rng.uniform(0, 100, size=(50, 2))
-        ad_obj = _grid_to_adata(rng.uniform(size=(3, 8, 8)), gene_names=[f"g{i}" for i in range(3)])
         # Build 4 simple AnnData samples for the constructor.
         samples = []
         for _ in range(4):
@@ -891,12 +904,14 @@ class TestEffectiveRank:
     def test_effective_rank_identity_equals_K(self):
         """K_eff(I_K) = K — uniformly spread eigenvalues."""
         from quadsv import effective_rank
+
         for K in [3, 10, 30]:
             assert abs(effective_rank(np.eye(K)) - K) < 1e-12
 
     def test_effective_rank_rank_one_equals_one(self):
         """K_eff of an outer product vv^T is 1."""
         from quadsv import effective_rank
+
         rng = np.random.default_rng(0)
         v = rng.standard_normal(15)
         cov = np.outer(v, v)
@@ -905,6 +920,7 @@ class TestEffectiveRank:
     def test_effective_rank_bounds(self):
         """1 ≤ K_eff ≤ K for any PSD covariance."""
         from quadsv import effective_rank
+
         rng = np.random.default_rng(1)
         for _ in range(20):
             K = rng.integers(2, 30)
@@ -916,6 +932,7 @@ class TestEffectiveRank:
     def test_effective_rank_with_weights_changes_value(self):
         """Non-uniform weights skew the effective rank."""
         from quadsv import effective_rank
+
         K = 20
         cov = np.eye(K)
         # Uniform weights → still K
@@ -929,6 +946,7 @@ class TestEffectiveRank:
 
     def test_effective_rank_invalid_inputs(self):
         from quadsv import effective_rank
+
         with pytest.raises(ValueError, match="square 2D matrix"):
             effective_rank(np.zeros((5, 4)))
         with pytest.raises(ValueError, match="non-negative"):
@@ -938,6 +956,7 @@ class TestEffectiveRank:
         """Constant spectra + rank-1 perturbation → K_eff close to 1.
         Iid noise across genes → K_eff close to K."""
         from quadsv import gene_pattern_diversity
+
         rng = np.random.default_rng(0)
         K = 10
         # Rank-1 heterogeneity: each gene gets the same shape, scaled by a
@@ -955,6 +974,7 @@ class TestEffectiveRank:
 
     def test_gene_pattern_diversity_random_spectra_near_K(self):
         from quadsv import gene_pattern_diversity
+
         rng = np.random.default_rng(2)
         spectra = np.exp(rng.standard_normal((500, 20)))
         ke = gene_pattern_diversity(spectra)
@@ -965,12 +985,13 @@ class TestEffectiveRank:
     def test_within_group_pattern_diversity_real_data_like(self):
         """Synthetic cohort with rank-1 within-group structure: K_eff ≈ 1."""
         from quadsv import within_group_pattern_diversity
+
         rng = np.random.default_rng(3)
         n_a, n_b, G, K = 4, 4, 800, 20
         # Per-sample shared scalar noise across all bins → near rank-1 Σ
         scalar = rng.standard_normal((n_a + n_b, G, 1))
         spectra = np.exp(scalar)  # All bins identical → singular Σ
-        groups = np.array([0]*n_a + [1]*n_b)
+        groups = np.array([0] * n_a + [1] * n_b)
         ke = within_group_pattern_diversity(spectra, groups)
         assert ke < 2.0, f"expected K_eff close to 1, got {ke:.2f}"
 
@@ -981,18 +1002,27 @@ class TestEffectiveRank:
 
     def test_comparator_effective_rank_within_group(self):
         from quadsv.comparators import ComparatorIrregular
+
         rng = np.random.default_rng(4)
         n_per = 4
-        spectra = np.exp(rng.standard_normal((2*n_per, 200, 20)))
-        # Wrap into AnnData via the test helper
+        # Wrap synthetic spectra into AnnData via the test helper
         adatas = []
-        for i in range(2*n_per):
-            adatas.append(_grid_to_adata(rng.uniform(size=(200, 8, 8)),
-                                          gene_names=[f"g{j}" for j in range(200)]))
-        groups = np.array([0]*n_per + [1]*n_per)
-        cmp = ComparatorIrregular(adatas, groups=groups, gene_names=[f"g{j}" for j in range(200)],
-                                   feature_mode="radial", n_radial_bins=15,
-                                   presence_threshold=0.0, min_samples_per_group=2)
+        for _ in range(2 * n_per):
+            adatas.append(
+                _grid_to_adata(
+                    rng.uniform(size=(200, 8, 8)), gene_names=[f"g{j}" for j in range(200)]
+                )
+            )
+        groups = np.array([0] * n_per + [1] * n_per)
+        cmp = ComparatorIrregular(
+            adatas,
+            groups=groups,
+            gene_names=[f"g{j}" for j in range(200)],
+            feature_mode="radial",
+            n_radial_bins=15,
+            presence_threshold=0.0,
+            min_samples_per_group=2,
+        )
         cmp.fit(n_jobs=1, progress=False)
         ke = cmp.effective_rank(level="within_group")
         assert isinstance(ke, float)
@@ -1000,17 +1030,27 @@ class TestEffectiveRank:
 
     def test_comparator_effective_rank_per_sample(self):
         from quadsv.comparators import ComparatorIrregular
+
         rng = np.random.default_rng(5)
         n_per = 3
         adatas = []
         n_total = 2 * n_per
-        for i in range(n_total):
-            adatas.append(_grid_to_adata(rng.uniform(size=(150, 8, 8)),
-                                          gene_names=[f"g{j}" for j in range(150)]))
-        groups = np.array([0]*n_per + [1]*n_per)
-        cmp = ComparatorIrregular(adatas, groups=groups, gene_names=[f"g{j}" for j in range(150)],
-                                   feature_mode="radial", n_radial_bins=12,
-                                   presence_threshold=0.0, min_samples_per_group=2)
+        for _ in range(n_total):
+            adatas.append(
+                _grid_to_adata(
+                    rng.uniform(size=(150, 8, 8)), gene_names=[f"g{j}" for j in range(150)]
+                )
+            )
+        groups = np.array([0] * n_per + [1] * n_per)
+        cmp = ComparatorIrregular(
+            adatas,
+            groups=groups,
+            gene_names=[f"g{j}" for j in range(150)],
+            feature_mode="radial",
+            n_radial_bins=12,
+            presence_threshold=0.0,
+            min_samples_per_group=2,
+        )
         cmp.fit(n_jobs=1, progress=False)
         ke_arr = cmp.effective_rank(level="per_sample")
         assert ke_arr.shape == (n_total,)

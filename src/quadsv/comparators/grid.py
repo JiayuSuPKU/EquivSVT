@@ -93,7 +93,7 @@ class ComparatorGrid(_ComparatorBase):
         row_key: str,
         value_key: str | None = None,
         gene_names: Sequence[str] | None = None,
-        design: "Any | None" = None,
+        design: Any | None = None,
         feature_mode: str = "radial",
         n_radial_bins: int = 30,
         fft_solver: str = "rfft2",

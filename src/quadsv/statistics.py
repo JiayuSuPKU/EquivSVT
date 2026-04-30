@@ -143,9 +143,7 @@ def gene_pattern_diversity(
         Floor for ``log(spectra)`` to handle exact-zero bins.
     """
     if spectra.ndim != 2:
-        raise ValueError(
-            f"spectra must be (n_genes, K), got shape {spectra.shape}."
-        )
+        raise ValueError(f"spectra must be (n_genes, K), got shape {spectra.shape}.")
     log_s = np.log(np.maximum(spectra, eps))
     centred = log_s - log_s.mean(axis=0, keepdims=True)
     G = log_s.shape[0]
@@ -195,15 +193,11 @@ def within_group_pattern_diversity(
         Effective rank of the pooled within-group covariance.
     """
     if spectra.ndim != 3:
-        raise ValueError(
-            f"spectra must be (n_samples, n_genes, K), got shape {spectra.shape}."
-        )
+        raise ValueError(f"spectra must be (n_samples, n_genes, K), got shape {spectra.shape}.")
     groups = np.asarray(groups)
     uniq = np.unique(groups)
     if uniq.size != 2:
-        raise ValueError(
-            f"groups must contain exactly two distinct labels, got {uniq}."
-        )
+        raise ValueError(f"groups must contain exactly two distinct labels, got {uniq}.")
     g_int = (groups == uniq[1]).astype(int)
     a_mask = g_int == 0
     log_a = np.log(np.maximum(spectra[a_mask], eps))
