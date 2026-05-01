@@ -1858,6 +1858,7 @@ def compare_two_groups_scalar(
     values: np.ndarray,
     groups: np.ndarray,
     gene_names: Sequence[str] | None = None,
+    null: str = "welch",
     n_perm: int = 1000,
     random_state: int | None = None,
     n_perm_max: int = 10000,
@@ -1871,6 +1872,18 @@ def compare_two_groups_scalar(
     DC and AC are orthogonal by construction (the FFT pipeline always mean-
     centres each gene's grid before computing power).
 
+    Two null distributions are supported, chosen via ``null``:
+
+    - ``null='welch'`` (default) — analytic two-sided Welch t-test
+      p-value from the Welch-Satterthwaite t-distribution. No
+      permutation BH-floor; the natural counterpart to
+      :func:`compare_two_groups`'s ``null='wald'`` analytic path on the
+      spectral side.
+    - ``null='permutation'`` — exact / approximate permutation null on
+      ``abs(Welch t)``. More conservative at small ``n``; produces
+      identical p-values as a Mann-Whitney-style rank test up to ties
+      when the permutation pool is exhausted.
+
     Parameters
     ----------
     values : np.ndarray
@@ -1880,10 +1893,15 @@ def compare_two_groups_scalar(
         Group labels of length ``n_samples`` with exactly two distinct values.
     gene_names : sequence of str, optional
         Gene names. Integer indices if None.
+    null : {'welch', 'permutation'}, default 'welch'
+        Null-distribution method.
     n_perm : int, default 1000
-        Number of sample-label permutations for the null.
+        Number of sample-label permutations for ``null='permutation'``.
+        Ignored when ``null='welch'``.
     random_state : int, optional
-        Seed for the permutation RNG.
+        Seed for the permutation RNG. Ignored when ``null='welch'``.
+    n_perm_max : int, default 10000
+        Cap on enumerated unique permutations.
 
     Returns
     -------
@@ -1895,11 +1913,13 @@ def compare_two_groups_scalar(
     Raises
     ------
     ValueError
-        If shapes are inconsistent or ``groups`` does not contain exactly two
-        distinct values.
+        If shapes are inconsistent, ``groups`` does not contain exactly two
+        distinct values, or ``null`` is unknown.
     """
     if values.ndim != 2:
         raise ValueError(f"values must be 2D (n_samples, n_genes), got {values.shape}.")
+    if null not in ("welch", "permutation"):
+        raise ValueError(f"null must be 'welch' or 'permutation', got {null!r}.")
     n_samples, n_genes = values.shape
     groups = np.asarray(groups)
     if groups.shape != (n_samples,):
@@ -1909,21 +1929,28 @@ def compare_two_groups_scalar(
         raise ValueError(f"groups must contain exactly two distinct values, got {uniq}.")
     g_int = (groups == uniq[1]).astype(int)
 
-    rng = np.random.default_rng(random_state)
-    perm_labels, is_exact = _exchangeable_group_labels(g_int, n_perm, rng, n_perm_max=n_perm_max)
-    if is_exact:
-        logger.info(
-            "Exact permutation test (DE): enumerated %d distinct relabellings.",
-            perm_labels.shape[0],
-        )
-    observed = np.abs(_welch_t(values[g_int == 0], values[g_int == 1]))
-    mean_diff = values[g_int == 0].mean(axis=0) - values[g_int == 1].mean(axis=0)
+    a_vals = values[g_int == 0]
+    b_vals = values[g_int == 1]
+    mean_diff = a_vals.mean(axis=0) - b_vals.mean(axis=0)
 
-    null = np.empty((perm_labels.shape[0], n_genes))
-    for p in range(perm_labels.shape[0]):
-        a = perm_labels[p] == 0
-        null[p] = np.abs(_welch_t(values[a], values[~a]))
-    pvals = _permutation_pvalue(observed, null)
+    if null == "welch":
+        observed, pvals = _welch_p_two_sided(a_vals, b_vals)
+    else:
+        rng = np.random.default_rng(random_state)
+        perm_labels, is_exact = _exchangeable_group_labels(
+            g_int, n_perm, rng, n_perm_max=n_perm_max
+        )
+        if is_exact:
+            logger.info(
+                "Exact permutation test (DE): enumerated %d distinct relabellings.",
+                perm_labels.shape[0],
+            )
+        observed = np.abs(_welch_t(a_vals, b_vals))
+        null_dist = np.empty((perm_labels.shape[0], n_genes))
+        for p in range(perm_labels.shape[0]):
+            a_mask = perm_labels[p] == 0
+            null_dist[p] = np.abs(_welch_t(values[a_mask], values[~a_mask]))
+        pvals = _permutation_pvalue(observed, null_dist)
 
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]

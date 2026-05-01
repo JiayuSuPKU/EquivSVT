@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Analytic Welch t null for `compare_two_groups_scalar`**: new
+  `null="welch"` parameter (now the default) computes the per-gene
+  two-sided p-value from the Welch-Satterthwaite t-distribution
+  instead of a permutation null. Mirrors the analytic-default
+  posture of `compare_two_groups`'s `null="wald"` path on the
+  spectral side, and lets the DE companion produce raw p-values that
+  aren't floored at `1/(n_perm+1)` on small cohorts (which
+  permutation cannot escape and which collapses BH-FDR power on
+  small-n binary panels). The previous permutation null is preserved
+  as `null="permutation"`. New tests cover analytic-vs-scipy parity,
+  null-uniformity under H₀, and the raw-p floor that permutation
+  hits at small n while the analytic path bypasses.
+
 ### Removed
 - **Breaking: `center` argument retired across the comparator API.**
   `ComparatorIrregular`, `ComparatorGrid`, and `compute_sample_spectrum`

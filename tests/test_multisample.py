@@ -1245,9 +1245,77 @@ class TestScalarTestCalibration:
         n_samples, n_genes = 10, 300
         values = rng.standard_normal((n_samples, n_genes))
         groups = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
-        df = compare_two_groups_scalar(values, groups, n_perm=300, random_state=0)
+        df = compare_two_groups_scalar(
+            values, groups, null="permutation", n_perm=300, random_state=0
+        )
         ks_stat, ks_p = kstest(df.P_value.to_numpy(), "uniform")
         assert ks_p > 0.01, f"DE-test p-values not uniform under H0, KS p={ks_p:.4f}"
+
+    def test_welch_analytic_is_uniform_under_h0(self):
+        """null='welch' (analytic) p-values should be uniform under iid Gaussian H0."""
+        rng = np.random.default_rng(0)
+        n_samples, n_genes = 10, 1000
+        values = rng.standard_normal((n_samples, n_genes))
+        groups = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+        df = compare_two_groups_scalar(values, groups, null="welch")
+        ks_stat, ks_p = kstest(df.P_value.to_numpy(), "uniform")
+        assert ks_p > 0.01, f"analytic-Welch p-values not uniform under H0, KS p={ks_p:.4f}"
+
+    def test_welch_analytic_matches_scipy(self):
+        """null='welch' p-values should agree with scipy.stats.ttest_ind(equal_var=False)."""
+        from scipy.stats import ttest_ind
+
+        rng = np.random.default_rng(2)
+        n_per, n_genes = 5, 50
+        a = rng.normal(0.0, 1.0, size=(n_per, n_genes))
+        b = rng.normal(0.3, 1.5, size=(n_per, n_genes))
+        values = np.concatenate([a, b], axis=0)
+        groups = np.array([0] * n_per + [1] * n_per)
+        df = compare_two_groups_scalar(values, groups, null="welch")
+        df = df.set_index("Feature").loc[[str(i) for i in range(n_genes)]]
+        scipy_p = ttest_ind(a, b, equal_var=False, axis=0).pvalue
+        np.testing.assert_allclose(df["P_value"].to_numpy(), scipy_p, rtol=1e-9, atol=1e-300)
+
+    def test_welch_analytic_breaks_perm_raw_p_floor(self):
+        """At small n the permutation raw-p has a floor at 1/(perms+1); analytic does not.
+
+        4 vs 4 has C(8, 4) = 70 unique permutations, so the permutation null
+        cannot give a raw p-value smaller than ~1/70 ≈ 0.014 even for an
+        arbitrarily strong signal. The analytic Welch path can give raw p
+        many orders of magnitude smaller. This is the floor that translates
+        downstream into the BH-FDR power problem on small cohorts.
+        """
+        rng = np.random.default_rng(3)
+        n_per, n_genes = 4, 50
+        a = rng.normal(0.0, 1.0, size=(n_per, n_genes))
+        b = rng.normal(0.0, 1.0, size=(n_per, n_genes))
+        # Implant a very strong shift so the analytic test gives a tiny p.
+        b[:, 0] += 8.0
+        values = np.concatenate([a, b], axis=0)
+        groups = np.array([0] * n_per + [1] * n_per)
+
+        df_perm = compare_two_groups_scalar(
+            values, groups, null="permutation", n_perm=1000, random_state=0
+        )
+        df_welch = compare_two_groups_scalar(values, groups, null="welch")
+        # Most-significant gene should be the same in both rankings (gene 0).
+        assert df_perm.iloc[0]["Feature"] == "0"
+        assert df_welch.iloc[0]["Feature"] == "0"
+        top_perm_raw = float(df_perm.iloc[0]["P_value"])
+        top_welch_raw = float(df_welch.iloc[0]["P_value"])
+        # Permutation raw-p floor at n=4v4: ~1 / C(8, 4) ≈ 0.014.
+        assert top_perm_raw >= 0.01, f"perm raw-p unexpectedly tight: {top_perm_raw}"
+        # Analytic should be < 1e-3 for a 8σ implant on a non-degenerate Welch t.
+        assert top_welch_raw < 1e-3, f"analytic raw p too large: {top_welch_raw}"
+        # The analytic-vs-perm raw-p ratio at the top gene should be at least 10×.
+        assert top_perm_raw / max(top_welch_raw, 1e-300) > 10.0
+
+    def test_invalid_null_raises(self):
+        rng = np.random.default_rng(0)
+        values = rng.standard_normal((6, 3))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        with pytest.raises(ValueError, match="null must be"):
+            compare_two_groups_scalar(values, groups, null="bogus")
 
     def test_implanted_mean_shift_recovered(self):
         rng = np.random.default_rng(7)
@@ -1257,7 +1325,7 @@ class TestScalarTestCalibration:
         b[:, :5] += 2.0  # large mean shift on genes 0..4
         values = np.concatenate([a, b], axis=0)
         groups = np.array([0] * n_per + [1] * n_per)
-        df = compare_two_groups_scalar(values, groups, n_perm=400, random_state=0)
+        df = compare_two_groups_scalar(values, groups, null="welch")
         top5 = set(df.head(5).Feature.astype(str).tolist())
         assert top5 == {"0", "1", "2", "3", "4"}
 
