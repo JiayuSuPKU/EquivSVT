@@ -60,7 +60,7 @@ Five-step pipeline
    normalised expression. It is tested across groups with
    :meth:`~quadsv.ComparatorIrregular.test_diff_expr`, which runs
    an analytic Welch-Satterthwaite t-test by default
-   (``null="welch"``; ``null="permutation"`` is also available) with
+   (``null="wald"``; ``null="permutation"`` is also available) with
    BH-FDR. This is a spatially-aware differential-expression test.
 
    The **AC spectrum** is the pattern shape, with DC exactly zero.
@@ -91,14 +91,14 @@ common dispatch, so they are directly comparable:
        bypasses the BH-FDR floor that the exact permutation test
        hits at small per-arm n, and is the only path that works on
        multi-column / continuous designs.
-   * - ``cauchy_welch``
+   * - ``welch_t_cauchy``
      - Cauchy combination of per-bin Welch t-statistics. Analytic
        null is built in; remains well-calibrated at very small n.
        Binary path only.
 
 Both run through :func:`quadsv.comparators.multisample.compare_two_groups`
 (or :meth:`quadsv.ComparatorIrregular.test_diff_freq` for the class API);
-flip ``statistic="log_l2"`` ↔ ``statistic="cauchy_welch"`` to compare on
+flip ``statistic="log_l2"`` ↔ ``statistic="welch_t_cauchy"`` to compare on
 the same fitted spectra.
 
 
@@ -269,7 +269,7 @@ See also
   :class:`quadsv.ComparatorGrid` for the class reference.
 - :func:`quadsv.comparators.multisample.compare_two_groups`,
   :func:`quadsv.comparators.multisample.compare_two_groups_masked`,
-  and :func:`quadsv.comparators.multisample.compare_designs` for the
+  and :func:`quadsv.comparators.multisample.compare_glm` for the
   array-level primitives.
 - :func:`quadsv.kernels.fft.power_spectrum_2d` and
   :func:`quadsv.kernels.nufft.power_spectrum_2d_nufft` for the

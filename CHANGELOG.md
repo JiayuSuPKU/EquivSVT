@@ -9,14 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **GLM design API for cross-sample pattern comparison.** New public
-  `compare_designs(spectra, design, contrast, …)` generalises the
+  `compare_glm(spectra, design, contrast, …)` generalises the
   two-group test to arbitrary OLS designs (binary, continuous,
   multi-factor) with an analytic Wald null. The two-group case is
   recovered exactly. `Comparator.test_diff_freq(...)` gains a
   `contrast=` argument (column name, dict, or contrast vector).
-- **Analytic Wald null for `log_l2`** (`null="wald"`, alias
-  `"liu"`) on `compare_two_groups`, `compare_two_groups_masked`, and
-  `compare_designs`. Per-gene statistic is integrated via Liu's
+- **Analytic Wald null for `log_l2`** (`null="wald"`) on
+  `compare_two_groups`, `compare_two_groups_masked`, and
+  `compare_glm`. Per-gene statistic is integrated via Liu's
   approximation against a pooled-across-genes **full** within-group
   Σ (a single 30×30 eigendecomposition before each Liu integration);
   bypasses the small-n permutation BH-floor while keeping mean
@@ -26,14 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so genes with different observed cohorts get correctly-scaled
   eigenvalues.
 - **Analytic Welch t null for `compare_two_groups_scalar`**
-  (`null="welch"`, now the default). Computes per-gene two-sided
+  (`null="wald"`, now the default). Computes per-gene two-sided
   p-values from the Welch-Satterthwaite t-distribution; lets the DE
   companion bypass the permutation `1/(n_perm+1)` raw-p floor on
   small cohorts. The previous permutation null is preserved as
   `null="permutation"`.
 - **`normalize_shape: bool = False` keyword** on every spectrum-input
   comparison test (`compare_two_groups`, `compare_two_groups_masked`,
-  `compare_designs`). When True, divides each per-(sample, gene)
+  `compare_glm`). When True, divides each per-(sample, gene)
   spectrum by its sum along the frequency axis before the statistic
   is computed, so the test fires only on shape-only redistribution
   of power across radial frequencies. Statistic-agnostic; default
@@ -103,9 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     * 1-D array / Series of binary labels → two-sample dispatch
       (`compare_two_groups` / `compare_two_groups_masked`);
     * 2-D `np.ndarray` of shape `(n_samples, p)` → GLM design matrix,
-      used verbatim by `compare_designs`;
+      used verbatim by `compare_glm`;
     * `pandas.DataFrame` → GLM design, patsy-encoded by
-      `compare_designs`.
+      `compare_glm`.
 - **Breaking: default `null` switched from `"permutation"` to
   `"wald"` across the entire comparison surface** —
   `Comparator.test_diff_freq`,
@@ -116,11 +116,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (binary perm/Wald + GLM Wald), so it makes a single sensible
   package-wide default. Callers who want the permutation null must
   now pass `null="permutation"` explicitly. As a related
-  ergonomic fix, `compare_two_groups{,_masked}(statistic="cauchy_welch",
-  null="wald")` no longer raises — `cauchy_welch` carries its own
+  ergonomic fix, `compare_two_groups{,_masked}(statistic="welch_t_cauchy",
+  null="wald")` no longer raises — `welch_t_cauchy` carries its own
   analytic null (documented as ignoring the `null` kwarg) so the
   package default `null="wald"` is treated as a no-op for that
   statistic.
+- **Breaking: statistical-test naming cleanup** in
+  `quadsv.comparators.multisample` and the corresponding
+  `Comparator.test_diff_*` methods:
+    * **`compare_designs` → `compare_glm`.** The plural form was
+      awkward (one design per call); `compare_glm` names the test
+      family at the call site and parallels the binary
+      `compare_two_groups` cleanly.
+    * **Statistic `"cauchy_welch"` → `"welch_t_cauchy"`.** The new
+      token reads in pipeline order (per-bin Welch t first, gene-level
+      Cauchy combination second) and disambiguates from naming the
+      gene-level aggregator alone.
+    * **`null="welch"` → `null="wald"` on
+      `compare_two_groups_scalar` / `Comparator.test_diff_expr`.**
+      The Welch t-statistic *is* a Wald-type test, so unifying the
+      analytic-null token across the API removes a confusing
+      "wald on the spectrum path, welch on the scalar path"
+      asymmetry. The specific null distribution (Welch-Satterthwaite
+      t vs Liu mixture-χ²) is still spelled out in each function's
+      docstring.
+    * **`null="liu"` alias retired.** The `liu` token referred to
+      the numerical algorithm used to integrate the Wald χ² mixture
+      tail (see `quadsv.statistics.liu_sf`), not a separate
+      statistical concept. Single canonical token: `wald`.
 - **Breaking: Comparator attribute surface narrowed** (sklearn-style
   moderate-privacy convention). The public surface is now `samples`,
   `gene_names`, `feature_mode`, `freq_edges`, plus the
@@ -137,12 +160,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     * `.test_pattern()`    → `.test_diff_freq()` — gains a new
       `normalize_shape: bool = False` keyword, forwarded to its
       dispatch target (`compare_two_groups`,
-      `compare_two_groups_masked`, or `compare_designs`) so users get
+      `compare_two_groups_masked`, or `compare_glm`) so users get
       the shape-only DF path without mutating `cmp.spectra_`.
     * `.test_expression()` → `.test_diff_expr()` — gains an explicit
-      `null: str = "welch"` keyword (default matches the analytic
-      Welch t default on `compare_two_groups_scalar`); the previous
-      always-permutation behaviour is now reachable via
+      `null: str = "wald"` keyword (the analytic Welch-Satterthwaite
+      t-distribution path on `compare_two_groups_scalar`); the
+      previous always-permutation behaviour is reachable via
       `null="permutation"`.
 
 ### Removed
@@ -178,8 +201,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `statistic="hotelling_lw"` and `statistic="mmd_rbf"`
   paths retired** from every comparison function. Both were
   impractically slow and consistently dominated on sensitivity by
-  `log_l2 + null='wald'` or `cauchy_welch`. `_AVAILABLE_STATISTICS`
-  now reads `("log_l2", "cauchy_welch")`.
+  `log_l2 + null='wald'` or `welch_t_cauchy`. `_AVAILABLE_STATISTICS`
+  now reads `("log_l2", "welch_t_cauchy")`.
 - **Breaking: six legacy-path shim modules removed** —
   `quadsv.fft`, `quadsv.nufft`, `quadsv.detector`,
   `quadsv.detector_grid`, `quadsv._detector_base`,

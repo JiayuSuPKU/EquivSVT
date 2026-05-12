@@ -32,7 +32,7 @@ Pipeline
      analytic Wald (Liu mixture-χ²) null;
    - :func:`compare_two_groups_masked` (binary + per-(sample, gene)
      presence mask) — same nulls, masked per-gene cohort;
-   - :func:`compare_designs` (general OLS design + contrast) — Wald
+   - :func:`compare_glm` (general OLS design + contrast) — Wald
      null only.
 
    :func:`compare_two_groups_scalar` runs the DC-component DE companion
@@ -89,12 +89,12 @@ __all__ = [
     "compare_two_groups",
     "compare_two_groups_masked",
     "compare_two_groups_scalar",
-    "compare_designs",
+    "compare_glm",
 ]
 
 logger = logging.getLogger(__name__)
 
-_AVAILABLE_STATISTICS = ("log_l2", "cauchy_welch")
+_AVAILABLE_STATISTICS = ("log_l2", "welch_t_cauchy")
 
 
 # ---------------------------------------------------------------------------
@@ -997,7 +997,7 @@ def normalize_shape(
 
     Used internally by the spectrum comparison functions
     (:func:`compare_two_groups`, :func:`compare_two_groups_masked`,
-    :func:`compare_designs`) when their ``normalize_shape=True``
+    :func:`compare_glm`) when their ``normalize_shape=True``
     keyword argument is set — the differential-frequency test then
     fires only on shape redistribution across radial bins, not on
     overall amplitude changes.
@@ -1161,7 +1161,7 @@ _STAT_FNS = {
     "log_l2": _stat_log_l2,
 }
 
-# `cauchy_welch` lives outside _STAT_FNS because it returns a ``(n_genes, K)``
+# `welch_t_cauchy` lives outside _STAT_FNS because it returns a ``(n_genes, K)``
 # per-bin array (not a per-gene scalar) and needs a bespoke runner that turns
 # per-bin analytic Welch p-values into a Cauchy-combined gene-level p-value.
 
@@ -1297,7 +1297,7 @@ def _run_statistic_with_perm(
     return observed, null
 
 
-def _run_cauchy_welch_analytic(
+def _run_welch_t_cauchy_analytic(
     spectra: np.ndarray,
     groups: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1337,18 +1337,13 @@ def _run_cauchy_welch_analytic(
 # ---------------------------------------------------------------------------
 
 _NULL_OPTIONS = ("permutation", "wald")
-_NULL_ALIASES = {"liu": "wald"}
 
 
 def _resolve_null(null: str) -> str:
-    """Map ``null`` to the canonical token, handling aliases. Raises on unknown."""
-    canon = _NULL_ALIASES.get(null, null)
-    if canon not in _NULL_OPTIONS:
-        raise ValueError(
-            f"Unknown null='{null}'. Options: {sorted(_NULL_OPTIONS)} "
-            f"(aliases: {sorted(_NULL_ALIASES)})."
-        )
-    return canon
+    """Validate ``null`` against the supported set. Raises on unknown."""
+    if null not in _NULL_OPTIONS:
+        raise ValueError(f"Unknown null='{null}'. Options: {sorted(_NULL_OPTIONS)}.")
+    return null
 
 
 # Minimum residual df below which we issue a calibration warning for the
@@ -1371,7 +1366,7 @@ def _maybe_warn_small_df_wald(df_resid: int) -> None:
             f"log_l2 + null='wald' at residual df={df_resid}: "
             f"σ̂² estimator has ~{rel_noise_pct:.0f}% relative noise, "
             f"so the Wald null may be anti-conservative on a per-test basis. "
-            f"For n_a + n_b ≤ 4, prefer statistic='cauchy_welch' for stricter "
+            f"For n_a + n_b ≤ 4, prefer statistic='welch_t_cauchy' for stricter "
             f"calibration (at the cost of some sensitivity).",
             UserWarning,
             stacklevel=3,
@@ -1729,7 +1724,7 @@ def compare_two_groups(  # noqa: C901
         (mapped internally to 0/1 in sorted order).
     gene_names : sequence of str, optional
         Names for the gene axis. If None, integer indices are used.
-    statistic : {'log_l2', 'cauchy_welch'}, default 'log_l2'
+    statistic : {'log_l2', 'welch_t_cauchy'}, default 'log_l2'
         Test statistic:
 
         - ``'log_l2'`` — (optionally weighted) L2 distance between mean
@@ -1738,16 +1733,15 @@ def compare_two_groups(  # noqa: C901
           the small-n permutation BH-floor; ``null='permutation'`` (default)
           falls back to label permutations with exact enumeration when
           ``C(n, n_a) ≤ n_perm_max``.
-        - ``'cauchy_welch'`` — per-bin Welch two-sided t-test with
+        - ``'welch_t_cauchy'`` — per-bin Welch two-sided t-test with
           **analytic** (t-distribution) p-values combined across bins
           via Cauchy combination. Analytic is the whole point:
           permutation p-values would floor at ``1/(n_perm + 1)`` per
           bin, which would also floor the gene-level combined p-value
           and destroy BH-FDR power across thousands of genes. Yields
           an extra ``P_value_per_bin`` column.
-    null : {'wald', 'liu', 'permutation'}, default 'wald'
-        Null-distribution method. ``'wald'`` (alias ``'liu'``, the
-        default) uses an analytic Wald-type test for the L2 quadratic
+    null : {'wald', 'permutation'}, default 'wald'
+        Null-distribution method. ``'wald'`` (the default) uses an analytic Wald-type test for the L2 quadratic
         form: under H₀ the statistic ``T² = D'WD`` is distributed as a
         weighted sum of χ²₁ variables whose tail is integrated via Liu's
         approximation (see :func:`quadsv.statistics.liu_sf`).
@@ -1756,7 +1750,7 @@ def compare_two_groups(  # noqa: C901
         ``n_perm`` / ``random_state`` / ``n_perm_max`` arguments.
         Currently ``null='wald'`` is only supported for
         ``statistic='log_l2'``; raises ``ValueError`` otherwise.
-        ``cauchy_welch`` ignores this argument.
+        ``welch_t_cauchy`` ignores this argument.
 
         **Sample-size guidance** (residual df = ``n_a + n_b - 2``):
 
@@ -1765,15 +1759,15 @@ def compare_two_groups(  # noqa: C901
         - df ≥ 3 (n_a + n_b ≥ 5): ``'wald'`` acceptable.
         - df < 3 (n_a + n_b ≤ 4): ``'wald'`` emits a ``UserWarning``;
           σ̂² has ≥ 67% relative noise so per-test calibration may be
-          anti-conservative. Prefer ``statistic='cauchy_welch'``
+          anti-conservative. Prefer ``statistic='welch_t_cauchy'``
           (per-bin Welch t with proper df-corrected denominator) or
           stay with ``null='permutation'`` if the cohort allows
           enough exact relabellings.
     n_perm : int, default 1000
         Number of label permutations for the null distribution. **Ignored**
-        when ``statistic='cauchy_welch'`` or ``null='wald'``.
+        when ``statistic='welch_t_cauchy'`` or ``null='wald'``.
     random_state : int, optional
-        Seed for the permutation RNG (ignored for ``'cauchy_welch'``).
+        Seed for the permutation RNG (ignored for ``'welch_t_cauchy'``).
     n_jobs : int, default 1
         Reserved for future parallelism over genes; currently unused (the per-stat
         implementations are already vectorized over genes).
@@ -1806,7 +1800,7 @@ def compare_two_groups(  # noqa: C901
     pd.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value``, ``P_adj``
         (BH-FDR), sorted by descending statistic. When
-        ``statistic='cauchy_welch'``, the frame also carries a
+        ``statistic='welch_t_cauchy'``, the frame also carries a
         ``P_value_per_bin`` object column — each entry is an
         ``(K,)`` numpy array of per-bin permutation p-values for that gene.
 
@@ -1816,14 +1810,14 @@ def compare_two_groups(  # noqa: C901
         If ``statistic`` is unknown, ``groups`` does not contain exactly two values,
         or shapes are inconsistent.
     """
-    _available = set(_STAT_FNS) | {"cauchy_welch"}
+    _available = set(_STAT_FNS) | {"welch_t_cauchy"}
     if statistic not in _available:
         raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_available)}.")
     null_canon = _resolve_null(null)
-    # ``cauchy_welch`` carries its own analytic null; the ``null`` argument
+    # ``welch_t_cauchy`` carries its own analytic null; the ``null`` argument
     # is documented as ignored. Don't reject ``null='wald'`` (the package
     # default) for that statistic — just no-op.
-    if null_canon == "wald" and statistic not in ("log_l2", "cauchy_welch"):
+    if null_canon == "wald" and statistic not in ("log_l2", "welch_t_cauchy"):
         raise ValueError(
             f"null='wald' is only supported with statistic='log_l2', "
             f"got statistic='{statistic}'."
@@ -1844,10 +1838,10 @@ def compare_two_groups(  # noqa: C901
 
     rng = np.random.default_rng(random_state)
 
-    if statistic == "cauchy_welch":
+    if statistic == "welch_t_cauchy":
         if freq_weights is not None:
-            logger.debug("freq_weights is ignored by statistic='cauchy_welch'.")
-        observed, combined_p, per_bin_p = _run_cauchy_welch_analytic(spectra, g_int)
+            logger.debug("freq_weights is ignored by statistic='welch_t_cauchy'.")
+        observed, combined_p, per_bin_p = _run_welch_t_cauchy_analytic(spectra, g_int)
         summary_stat = observed.max(axis=-1)  # reportable scalar per gene
         if gene_names is None:
             gene_names = [str(i) for i in range(n_genes)]
@@ -1938,10 +1932,9 @@ def compare_two_groups_masked(  # noqa: C901
         ``(n_samples, n_genes)`` boolean mask. ``True`` = gene is observed
         in that sample (contributes); ``False`` = gene is absent (ignored).
     gene_names : sequence of str, optional
-    statistic : {'log_l2', 'cauchy_welch'}, default 'log_l2'
-    null : {'wald', 'liu', 'permutation'}, default 'wald'
-        Null-distribution method. ``'wald'`` (alias ``'liu'``, the
-        default) uses an analytic Wald-type test adapted for the masked
+    statistic : {'log_l2', 'welch_t_cauchy'}, default 'log_l2'
+    null : {'wald', 'permutation'}, default 'wald'
+        Null-distribution method. ``'wald'`` (the default) uses an analytic Wald-type test adapted for the masked
         case via a **mask-aware pooled-Σ** estimator: a single global
         ``(K, K)`` Σ is accumulated across every gene's present
         (sample, gene) cells (each gene contributes ``n_g - 2``
@@ -1975,18 +1968,18 @@ def compare_two_groups_masked(  # noqa: C901
     -------
     pd.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value``, ``P_adj``,
-        ``n_obs_A``, ``n_obs_B``. For ``'cauchy_welch'`` a
+        ``n_obs_A``, ``n_obs_B``. For ``'welch_t_cauchy'`` a
         ``P_value_per_bin`` column is also included (``None`` for skipped
         genes). BH-FDR is computed only over tested genes.
     """
-    _available = set(_STAT_FNS) | {"cauchy_welch"}
+    _available = set(_STAT_FNS) | {"welch_t_cauchy"}
     if statistic not in _available:
         raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_available)}.")
     null_canon = _resolve_null(null)
-    # ``cauchy_welch`` carries its own analytic null; the ``null`` argument
+    # ``welch_t_cauchy`` carries its own analytic null; the ``null`` argument
     # is documented as ignored. Don't reject ``null='wald'`` (the package
     # default) for that statistic — just no-op.
-    if null_canon == "wald" and statistic not in ("log_l2", "cauchy_welch"):
+    if null_canon == "wald" and statistic not in ("log_l2", "welch_t_cauchy"):
         raise ValueError(
             f"null='wald' is only supported with statistic='log_l2', "
             f"got statistic='{statistic}'."
@@ -2014,7 +2007,7 @@ def compare_two_groups_masked(  # noqa: C901
         gene_names = [str(i) for i in range(n_genes)]
 
     # Wald masked path: precompute global pooled Σ + eigvalsh; then per-gene
-    # T², v_c-scaled λ, and Liu-tail p-value. ``cauchy_welch`` carries its
+    # T², v_c-scaled λ, and Liu-tail p-value. ``welch_t_cauchy`` carries its
     # own analytic null and falls through to the per-gene branch below.
     if null_canon == "wald" and statistic == "log_l2":
         Sigma_ell, total_df, _eligible = _pooled_full_within_group_sigma_masked(
@@ -2069,7 +2062,7 @@ def compare_two_groups_masked(  # noqa: C901
             drop=True
         )
 
-    # Permutation / cauchy_welch masked path (per-gene loop).
+    # Permutation / welch_t_cauchy masked path (per-gene loop).
     rows: list[dict[str, Any]] = []
     for g in range(n_genes):
         mask = presence[:, g]
@@ -2083,7 +2076,7 @@ def compare_two_groups_masked(  # noqa: C901
             "Statistic": np.nan,
             "P_value": np.nan,
         }
-        if statistic == "cauchy_welch":
+        if statistic == "welch_t_cauchy":
             row["P_value_per_bin"] = None
 
         if n_a < min_samples_per_group or n_b < min_samples_per_group:
@@ -2093,8 +2086,8 @@ def compare_two_groups_masked(  # noqa: C901
         sub = spectra[mask, g : g + 1, :]  # (n_obs, 1, K)
         sub_groups = g_int[mask]
 
-        if statistic == "cauchy_welch":
-            observed, combined_p, per_bin_p = _run_cauchy_welch_analytic(sub, sub_groups)
+        if statistic == "welch_t_cauchy":
+            observed, combined_p, per_bin_p = _run_welch_t_cauchy_analytic(sub, sub_groups)
             row["Statistic"] = float(observed.max())
             row["P_value"] = float(combined_p[0])
             row["P_value_per_bin"] = per_bin_p[0]
@@ -2128,7 +2121,7 @@ def compare_two_groups_scalar(
     values: np.ndarray,
     groups: np.ndarray,
     gene_names: Sequence[str] | None = None,
-    null: str = "welch",
+    null: str = "wald",
     n_perm: int = 1000,
     random_state: int | None = None,
     n_perm_max: int = 10000,
@@ -2144,11 +2137,13 @@ def compare_two_groups_scalar(
 
     Two null distributions are supported, chosen via ``null``:
 
-    - ``null='welch'`` (default) — analytic two-sided Welch t-test
+    - ``null='wald'`` (default) — analytic two-sided Welch t-test
       p-value from the Welch-Satterthwaite t-distribution. No
       permutation BH-floor; the natural counterpart to
       :func:`compare_two_groups`'s ``null='wald'`` analytic path on the
-      spectral side.
+      spectral side. The Welch t is itself a Wald-type statistic
+      (point estimate / estimated SE under H₁), hence the shared
+      kwarg name across the API surface.
     - ``null='permutation'`` — exact / approximate permutation null on
       ``abs(Welch t)``. More conservative at small ``n``; produces
       identical p-values as a Mann-Whitney-style rank test up to ties
@@ -2163,13 +2158,15 @@ def compare_two_groups_scalar(
         Group labels of length ``n_samples`` with exactly two distinct values.
     gene_names : sequence of str, optional
         Gene names. Integer indices if None.
-    null : {'welch', 'permutation'}, default 'welch'
-        Null-distribution method.
+    null : {'wald', 'permutation'}, default 'wald'
+        Null-distribution method. ``'wald'`` returns analytic
+        Welch-Satterthwaite t-distribution p-values; ``'permutation'``
+        runs a label-shuffle null on ``abs(Welch t)``.
     n_perm : int, default 1000
         Number of sample-label permutations for ``null='permutation'``.
-        Ignored when ``null='welch'``.
+        Ignored when ``null='wald'``.
     random_state : int, optional
-        Seed for the permutation RNG. Ignored when ``null='welch'``.
+        Seed for the permutation RNG. Ignored when ``null='wald'``.
     n_perm_max : int, default 10000
         Cap on enumerated unique permutations.
 
@@ -2188,8 +2185,8 @@ def compare_two_groups_scalar(
     """
     if values.ndim != 2:
         raise ValueError(f"values must be 2D (n_samples, n_genes), got {values.shape}.")
-    if null not in ("welch", "permutation"):
-        raise ValueError(f"null must be 'welch' or 'permutation', got {null!r}.")
+    if null not in ("wald", "permutation"):
+        raise ValueError(f"null must be 'wald' or 'permutation', got {null!r}.")
     n_samples, n_genes = values.shape
     groups = np.asarray(groups)
     if groups.shape != (n_samples,):
@@ -2203,7 +2200,7 @@ def compare_two_groups_scalar(
     b_vals = values[g_int == 1]
     mean_diff = a_vals.mean(axis=0) - b_vals.mean(axis=0)
 
-    if null == "welch":
+    if null == "wald":
         observed, pvals = _welch_p_two_sided(a_vals, b_vals)
     else:
         rng = np.random.default_rng(random_state)
@@ -2236,7 +2233,7 @@ def compare_two_groups_scalar(
     return df.sort_values("Statistic", ascending=False).reset_index(drop=True)
 
 
-def compare_designs(
+def compare_glm(
     spectra: np.ndarray,
     design: pd.DataFrame | np.ndarray,
     contrast: str | dict[str, float] | np.ndarray,
@@ -2275,14 +2272,14 @@ def compare_designs(
     gene_names : sequence of str, optional
     statistic : {'log_l2'}, default 'log_l2'
         Currently only ``log_l2`` is supported in the GLM path.
-    null : {'wald', 'liu'}, default 'wald'
+    null : {'wald'}, default 'wald'
         Only the analytic Wald-type null is supported here. Permutation
         nulls for continuous covariates are intentionally deferred (naive
         row permutation breaks the X-y joint distribution under nuisance
         covariates; correct alternatives like Freedman–Lane add complexity
         without a clear payoff over the analytic Wald). Pass
-        ``null="permutation"`` only via :func:`compare_two_groups` with
-        ``groups=`` for the binary case.
+        ``null="permutation"`` only via :func:`compare_two_groups` (binary
+        labels) for permutation-based tests.
     normalize_shape : bool, default False
         If True, divide each per-(sample, gene) spectrum by its sum along
         the trailing (frequency) axis before the GLM is fit (same
@@ -2308,14 +2305,14 @@ def compare_designs(
     null_canon = _resolve_null(null)
     if null_canon != "wald":
         raise NotImplementedError(
-            "compare_designs currently only supports null='wald' (alias 'liu'). "
-            "Permutation null for the GLM path is intentionally deferred — "
-            "use compare_two_groups (1-D binary labels) for permutation-based "
+            "compare_glm currently only supports null='wald'. Permutation "
+            "null for the GLM path is intentionally deferred — use "
+            "compare_two_groups (1-D binary labels) for permutation-based "
             "tests."
         )
     if statistic != "log_l2":
         raise ValueError(
-            f"compare_designs currently only supports statistic='log_l2', " f"got '{statistic}'."
+            f"compare_glm currently only supports statistic='log_l2', " f"got '{statistic}'."
         )
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, K), got {spectra.shape}.")

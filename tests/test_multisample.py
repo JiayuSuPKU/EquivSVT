@@ -12,7 +12,7 @@ from quadsv.comparators import ComparatorIrregular
 from quadsv.comparators.multisample import (
     align_spectra_by_rotation,
     apply_rotations_to_spectra,
-    compare_designs,
+    compare_glm,
     compare_two_groups,
     compare_two_groups_masked,
     compare_two_groups_scalar,
@@ -543,16 +543,15 @@ class TestLogL2WaldNull:
             assert p_wald < p_perm, f"gene {g}: Wald={p_wald:.3g} not < perm={p_perm:.3g}"
             assert p_wald < 1.0 / 71.0, f"gene {g}: Wald={p_wald:.3g} above perm floor"
 
-    def test_liu_alias_matches_wald(self):
+    def test_liu_alias_retired(self):
+        """The retired ``null='liu'`` alias must now raise. Rename guard for
+        the alias-cleanup that left ``null='wald'`` as the single canonical
+        token."""
         rng = np.random.default_rng(1)
         spectra = np.exp(rng.standard_normal((6, 100, 20)))
         groups = np.array([0, 0, 0, 1, 1, 1])
-        df_w = compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
-        df_l = compare_two_groups(spectra, groups, statistic="log_l2", null="liu")
-        # Sort both by Feature for safe comparison.
-        df_w_s = df_w.sort_values("Feature").reset_index(drop=True)
-        df_l_s = df_l.sort_values("Feature").reset_index(drop=True)
-        np.testing.assert_array_equal(df_w_s["P_value"].to_numpy(), df_l_s["P_value"].to_numpy())
+        with pytest.raises(ValueError, match="Unknown null='liu'"):
+            compare_two_groups(spectra, groups, statistic="log_l2", null="liu")
 
     def test_wald_is_deterministic(self):
         rng = np.random.default_rng(2)
@@ -568,15 +567,15 @@ class TestLogL2WaldNull:
             df_b.sort_values("Feature")["P_value"].to_numpy(),
         )
 
-    def test_wald_argument_is_ignored_for_cauchy_welch(self):
-        """``cauchy_welch`` has its own analytic null; the ``null`` argument
+    def test_wald_argument_is_ignored_for_welch_t_cauchy(self):
+        """``welch_t_cauchy`` has its own analytic null; the ``null`` argument
         is documented as ignored. With the package default
         ``null='wald'``, the call must succeed (no spurious rejection on
         a moot kwarg) and produce the cauchy-welch output schema."""
         rng = np.random.default_rng(3)
         spectra = np.exp(rng.standard_normal((6, 50, 20)))
         groups = np.array([0, 0, 0, 1, 1, 1])
-        df = compare_two_groups(spectra, groups, statistic="cauchy_welch", null="wald")
+        df = compare_two_groups(spectra, groups, statistic="welch_t_cauchy", null="wald")
         assert "P_value_per_bin" in df.columns
         assert df["P_value"].between(0, 1).all()
 
@@ -589,7 +588,7 @@ class TestLogL2WaldNull:
 
     def test_small_df_emits_user_warning(self):
         """At residual df < 3 (n_a + n_b ≤ 4), the Wald path should warn the
-        user that σ̂² is noisy and recommend cauchy_welch.
+        user that σ̂² is noisy and recommend welch_t_cauchy.
         """
         rng = np.random.default_rng(0)
         # 1v2 split → df = 1 + 2 - 2 = 1; should warn.
@@ -756,8 +755,8 @@ class TestLogL2WaldNull:
                 min_samples_per_group=2,
             )
 
-    def test_masked_wald_argument_is_ignored_for_cauchy_welch(self):
-        """Same as the unmasked counterpart: ``cauchy_welch`` ignores
+    def test_masked_wald_argument_is_ignored_for_welch_t_cauchy(self):
+        """Same as the unmasked counterpart: ``welch_t_cauchy`` ignores
         ``null=``, so passing the package default ``null='wald'`` must
         succeed (no spurious rejection on a moot kwarg)."""
         rng = np.random.default_rng(9)
@@ -769,7 +768,7 @@ class TestLogL2WaldNull:
             spectra,
             groups,
             presence,
-            statistic="cauchy_welch",
+            statistic="welch_t_cauchy",
             null="wald",
         )
         assert "P_value_per_bin" in df.columns
@@ -777,7 +776,7 @@ class TestLogL2WaldNull:
 
 
 class TestCompareDesignsAndGLMWald:
-    """`compare_designs` GLM Wald path + `Comparator.test_diff_freq(design=DataFrame)`."""
+    """`compare_glm` GLM Wald path + `Comparator.test_diff_freq(design=DataFrame)`."""
 
     def test_binary_design_matches_groups_path_byte_close(self):
         """Two-group Wald via 1-D labels and via DataFrame design must agree to ~1e-10.
@@ -801,7 +800,7 @@ class TestCompareDesignsAndGLMWald:
 
         design = pd.DataFrame({"genotype": groups})
         df_d = (
-            compare_designs(spectra, design, contrast="genotype", null="wald")
+            compare_glm(spectra, design, contrast="genotype", null="wald")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
@@ -827,7 +826,7 @@ class TestCompareDesignsAndGLMWald:
         log_y = beta[None, :, :] * x[:, None, None] + 0.3 * rng.standard_normal((n, n_genes, K))
         spectra = np.exp(log_y)
         design = pd.DataFrame({"time": x})
-        df = compare_designs(spectra, design, contrast="time", null="wald")
+        df = compare_glm(spectra, design, contrast="time", null="wald")
         top10 = set(df.head(10)["Feature"].tolist())
         assert {"0", "1", "2", "3", "4"} <= top10, f"missing planted: {top10}"
 
@@ -841,45 +840,45 @@ class TestCompareDesignsAndGLMWald:
         spectra = np.exp(rng.standard_normal((8, 30, 20)))
         design = pd.DataFrame({"a": [0, 1, 0, 1, 0, 1, 0, 1], "b": np.arange(8)})
         df_dict = (
-            compare_designs(spectra, design, contrast={"a": 1.0}, null="wald")
+            compare_glm(spectra, design, contrast={"a": 1.0}, null="wald")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
         df_str = (
-            compare_designs(spectra, design, contrast="a", null="wald")
+            compare_glm(spectra, design, contrast="a", null="wald")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
         np.testing.assert_allclose(df_dict["P_value"].to_numpy(), df_str["P_value"].to_numpy())
 
     def test_ndarray_design_with_intercept_only(self):
-        """Numpy design matrix (caller-built) flows through compare_designs."""
+        """Numpy design matrix (caller-built) flows through compare_glm."""
         rng = np.random.default_rng(3)
         n, n_genes, K = 6, 20, 18
         spectra = np.exp(rng.standard_normal((n, n_genes, K)))
         # Design = [intercept, group_indicator]
         X = np.column_stack([np.ones(n), [0, 0, 0, 1, 1, 1]])
-        df = compare_designs(spectra, X, contrast=np.array([0.0, 1.0]), null="wald")
+        df = compare_glm(spectra, X, contrast=np.array([0.0, 1.0]), null="wald")
         assert df.shape[0] == n_genes
         assert df["P_value"].between(0, 1).all()
 
-    def test_compare_designs_rejects_permutation_null(self):
+    def test_compare_glm_rejects_permutation_null(self):
         import pandas as pd
 
         rng = np.random.default_rng(0)
         spectra = np.exp(rng.standard_normal((6, 10, 12)))
         design = pd.DataFrame({"g": [0, 0, 0, 1, 1, 1]})
         with pytest.raises(NotImplementedError, match="Permutation null"):
-            compare_designs(spectra, design, contrast="g", null="permutation")
+            compare_glm(spectra, design, contrast="g", null="permutation")
 
-    def test_compare_designs_rejects_non_log_l2(self):
+    def test_compare_glm_rejects_non_log_l2(self):
         import pandas as pd
 
         rng = np.random.default_rng(0)
         spectra = np.exp(rng.standard_normal((6, 10, 12)))
         design = pd.DataFrame({"g": [0, 0, 0, 1, 1, 1]})
         with pytest.raises(ValueError, match="only supports statistic='log_l2'"):
-            compare_designs(spectra, design, contrast="g", statistic="cauchy_welch", null="wald")
+            compare_glm(spectra, design, contrast="g", statistic="welch_t_cauchy", null="wald")
 
     def test_invalid_1d_design_not_binary(self):
         rng = np.random.default_rng(0)
@@ -1089,7 +1088,7 @@ class TestTwoGroupPower:
 
 
 class TestStatisticAliases:
-    @pytest.mark.parametrize("stat", ["log_l2", "cauchy_welch"])
+    @pytest.mark.parametrize("stat", ["log_l2", "welch_t_cauchy"])
     def test_each_statistic_runs(self, stat):
         rng = np.random.default_rng(0)
         spectra = rng.uniform(0.1, 5.0, size=(6, 8, 6))
@@ -1098,7 +1097,7 @@ class TestStatisticAliases:
         assert df.shape[0] == 8
         assert {"Feature", "Statistic", "P_value", "P_adj"} <= set(df.columns)
         assert df["P_value"].between(0, 1).all()
-        if stat == "cauchy_welch":
+        if stat == "welch_t_cauchy":
             assert "P_value_per_bin" in df.columns
             # Each entry is an (K,) array of per-bin p-values in [0, 1].
             per_bin = np.stack(df["P_value_per_bin"].to_numpy())
@@ -1263,17 +1262,17 @@ class TestScalarTestCalibration:
         assert ks_p > 0.01, f"DE-test p-values not uniform under H0, KS p={ks_p:.4f}"
 
     def test_welch_analytic_is_uniform_under_h0(self):
-        """null='welch' (analytic) p-values should be uniform under iid Gaussian H0."""
+        """null='wald' (analytic) p-values should be uniform under iid Gaussian H0."""
         rng = np.random.default_rng(0)
         n_samples, n_genes = 10, 1000
         values = rng.standard_normal((n_samples, n_genes))
         groups = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
-        df = compare_two_groups_scalar(values, groups, null="welch")
+        df = compare_two_groups_scalar(values, groups, null="wald")
         ks_stat, ks_p = kstest(df.P_value.to_numpy(), "uniform")
         assert ks_p > 0.01, f"analytic-Welch p-values not uniform under H0, KS p={ks_p:.4f}"
 
     def test_welch_analytic_matches_scipy(self):
-        """null='welch' p-values should agree with scipy.stats.ttest_ind(equal_var=False)."""
+        """null='wald' p-values should agree with scipy.stats.ttest_ind(equal_var=False)."""
         from scipy.stats import ttest_ind
 
         rng = np.random.default_rng(2)
@@ -1282,7 +1281,7 @@ class TestScalarTestCalibration:
         b = rng.normal(0.3, 1.5, size=(n_per, n_genes))
         values = np.concatenate([a, b], axis=0)
         groups = np.array([0] * n_per + [1] * n_per)
-        df = compare_two_groups_scalar(values, groups, null="welch")
+        df = compare_two_groups_scalar(values, groups, null="wald")
         df = df.set_index("Feature").loc[[str(i) for i in range(n_genes)]]
         scipy_p = ttest_ind(a, b, equal_var=False, axis=0).pvalue
         np.testing.assert_allclose(df["P_value"].to_numpy(), scipy_p, rtol=1e-9, atol=1e-300)
@@ -1308,7 +1307,7 @@ class TestScalarTestCalibration:
         df_perm = compare_two_groups_scalar(
             values, groups, null="permutation", n_perm=1000, random_state=0
         )
-        df_welch = compare_two_groups_scalar(values, groups, null="welch")
+        df_welch = compare_two_groups_scalar(values, groups, null="wald")
         # Most-significant gene should be the same in both rankings (gene 0).
         assert df_perm.iloc[0]["Feature"] == "0"
         assert df_welch.iloc[0]["Feature"] == "0"
@@ -1336,7 +1335,7 @@ class TestScalarTestCalibration:
         b[:, :5] += 2.0  # large mean shift on genes 0..4
         values = np.concatenate([a, b], axis=0)
         groups = np.array([0] * n_per + [1] * n_per)
-        df = compare_two_groups_scalar(values, groups, null="welch")
+        df = compare_two_groups_scalar(values, groups, null="wald")
         top5 = set(df.head(5).Feature.astype(str).tolist())
         assert top5 == {"0", "1", "2", "3", "4"}
 
@@ -1671,7 +1670,7 @@ class TestNormalizeShapeKwargCompareTwoGroups:
         [
             ("log_l2", "wald"),
             ("log_l2", "permutation"),
-            ("cauchy_welch", "permutation"),
+            ("welch_t_cauchy", "permutation"),
         ],
     )
     def test_default_false_unchanged(self, statistic, null):
@@ -1679,7 +1678,7 @@ class TestNormalizeShapeKwargCompareTwoGroups:
         kw = {"statistic": statistic, "null": null, "n_perm": 200, "random_state": 0}
         df_a = compare_two_groups(spec, groups, **kw)
         df_b = compare_two_groups(spec, groups, **kw, normalize_shape=False)
-        # Drop the per-bin object column for cauchy_welch (object dtype
+        # Drop the per-bin object column for welch_t_cauchy (object dtype
         # confuses pandas equality assertions).
         for c in ("P_value_per_bin",):
             df_a = df_a.drop(columns=c, errors="ignore")
@@ -1691,7 +1690,7 @@ class TestNormalizeShapeKwargCompareTwoGroups:
         [
             ("log_l2", "wald"),
             ("log_l2", "permutation"),
-            ("cauchy_welch", "permutation"),
+            ("welch_t_cauchy", "permutation"),
         ],
     )
     def test_kwarg_true_matches_manual(self, statistic, null):
@@ -1740,7 +1739,7 @@ class TestNormalizeShapeKwargCompareTwoGroupsMasked:
         [
             ("log_l2", "wald"),
             ("log_l2", "permutation"),
-            ("cauchy_welch", "permutation"),
+            ("welch_t_cauchy", "permutation"),
         ],
     )
     def test_default_false_unchanged(self, statistic, null):
@@ -1759,7 +1758,7 @@ class TestNormalizeShapeKwargCompareTwoGroupsMasked:
         [
             ("log_l2", "wald"),
             ("log_l2", "permutation"),
-            ("cauchy_welch", "permutation"),
+            ("welch_t_cauchy", "permutation"),
         ],
     )
     def test_kwarg_true_matches_manual(self, statistic, null):
@@ -1779,13 +1778,13 @@ class TestNormalizeShapeKwargCompareTwoGroupsMasked:
 
 
 class TestNormalizeShapeKwargCompareDesigns:
-    """``normalize_shape`` kwarg on ``compare_designs``."""
+    """``normalize_shape`` kwarg on ``compare_glm``."""
 
     def test_default_false_unchanged(self):
         spec, _ = _stub_spectra_groups()
         design = pd.DataFrame({"x": np.arange(spec.shape[0], dtype=float)})
-        df_a = compare_designs(spec, design, "x", statistic="log_l2", null="wald")
-        df_b = compare_designs(
+        df_a = compare_glm(spec, design, "x", statistic="log_l2", null="wald")
+        df_b = compare_glm(
             spec, design, "x", statistic="log_l2", null="wald", normalize_shape=False
         )
         pd.testing.assert_frame_equal(df_a, df_b)
@@ -1793,12 +1792,10 @@ class TestNormalizeShapeKwargCompareDesigns:
     def test_kwarg_true_matches_manual(self):
         spec, _ = _stub_spectra_groups()
         design = pd.DataFrame({"x": np.arange(spec.shape[0], dtype=float)})
-        df_kw = compare_designs(
+        df_kw = compare_glm(
             spec, design, "x", statistic="log_l2", null="wald", normalize_shape=True
         )
-        df_manual = compare_designs(
-            normalize_shape(spec), design, "x", statistic="log_l2", null="wald"
-        )
+        df_manual = compare_glm(normalize_shape(spec), design, "x", statistic="log_l2", null="wald")
         df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
         df_manual = df_manual.sort_values("Feature").reset_index(drop=True)
         np.testing.assert_allclose(
@@ -1812,11 +1809,9 @@ class TestNormalizeShapeKwargCompareDesigns:
         rng = np.random.default_rng(7)
         spec = rng.uniform(0.5, 2.0, size=(10, 200, 12))
         design = pd.DataFrame({"x": rng.standard_normal(10)})
-        df = compare_designs(
-            spec, design, "x", statistic="log_l2", null="wald", normalize_shape=True
-        )
+        df = compare_glm(spec, design, "x", statistic="log_l2", null="wald", normalize_shape=True)
         ks_p = kstest(df["P_value"].to_numpy(), "uniform").pvalue
-        assert ks_p > 1e-3, f"compare_designs shape-path H0 ks-uniform p={ks_p:.3g}"
+        assert ks_p > 1e-3, f"compare_glm shape-path H0 ks-uniform p={ks_p:.3g}"
 
 
 # ---------------------------------------------------------------------------

@@ -49,7 +49,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 
 from quadsv.comparators.multisample import (
     align_spectra_by_rotation,
-    compare_designs,
+    compare_glm,
     compare_two_groups,
     compare_two_groups_masked,
     compare_two_groups_scalar,
@@ -362,7 +362,7 @@ class _ComparatorBase:
           label-permutation test on the same dispatch target.
         - **GLM Wald** (multi-column / continuous ``design`` **or**
           explicit ``contrast=``): generalized analytic Wald test via
-          :func:`~quadsv.comparators.multisample.compare_designs`.
+          :func:`~quadsv.comparators.multisample.compare_glm`.
 
         Supplying ``contrast=`` alongside a 1-D ``design`` switches to
         the GLM path on the single-column DataFrame that wraps the
@@ -384,11 +384,11 @@ class _ComparatorBase:
             Per-gene statistic. See
             :func:`~quadsv.comparators.multisample.compare_two_groups`
             for the catalog.
-        null : {'wald', 'liu', 'permutation'}, default 'wald'
-            Null-distribution method. ``'wald'`` (alias ``'liu'``) is
-            the analytic Liu-approximation null — the default on every
-            dispatch path. ``'permutation'`` is available on the
-            binary path only (raises on the GLM path).
+        null : {'wald', 'permutation'}, default 'wald'
+            Null-distribution method. ``'wald'`` is the analytic
+            Liu-approximation null — the default on every dispatch
+            path. ``'permutation'`` is available on the binary path
+            only (raises on the GLM path).
         n_perm, random_state, n_perm_max
             Forwarded to the permutation path; ignored on the Wald
             path.
@@ -427,9 +427,9 @@ class _ComparatorBase:
 
         use_glm = (contrast is not None) or (groups is None)
         if use_glm:
-            if null not in ("wald", "liu"):
+            if null != "wald":
                 raise NotImplementedError(
-                    "Only null='wald' (alias 'liu') is supported when "
+                    "Only null='wald' is supported when "
                     "contrast= is provided or `design` is a multi-column / "
                     "continuous design. Pass null='wald' or pass a 1-D "
                     "binary `design` (and omit `contrast=`) to take the "
@@ -440,7 +440,7 @@ class _ComparatorBase:
                     "test_diff_freq() requires `contrast=` when `design` is "
                     "a multi-column / continuous design."
                 )
-            return compare_designs(
+            return compare_glm(
                 self.spectra_,
                 design_obj,
                 contrast,
@@ -485,7 +485,7 @@ class _ComparatorBase:
         self,
         design: Any,
         *,
-        null: str = "welch",
+        null: str = "wald",
         n_perm: int = 1000,
         random_state: int | None = None,
         n_perm_max: int = 10000,
@@ -507,13 +507,13 @@ class _ComparatorBase:
             / continuous designs are not yet supported for the DC test;
             use a downstream tool (e.g. :func:`scanpy.tl.rank_genes_groups`)
             on :attr:`dc_` directly for those cases.
-        null : {'welch', 'permutation'}, default 'welch'
+        null : {'wald', 'permutation'}, default 'wald'
             Null-distribution method. Forwarded to
             :func:`~quadsv.comparators.multisample.compare_two_groups_scalar`.
-            ``'welch'`` (default) returns analytic Welch-Satterthwaite t
+            ``'wald'`` (default) returns analytic Welch-Satterthwaite t
             p-values; ``'permutation'`` runs a label-shuffle null.
         n_perm, random_state, n_perm_max
-            Ignored when ``null='welch'``; forwarded otherwise.
+            Ignored when ``null='wald'``; forwarded otherwise.
         """
         if self.dc_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_expr().")
@@ -624,7 +624,7 @@ def _validate_design(  # noqa: C901 — dispatch over three input shapes is esse
       ``(n_samples, p)``. Used verbatim as the design; binary
       dispatch is disabled.
     - **``pandas.DataFrame``** — passed straight through (patsy
-      encoding happens lazily inside ``compare_designs``). Binary
+      encoding happens lazily inside ``compare_glm``). Binary
       dispatch disabled.
 
     Returns
