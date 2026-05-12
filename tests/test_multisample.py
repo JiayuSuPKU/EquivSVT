@@ -427,13 +427,16 @@ class TestBackgroundNormalization:
 
 
 class TestResidualization:
-    def test_perfect_predictor_residual_is_near_zero(self):
+    def test_log_space_perfect_predictor_residual_is_unity(self):
+        """If ``log gene = β_0 + Σ β_c log cov_c`` exactly, the (log-space)
+        residual is zero and the exponentiated output equals 1.0."""
         rng = np.random.default_rng(0)
         cov = rng.uniform(0.1, 5.0, size=(2, 8))  # 2 covariates, K=8
-        gene = 1.5 * cov[0] - 0.7 * cov[1] + 2.0  # exact linear combo + intercept
+        # Log-space linear combo: gene = exp(β_0) · cov_0^{β_1} · cov_1^{β_2}
+        gene = np.exp(2.0 + 1.5 * np.log(cov[0]) - 0.7 * np.log(cov[1]))
         gene = np.tile(gene, (5, 1))
         out = normalize_covariates(gene, cov, fit_intercept=True)
-        np.testing.assert_allclose(out, 0.0, atol=1e-9)
+        np.testing.assert_allclose(out, 1.0, atol=1e-6)
 
     def test_shape_validation(self):
         with pytest.raises(ValueError, match="Last axis"):
@@ -1810,30 +1813,47 @@ class TestNormalizationApiUnification:
                 old not in mod.__all__
             ), f"{old} still listed in multisample.__all__ after the rename"
 
-    def test_eps_default_consistent_where_used(self):
-        """``normalize_background`` and ``normalize_shape`` both expose
-        ``eps=1e-12`` (used inside log/divide). ``normalize_covariates`` does
-        not have an ``eps`` parameter — the closed-form pseudoinverse path is
-        numerically stable on the low-``n_cov`` designs used here, so adding a
-        no-op kwarg purely for API symmetry would be misleading."""
+    def test_three_normalizers_share_eps_default(self):
+        """All three normalize_* helpers expose ``eps=1e-12`` (used inside the
+        per-function log/divide guard)."""
         import inspect
 
-        for fn in (normalize_background, normalize_shape):
+        for fn in (normalize_background, normalize_covariates, normalize_shape):
             sig = inspect.signature(fn)
             assert "eps" in sig.parameters, f"{fn.__name__} missing eps kwarg"
             assert (
                 sig.parameters["eps"].default == 1e-12
             ), f"{fn.__name__} eps default differs from 1e-12"
-        # normalize_covariates intentionally omits eps.
-        assert "eps" not in inspect.signature(normalize_covariates).parameters
 
-    def test_normalize_covariates_rejects_eps_kwarg(self):
-        """``eps`` was dropped — passing it must now raise TypeError."""
+    def test_normalize_covariates_output_strictly_positive(self):
+        """Log-space formulation: output is exp(log P - X β̂), always > 0."""
         rng = np.random.default_rng(0)
-        gene = rng.uniform(size=(5, 6))
-        cov = rng.uniform(size=(1, 6))
-        with pytest.raises(TypeError):
-            normalize_covariates(gene, cov, eps=1e-12)
+        gene = rng.lognormal(size=(50, 10))
+        cov = rng.lognormal(size=(3, 10))
+        out = normalize_covariates(gene, cov)
+        assert (out > 0).all(), "log-space normalize_covariates must return > 0"
+
+    def test_normalize_covariates_commutes_with_background_in_log_space(self):
+        """``bg`` is left-mult by a projection on the genes axis; ``cov`` is
+        right-mult by a projection on the bins axis. They commute exactly
+        on log-spectra. Verify via the public (exponentiated) outputs."""
+        rng = np.random.default_rng(0)
+        spec = rng.lognormal(size=(40, 12))  # (G, K)
+        cov = rng.lognormal(size=(2, 12))  # (n_cov, K)
+        order_a = normalize_covariates(normalize_background(spec, axis=-2), cov)
+        order_b = normalize_background(normalize_covariates(spec, cov), axis=-2)
+        np.testing.assert_allclose(order_a, order_b, rtol=1e-10, atol=1e-12)
+
+    def test_normalize_covariates_no_covariates_reduces_to_geo_mean_centering(
+        self,
+    ):
+        """With fit_intercept=True and no covariates, the output equals each
+        gene's spectrum divided by its cross-bin geometric mean."""
+        rng = np.random.default_rng(0)
+        spec = rng.lognormal(size=(15, 9))
+        out = normalize_covariates(spec, np.zeros((0, spec.shape[-1])))
+        geo_mean_per_gene = np.exp(np.mean(np.log(spec + 1e-12), axis=-1, keepdims=True))
+        np.testing.assert_allclose(out, spec / geo_mean_per_gene, rtol=1e-10)
 
     def test_normalize_background_axis_default_unchanged(self):
         """Passing axis=-2 explicitly matches omitting it (default)."""

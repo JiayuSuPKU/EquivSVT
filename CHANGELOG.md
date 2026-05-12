@@ -73,13 +73,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     * `normalize_by_background` → `normalize_background`
     * `residualize_against_covariates` → `normalize_covariates`
     * `shape_normalize` → `normalize_shape`
-  Consistent first-arg `spectra`, keyword-only after, NumPy-style
-  docstrings with LaTeX math.
-  `normalize_covariates`'s first positional arg is renamed
-  `gene_spectra` → `spectra` and the `eps` kwarg is dropped (the
-  closed-form pseudoinverse is numerically robust on the typical
-  low-`n_cov` designs used here). The chainable comparator
-  instance methods follow suit:
+  Consistent first-arg `spectra`, keyword-only after, `eps=1e-12`
+  default on every helper, and NumPy-style docstrings with LaTeX
+  math. `normalize_covariates`'s first positional arg is renamed
+  `gene_spectra` → `spectra`, and its implementation now operates in
+  **log-space**: it residualises `log(spectra + ε)` against
+  `[1, log(C^T + ε)]` and exponentiates, so the output stays strictly
+  positive and composes cleanly with downstream `log_l2` tests.
+  Log-space `normalize_covariates` also **commutes exactly** with
+  `normalize_background` (left- vs right-multiplication of the
+  log-spectrum matrix by orthogonal-projection matrices on disjoint
+  axes), so the two can be applied in either order. The chainable
+  comparator instance methods follow suit:
     * `.shape_normalize()` → `.normalize_shape()`
     * `.residualize()` → `.normalize_covariates()`
 

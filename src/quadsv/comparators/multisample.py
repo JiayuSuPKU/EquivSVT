@@ -749,32 +749,46 @@ def normalize_covariates(
     covariate_spectra: np.ndarray,
     *,
     fit_intercept: bool = True,
+    eps: float = 1e-12,
 ) -> np.ndarray:
-    """Project gene spectra onto the orthogonal complement of covariate spectra.
+    """Residualise log-spectra against the log of covariate spectra.
 
-    Each gene's :math:`K`-dim spectrum is regressed (per gene, OLS in
-    linear scale) on the supplied covariate spectra plus an optional
-    intercept; the function returns the residual. Use to remove the
-    contribution of structured per-bin templates (cell-type proportion
-    maps, tissue-domain indicators, housekeeping composite expression)
-    from every gene's per-frequency power.
+    Each gene's log-spectrum is regressed (per gene, OLS in log-space)
+    on the log of the supplied covariate spectra plus an optional
+    intercept; the function exponentiates and returns the residual
+    spectrum. Use to remove the multiplicative contribution of
+    structured per-bin templates (cell-type proportion maps,
+    tissue-domain indicators, housekeeping composite expression) from
+    every gene's per-frequency power.
+
+    Operating in log-space matches the multiplicative noise model of
+    spectral data, keeps the output strictly positive (so the result
+    composes cleanly with the downstream ``log_l2`` test), and makes
+    this helper commute exactly with :func:`normalize_background`
+    (orthogonal projections along orthogonal axes — see Notes).
 
     Parameters
     ----------
     spectra : np.ndarray
-        Gene spectra :math:`P` of shape ``(G, K)`` to residualise.
+        Non-negative gene spectra :math:`P` of shape ``(G, K)`` to
+        residualise.
     covariate_spectra : np.ndarray
-        Covariate spectra :math:`C` of shape ``(n_cov, K)``.
+        Non-negative covariate spectra :math:`C` of shape
+        ``(n_cov, K)``.
     fit_intercept : bool, default True
         If True, prepend a column of ones to the design matrix
-        :math:`X` so per-gene additive offsets along the frequency
-        axis are absorbed.
+        :math:`X` so per-gene log-amplitude offsets along the
+        frequency axis are absorbed.
+    eps : float, default 1e-12
+        Floor :math:`\\varepsilon` added inside :math:`\\log(\\cdot)`
+        on both ``spectra`` and ``covariate_spectra`` to keep zeros
+        finite.
 
     Returns
     -------
     np.ndarray
-        Residual spectra :math:`\\tilde P` of shape ``(G, K)``. Never
-        mutates the input.
+        Residual spectra :math:`\\tilde P` of shape ``(G, K)``,
+        strictly positive. Never mutates the input.
 
     Raises
     ------
@@ -784,61 +798,90 @@ def normalize_covariates(
 
     Notes
     -----
-    Let :math:`P \\in \\mathbb{R}^{G \\times K}` denote the input
-    spectra (:math:`G` genes, :math:`K` frequency bins) and
-    :math:`C \\in \\mathbb{R}^{n_{\\mathrm{cov}} \\times K}` the
-    covariate spectra. Build the design matrix
+    Let :math:`P \\in \\mathbb{R}_{\\geq 0}^{G \\times K}` denote the
+    input spectra (:math:`G` genes, :math:`K` frequency bins) and
+    :math:`C \\in \\mathbb{R}_{\\geq 0}^{n_{\\mathrm{cov}} \\times K}`
+    the covariate spectra. Build the log-design matrix
 
     .. math::
 
-        X = \\bigl[\\, \\mathbf{1}_{K} \\;\\big|\\; C^{\\top} \\,\\bigr]
+        X = \\bigl[\\, \\mathbf{1}_{K} \\;\\big|\\;
+                \\log(C^{\\top} + \\varepsilon) \\,\\bigr]
             \\;\\in\\; \\mathbb{R}^{K \\times (n_{\\mathrm{cov}} + 1)},
 
     dropping the leading column :math:`\\mathbf{1}_{K}` when
     ``fit_intercept=False``. Fit per-gene OLS coefficients via the
-    Moore-Penrose pseudoinverse :math:`X^{+}`,
+    Moore-Penrose pseudoinverse :math:`X^{+}` against the log of the
+    response,
 
     .. math::
 
-        \\hat\\beta_{g} = X^{+}\\, P_{g,\\cdot}^{\\top}
+        \\hat\\beta_{g} = X^{+}\\,
+            \\bigl[ \\log( P_{g,\\cdot} + \\varepsilon ) \\bigr]^{\\top}
             \\;\\in\\; \\mathbb{R}^{n_{\\mathrm{cov}} + 1},
 
-    and return the residual
+    and return the exponentiated residual
 
     .. math::
 
-        \\tilde P_{g,k} = P_{g,k} - X_{k,\\cdot}\\,\\hat\\beta_{g}.
+        \\tilde P_{g,k}
+        = \\exp\\!\\Bigl(
+            \\log( P_{g,k} + \\varepsilon )
+            - X_{k,\\cdot}\\,\\hat\\beta_{g}
+          \\Bigr).
 
     Equivalently,
 
     .. math::
 
-        \\tilde P_{g,\\cdot}^{\\top}
-        = \\bigl( I_{K} - X X^{+} \\bigr)\\, P_{g,\\cdot}^{\\top},
+        \\log \\tilde P_{g,\\cdot}^{\\top}
+        = \\bigl( I_{K} - X X^{+} \\bigr)\\,
+          \\bigl[ \\log( P_{g,\\cdot} + \\varepsilon ) \\bigr]^{\\top},
 
-    i.e., the orthogonal projection of each gene's spectrum onto the
-    orthogonal complement of the column space of :math:`X`. After the
-    transform, every gene's residual spectrum is uncorrelated (in the
-    :math:`K`-bin inner product) with each covariate column of
-    :math:`X`.
+    i.e., the orthogonal projection of each gene's **log-spectrum**
+    onto the orthogonal complement of the column space of :math:`X`,
+    then exponentiated.
+
+    **Commutativity with** :func:`normalize_background`. In log-space
+    the two operations are left- vs right-multiplication of the
+    :math:`G \\times K` log-spectrum matrix by orthogonal-projection
+    matrices on disjoint axes,
+
+    .. math::
+
+        \\mathrm{bg}: \\;\\log P \\;\\mapsto\\;
+            \\bigl( I_{G} - \\tfrac{1}{G}\\mathbf{1}_{G}\\mathbf{1}_{G}^{\\top}
+            \\bigr)\\,\\log P,
+        \\qquad
+        \\mathrm{cov}: \\;\\log P \\;\\mapsto\\;
+            \\log P \\,\\bigl( I_{K} - X X^{+} \\bigr).
+
+    Left- and right-multiplication trivially commute, so we have the exact identity
+    ``normalize_background(normalize_covariates(P)) ==
+    normalize_covariates(normalize_background(P))``.
 
     With ``fit_intercept=True`` and **no** covariates (empty
-    ``covariate_spectra``), this reduces to per-gene mean centring
+    ``covariate_spectra``), this reduces to per-gene log-mean centring
     along the frequency axis,
 
     .. math::
 
-        \\tilde P_{g,k} = P_{g,k}
-            - \\tfrac{1}{K} \\sum_{k'=1}^{K} P_{g,k'}.
+        \\tilde P_{g,k}
+        = \\frac{P_{g,k} + \\varepsilon}
+                {\\exp\\!\\bigl(\\tfrac{1}{K}
+                        \\sum_{k'=1}^{K}\\log(P_{g,k'} + \\varepsilon)
+                  \\bigr)},
 
-    This is **not** equivalent to :func:`normalize_background`, which
-    operates on a different axis (genes vs frequencies) in a different
-    scale (log vs linear).
+    i.e., dividing each gene's spectrum by its own cross-bin geometric
+    mean — a per-gene companion to :func:`normalize_background`'s
+    per-bin cross-gene operation, distinct from
+    :func:`normalize_shape`'s arithmetic-mean / sum-1 normalisation.
 
     Companion functions:
 
     - :func:`normalize_background` removes per-sample multiplicative
-      gain via cross-gene geometric-mean centring in log-space.
+      gain via cross-gene geometric-mean centring in log-space
+      (perpendicular axis to this function).
     - :func:`normalize_shape` removes per-(sample, gene) amplitude
       by L1-normalising along the frequency axis.
 
@@ -851,6 +894,8 @@ def normalize_covariates(
     >>> resid = normalize_covariates(spec, cov)
     >>> resid.shape
     (20, 8)
+    >>> bool((resid > 0).all())     # log-space output is strictly positive
+    True
     """
     if spectra.shape[-1] != covariate_spectra.shape[-1]:
         raise ValueError(
@@ -858,15 +903,17 @@ def normalize_covariates(
             f"covariate_spectra has K={covariate_spectra.shape[-1]}."
         )
     K = spectra.shape[-1]
+    log_spec = np.log(spectra + eps)  # (G, K)
+    log_cov = np.log(covariate_spectra + eps)  # (n_cov, K)
     # Design matrix shape (K, n_covariates [+1]).
-    X = covariate_spectra.T
+    X = log_cov.T
     if fit_intercept:
         X = np.hstack([np.ones((K, 1)), X])
-    # Solve least-squares: P_g.T = X @ beta_g -> beta_g = pinv(X) @ P_g.T per gene.
-    # Closed form via pseudo-inverse (covariates K is small).
+    # Solve OLS in log-space:  log P_g.T = X @ beta_g  →  beta_g = X^+ @ log P_g.T.
+    # Closed form via pseudo-inverse (n_cov + 1 columns, small).
     pinv = np.linalg.pinv(X)
-    fitted = (X @ pinv @ spectra.T).T  # (n_genes, K)
-    return spectra - fitted
+    fitted = (X @ pinv @ log_spec.T).T  # (G, K) in log-space
+    return np.exp(log_spec - fitted)
 
 
 def normalize_shape(
