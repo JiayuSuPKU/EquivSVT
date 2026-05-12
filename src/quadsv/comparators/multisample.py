@@ -19,24 +19,42 @@ Pipeline
    :func:`align_spectra_by_rotation` rotates each sample's full 2D spectrum to
    maximize similarity to a reference, restoring comparability when directional
    anisotropy matters.
-4. **Batch correction** — :func:`normalize_by_background` cancels per-slide
-   gain/sensitivity differences; :func:`residualize_against_covariates` regresses out
-   user-supplied covariate spectra (cell-type proportions, tissue domains, etc.).
-5. **Two-group test per gene** — :func:`compare_two_groups` produces a
-   per-gene table with a permutation (or analytic Wald) p-value and BH-FDR.
+4. **Batch correction** — :func:`normalize_background` cancels per-slide
+   gain/sensitivity differences; :func:`normalize_covariates` regresses out
+   user-supplied covariate spectra (cell-type proportions, tissue domains, etc.);
+   :func:`normalize_shape` projects per-(sample, gene) spectra onto the
+   probability simplex along the frequency axis, isolating shape-only
+   redistribution from amplitude differences.
+5. **Cross-sample comparison per gene** — three dispatch targets share
+   the same per-gene output schema:
+
+   - :func:`compare_two_groups` (binary 1-D labels) — permutation or
+     analytic Wald (Liu mixture-χ²) null;
+   - :func:`compare_two_groups_masked` (binary + per-(sample, gene)
+     presence mask) — same nulls, masked per-gene cohort;
+   - :func:`compare_glm` (general OLS design + contrast) — Wald
+     null only.
+
+   :func:`compare_two_groups_scalar` runs the DC-component DE companion
+   on per-(sample, gene) scalars (Welch t analytic or permutation).
 
 This module only contains **array-level primitives**. The two high-level
 wrapper classes that drive the pipeline on :class:`anndata.AnnData` /
 :class:`spatialdata.SpatialData` containers live in
 :mod:`quadsv.comparators` (:class:`~quadsv.ComparatorIrregular` /
-:class:`~quadsv.ComparatorGrid`).
+:class:`~quadsv.ComparatorGrid`); their ``test_diff_freq(design, ...)``
+method dispatches between the three comparison primitives above.
 
 Notes
 -----
-The default log-L2 statistic is motivated by the nonparametric two-sample test of
-log-spectral densities (Bandyopadhyay & Wu, *arXiv* 2026). Permutation nulls are used
-throughout because typical study sizes (3–10 slides per group) make parametric tail
-approximations on multivariate statistics unreliable.
+The default log-L2 statistic is a quadratic form on the log-radial
+spectrum: take per-group means in log-space, weight the difference
+by the bin weights ``W``, and report ``T² = D' W D``. At typical
+study sizes (3–10 slides per group) the exact-permutation test hits
+a BH-FDR floor; the analytic Wald null (Liu's χ² mixture
+approximation against a pooled within-group Σ) bypasses that floor
+while remaining well-calibrated on real data — see
+``scripts/comparator_benchmark`` for the calibration battery.
 """
 
 from __future__ import annotations
@@ -65,18 +83,18 @@ __all__ = [
     "align_spectra_by_rotation",
     "estimate_rotations_from_landmarks",
     "apply_rotations_to_spectra",
-    "normalize_by_background",
-    "residualize_against_covariates",
-    "shape_normalize",
+    "normalize_background",
+    "normalize_covariates",
+    "normalize_shape",
     "compare_two_groups",
     "compare_two_groups_masked",
     "compare_two_groups_scalar",
-    "compare_designs",
+    "compare_glm",
 ]
 
 logger = logging.getLogger(__name__)
 
-_AVAILABLE_STATISTICS = ("log_l2", "cauchy_welch")
+_AVAILABLE_STATISTICS = ("log_l2", "welch_t_cauchy")
 
 
 # ---------------------------------------------------------------------------
@@ -640,157 +658,376 @@ def align_spectra_by_rotation(
 # ---------------------------------------------------------------------------
 
 
-def normalize_by_background(
+def normalize_background(
     spectra: np.ndarray,
+    *,
+    axis: int = -2,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """
-    Cancel per-sample multiplicative effects via the geometric-mean spectrum.
+    """Cancel per-sample multiplicative gain via cross-gene geometric-mean centring.
 
-    For a single sample with spectra ``(n_genes, K)``, computes the geometric-mean
-    spectrum across genes :math:`\\bar P(k) = \\exp(\\overline{\\log P(\\cdot, k)})`
-    and returns ``spectra / bar_P``. In log-space this equals subtracting the per-bin
-    mean of ``log P`` across genes — the standard recipe for cancelling sample-level
-    sensitivity / depth differences.
+    For each (sample, frequency-bin) pair, every gene's power is divided
+    by the geometric mean of the spectrum across the genes axis. Use
+    this to correct per-sample multiplicative gain (sequencing depth,
+    antibody titre, dewaxing efficiency) that scales every gene's
+    spectrum at every frequency by a sample-level factor.
 
     Parameters
     ----------
     spectra : np.ndarray
-        Per-sample spectra of shape ``(..., n_genes, K)``. The geometric mean is
-        computed along the ``n_genes`` axis (second-to-last).
+        Non-negative spectra :math:`P` with shape ``(..., G, K)``
+        (:math:`G` along ``axis``, :math:`K` frequency bins on the
+        trailing axis). Any leading dimensions (e.g., ``n_samples``)
+        are broadcast over.
+    axis : int, default -2
+        Axis along which the cross-gene geometric mean is taken
+        (the genes axis).
     eps : float, default 1e-12
-        Floor added before the log to avoid ``log(0)``.
+        Floor :math:`\\varepsilon` added before the logarithm to keep
+        zeros finite.
 
     Returns
     -------
     np.ndarray
-        Background-normalized spectra, same shape as the input.
+        Background-normalized spectra :math:`\\tilde P`, same shape as
+        ``spectra``. Never mutates the input.
 
     Notes
     -----
-    **Equivalence with a per-sample one-hot covariate.** When stacking all
-    ``(sample, gene)`` log-spectra as rows and regressing each frequency bin
-    against a one-hot *sample-ID* indicator (i.e., a fixed sample effect
-    per bin), the residuals are, by construction, the per-sample demeaned
-    log-spectra — which is exactly what this function computes in log-space.
-    That is: running this function sample-by-sample is mathematically
-    identical to fitting a one-hot-sample covariate in log-space and
-    residualizing. This is why a separate "residualize against
-    per-sample one-hot" step is unnecessary — it is already covered here.
+    Let :math:`P` denote the input spectrum, :math:`G` the number of
+    genes (length of ``axis``), :math:`K` the number of frequency
+    bins, and :math:`\\varepsilon` the ``eps`` floor. The per-bin
+    geometric-mean background is
 
-    :func:`residualize_against_covariates` is the complementary step for
-    non-trivial covariates whose shape across frequency bins is not
-    constant (cell-type proportion spectra, tissue-domain maps, etc.).
+    .. math::
+
+        b_{k} = \\exp\\!\\Bigl(
+            \\tfrac{1}{G} \\sum_{g'=1}^{G}
+            \\log\\bigl(P_{g',k} + \\varepsilon\\bigr)
+        \\Bigr),
+
+    and the output is the per-bin gene-wise quotient
+
+    .. math::
+
+        \\tilde P_{g,k} = \\frac{P_{g,k}}{b_{k}}.
+
+    Equivalently, in log-space this is per-bin mean centring across
+    the genes axis,
+
+    .. math::
+
+        \\log \\tilde P_{g,k}
+        = \\log\\bigl(P_{g,k} + \\varepsilon\\bigr)
+          - \\tfrac{1}{G} \\sum_{g'=1}^{G}
+            \\log\\bigl(P_{g',k} + \\varepsilon\\bigr),
+
+    so after the transform :math:`\\prod_{g} \\tilde P_{g,k} = 1` at
+    every bin :math:`k` — the cross-gene geometric mean at every
+    frequency is unity.
+
+    The operation is equivalent to a per-bin OLS regression of
+    :math:`\\log P_{\\cdot,k}` against a constant (the cross-gene
+    mean) followed by exponentiation. With a per-sample one-hot
+    covariate stacked across all (sample, gene) rows, the residuals
+    match :math:`\\log \\tilde P` row-for-row, so running this
+    function sample-by-sample is identical to fitting a one-hot
+    sample-ID covariate in log-space and residualising.
+
+    Companion functions:
+
+    - :func:`normalize_covariates` removes per-bin bias linear in
+      user-supplied covariate spectra (cell-type proportion maps,
+      tissue domains, housekeeping templates).
+    - :func:`normalize_shape` removes per-(sample, gene) amplitude
+      by L1-normalising along the frequency axis.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> rng = np.random.default_rng(0)
+    >>> spec = rng.lognormal(size=(2, 5, 8))      # (n_samples, G, K)
+    >>> P_tilde = normalize_background(spec)
+    >>> P_tilde.shape
+    (2, 5, 8)
+    >>> # Cross-gene geometric mean at each (sample, bin) is unity:
+    >>> bool(np.allclose(np.prod(P_tilde, axis=-2), 1.0))
+    True
     """
     log_spec = np.log(spectra + eps)
-    bg = log_spec.mean(axis=-2, keepdims=True)
+    bg = log_spec.mean(axis=axis, keepdims=True)
     return np.exp(log_spec - bg)
 
 
-def residualize_against_covariates(
-    gene_spectra: np.ndarray,
+def normalize_covariates(
+    spectra: np.ndarray,
     covariate_spectra: np.ndarray,
+    *,
     fit_intercept: bool = True,
+    eps: float = 1e-12,
 ) -> np.ndarray:
-    """
-    Regress each gene's spectrum on a set of covariate spectra; return the residuals.
+    """Residualise log-spectra against the log of covariate spectra.
 
-    For one sample, fits :math:`P_g \\approx \\beta_0 + \\sum_c \\beta_c\\,C_c` per
-    frequency bin (i.e., each bin treated as an observation; covariates as features),
-    and subtracts the fit. Equivalent to projecting out the column space of the
-    covariate matrix from the gene-spectrum matrix.
+    Each gene's log-spectrum is regressed (per gene, OLS in log-space)
+    on the log of the supplied covariate spectra plus an optional
+    intercept; the function exponentiates and returns the residual
+    spectrum. Use to remove the multiplicative contribution of
+    structured per-bin templates (cell-type proportion maps,
+    tissue-domain indicators, housekeeping composite expression) from
+    every gene's per-frequency power.
+
+    Operating in log-space matches the multiplicative noise model of
+    spectral data, keeps the output strictly positive (so the result
+    composes cleanly with the downstream ``log_l2`` test), and makes
+    this helper commute exactly with :func:`normalize_background`
+    (orthogonal projections along orthogonal axes — see Notes).
 
     Parameters
     ----------
-    gene_spectra : np.ndarray
-        Gene spectra of shape ``(n_genes, K)``.
+    spectra : np.ndarray
+        Non-negative gene spectra :math:`P` of shape ``(G, K)`` to
+        residualise.
     covariate_spectra : np.ndarray
-        Covariate spectra of shape ``(n_covariates, K)``. Typical covariates: spectra
-        of cell-type proportion maps, tissue-domain indicator maps, or housekeeping
-        composite expression.
+        Non-negative covariate spectra :math:`C` of shape
+        ``(n_cov, K)``.
     fit_intercept : bool, default True
-        If True, prepend a constant column to the covariate design.
+        If True, prepend a column of ones to the design matrix
+        :math:`X` so per-gene log-amplitude offsets along the
+        frequency axis are absorbed.
+    eps : float, default 1e-12
+        Floor :math:`\\varepsilon` added inside :math:`\\log(\\cdot)`
+        on both ``spectra`` and ``covariate_spectra`` to keep zeros
+        finite.
 
     Returns
     -------
     np.ndarray
-        Residual spectra of shape ``(n_genes, K)``.
+        Residual spectra :math:`\\tilde P` of shape ``(G, K)``,
+        strictly positive. Never mutates the input.
 
     Raises
     ------
     ValueError
         If ``covariate_spectra`` has a different last-axis length than
-        ``gene_spectra``.
+        ``spectra``.
+
+    Notes
+    -----
+    Let :math:`P \\in \\mathbb{R}_{\\geq 0}^{G \\times K}` denote the
+    input spectra (:math:`G` genes, :math:`K` frequency bins) and
+    :math:`C \\in \\mathbb{R}_{\\geq 0}^{n_{\\mathrm{cov}} \\times K}`
+    the covariate spectra. Build the log-design matrix
+
+    .. math::
+
+        X = \\bigl[\\, \\mathbf{1}_{K} \\;\\big|\\;
+                \\log(C^{\\top} + \\varepsilon) \\,\\bigr]
+            \\;\\in\\; \\mathbb{R}^{K \\times (n_{\\mathrm{cov}} + 1)},
+
+    dropping the leading column :math:`\\mathbf{1}_{K}` when
+    ``fit_intercept=False``. Fit per-gene OLS coefficients via the
+    Moore-Penrose pseudoinverse :math:`X^{+}` against the log of the
+    response,
+
+    .. math::
+
+        \\hat\\beta_{g} = X^{+}\\,
+            \\bigl[ \\log( P_{g,\\cdot} + \\varepsilon ) \\bigr]^{\\top}
+            \\;\\in\\; \\mathbb{R}^{n_{\\mathrm{cov}} + 1},
+
+    and return the exponentiated residual
+
+    .. math::
+
+        \\tilde P_{g,k}
+        = \\exp\\!\\Bigl(
+            \\log( P_{g,k} + \\varepsilon )
+            - X_{k,\\cdot}\\,\\hat\\beta_{g}
+          \\Bigr).
+
+    Equivalently,
+
+    .. math::
+
+        \\log \\tilde P_{g,\\cdot}^{\\top}
+        = \\bigl( I_{K} - X X^{+} \\bigr)\\,
+          \\bigl[ \\log( P_{g,\\cdot} + \\varepsilon ) \\bigr]^{\\top},
+
+    i.e., the orthogonal projection of each gene's **log-spectrum**
+    onto the orthogonal complement of the column space of :math:`X`,
+    then exponentiated.
+
+    **Commutativity with** :func:`normalize_background`. In log-space
+    the two operations are left- vs right-multiplication of the
+    :math:`G \\times K` log-spectrum matrix by orthogonal-projection
+    matrices on disjoint axes,
+
+    .. math::
+
+        \\mathrm{bg}: \\;\\log P \\;\\mapsto\\;
+            \\bigl( I_{G} - \\tfrac{1}{G}\\mathbf{1}_{G}\\mathbf{1}_{G}^{\\top}
+            \\bigr)\\,\\log P,
+        \\qquad
+        \\mathrm{cov}: \\;\\log P \\;\\mapsto\\;
+            \\log P \\,\\bigl( I_{K} - X X^{+} \\bigr).
+
+    Left- and right-multiplication trivially commute, so we have the exact identity
+    ``normalize_background(normalize_covariates(P)) ==
+    normalize_covariates(normalize_background(P))``.
+
+    With ``fit_intercept=True`` and **no** covariates (empty
+    ``covariate_spectra``), this reduces to per-gene log-mean centring
+    along the frequency axis,
+
+    .. math::
+
+        \\tilde P_{g,k}
+        = \\frac{P_{g,k} + \\varepsilon}
+                {\\exp\\!\\bigl(\\tfrac{1}{K}
+                        \\sum_{k'=1}^{K}\\log(P_{g,k'} + \\varepsilon)
+                  \\bigr)},
+
+    i.e., dividing each gene's spectrum by its own cross-bin geometric
+    mean — a per-gene companion to :func:`normalize_background`'s
+    per-bin cross-gene operation, distinct from
+    :func:`normalize_shape`'s arithmetic-mean / sum-1 normalisation.
+
+    Companion functions:
+
+    - :func:`normalize_background` removes per-sample multiplicative
+      gain via cross-gene geometric-mean centring in log-space
+      (perpendicular axis to this function).
+    - :func:`normalize_shape` removes per-(sample, gene) amplitude
+      by L1-normalising along the frequency axis.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> rng  = np.random.default_rng(0)
+    >>> spec = rng.lognormal(size=(20, 8))      # (G, K)
+    >>> cov  = rng.lognormal(size=(2, 8))       # (n_cov, K)
+    >>> resid = normalize_covariates(spec, cov)
+    >>> resid.shape
+    (20, 8)
+    >>> bool((resid > 0).all())     # log-space output is strictly positive
+    True
     """
-    if gene_spectra.shape[-1] != covariate_spectra.shape[-1]:
+    if spectra.shape[-1] != covariate_spectra.shape[-1]:
         raise ValueError(
-            f"Last axis must match: gene_spectra has K={gene_spectra.shape[-1]}, "
+            f"Last axis must match: spectra has K={spectra.shape[-1]}, "
             f"covariate_spectra has K={covariate_spectra.shape[-1]}."
         )
-    K = gene_spectra.shape[-1]
+    K = spectra.shape[-1]
+    log_spec = np.log(spectra + eps)  # (G, K)
+    log_cov = np.log(covariate_spectra + eps)  # (n_cov, K)
     # Design matrix shape (K, n_covariates [+1]).
-    X = covariate_spectra.T
+    X = log_cov.T
     if fit_intercept:
         X = np.hstack([np.ones((K, 1)), X])
-    # Solve least-squares: P_g.T = X @ beta_g -> beta_g = pinv(X) @ P_g.T per gene.
-    # Closed form via pseudo-inverse (covariates K is small).
+    # Solve OLS in log-space:  log P_g.T = X @ beta_g  →  beta_g = X^+ @ log P_g.T.
+    # Closed form via pseudo-inverse (n_cov + 1 columns, small).
     pinv = np.linalg.pinv(X)
-    fitted = (X @ pinv @ gene_spectra.T).T  # (n_genes, K)
-    return gene_spectra - fitted
+    fitted = (X @ pinv @ log_spec.T).T  # (G, K) in log-space
+    return np.exp(log_spec - fitted)
 
 
-def shape_normalize(
+def normalize_shape(
     spectra: np.ndarray,
+    *,
     axis: int = -1,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """
-    Normalize spectra to sum-1 along ``axis`` (probability-vector shape).
+    """Project each spectrum onto the probability simplex along ``axis``.
 
-    Divides each slice along ``axis`` by its own L1 norm so the resulting
-    slice is a proper probability distribution over frequency bins:
-    ``out = spectra / spectra.sum(axis)``. Rows that differ only by a
-    positive scalar (the fingerprint of a gene expressed in one group and
-    absent in another) become identical — only the **shape** of the
-    power-vs-frequency curve survives.
-
-    This is the natural companion to :func:`normalize_by_background`:
-    background normalization cancels per-sample gain across genes;
-    :func:`shape_normalize` cancels per-(sample, gene) magnitude across
-    frequencies. Composed, they leave a pure, unit-sum radial pattern
-    signature that is directly comparable as a distribution (so e.g.
-    Jensen-Shannon / total-variation distances are well-defined).
+    Each fibre along ``axis`` is divided by its L1 norm, so the result
+    is a proper probability distribution over the entries along that
+    axis. Two fibres that differ only by a positive scalar produce
+    identical outputs — only the **shape** of the power-vs-frequency
+    curve survives, the overall scale is removed.
 
     Parameters
     ----------
     spectra : np.ndarray
-        Non-negative radial spectra. Any leading dimensions are preserved;
-        normalization acts along ``axis`` only.
+        Non-negative spectra :math:`P`. Any leading dimensions are
+        preserved; normalisation acts along ``axis`` only.
     axis : int, default -1
-        Axis along which to enforce the sum-1 constraint (typically the K /
+        Axis to L1-normalise along (typically the trailing
         frequency-bin axis).
     eps : float, default 1e-12
-        Floor added to the denominator to avoid division-by-zero when an
-        entire slice is numerically zero.
+        Floor :math:`\\varepsilon` on the per-fibre sum to avoid
+        division by zero.
 
     Returns
     -------
     np.ndarray
-        Shape-normalized spectra, same shape as the input, summing to 1 along
-        ``axis``.
+        Shape-normalized spectra :math:`\\tilde P`, same shape as
+        ``spectra``, summing to 1 along ``axis``. Never mutates the
+        input.
+
+    Notes
+    -----
+    Let :math:`P` denote the input spectrum with :math:`K` entries
+    along ``axis`` and :math:`\\varepsilon` the ``eps`` floor. The
+    output is the per-fibre L1 quotient
+
+    .. math::
+
+        \\tilde P_{\\ldots,k}
+        = \\frac{P_{\\ldots,k}}
+                {\\sum_{k'=1}^{K} P_{\\ldots,k'} + \\varepsilon},
+
+    so :math:`\\sum_{k} \\tilde P_{\\ldots,k} = 1` for every
+    leading-index combination (modulo the :math:`\\varepsilon` floor;
+    fibres whose total sum is below :math:`\\varepsilon` are
+    effectively returned unchanged because the numerator dominates
+    the floor).
+
+    Equivalently, in log-space this is per-fibre log-sum centring,
+
+    .. math::
+
+        \\log \\tilde P_{\\ldots,k}
+        = \\log P_{\\ldots,k}
+          - \\log\\!\\Bigl( \\textstyle\\sum_{k'=1}^{K}
+            P_{\\ldots,k'} + \\varepsilon \\Bigr).
+
+    After this transform every fibre is a probability vector over
+    frequency bins, so distances such as Jensen-Shannon and
+    total-variation are well-defined between fibres.
+
+    Used internally by the spectrum comparison functions
+    (:func:`compare_two_groups`, :func:`compare_two_groups_masked`,
+    :func:`compare_glm`) when their ``normalize_shape=True``
+    keyword argument is set — the differential-frequency test then
+    fires only on shape redistribution across radial bins, not on
+    overall amplitude changes.
+
+    Companion functions:
+
+    - :func:`normalize_background` removes per-sample multiplicative
+      gain via cross-gene geometric-mean centring in log-space.
+    - :func:`normalize_covariates` removes per-bin bias linear in
+      user-supplied covariate spectra.
 
     Examples
     --------
     >>> import numpy as np
     >>> x = np.array([[1.0, 2.0, 4.0], [10.0, 20.0, 40.0]])
-    >>> out = shape_normalize(x, axis=-1)
-    >>> np.allclose(out.sum(axis=-1), 1.0)
+    >>> P_tilde = normalize_shape(x, axis=-1)
+    >>> bool(np.allclose(P_tilde.sum(axis=-1), 1.0))
     True
-    >>> np.allclose(out[0], out[1])  # only the shape survives
+    >>> bool(np.allclose(P_tilde[0], P_tilde[1]))  # only the shape survives
     True
     """
     total = spectra.sum(axis=axis, keepdims=True)
     return spectra / (total + eps)
+
+
+# Internal helper: applied inside the comparison functions when their
+# ``normalize_shape: bool`` kwarg is True. Exists only to bridge the
+# kwarg-vs-function name overlap inside the function body.
+def _normalize_shape_apply(spectra: np.ndarray) -> np.ndarray:
+    return normalize_shape(spectra, axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -891,7 +1128,7 @@ def _welch_p_two_sided(group_a: np.ndarray, group_b: np.ndarray) -> tuple[np.nda
 
 def _cauchy_combine(pvals: np.ndarray, axis: int = -1) -> np.ndarray:
     """
-    Cauchy combination test (Liu & Xie 2020).
+    Cauchy combination test.
 
     For p-values :math:`p_1, \\dots, p_K`, forms
     :math:`T = \\frac{1}{K}\\sum_k \\tan(\\pi\\,(0.5 - p_k))` and returns
@@ -924,7 +1161,7 @@ _STAT_FNS = {
     "log_l2": _stat_log_l2,
 }
 
-# `cauchy_welch` lives outside _STAT_FNS because it returns a ``(n_genes, K)``
+# `welch_t_cauchy` lives outside _STAT_FNS because it returns a ``(n_genes, K)``
 # per-bin array (not a per-gene scalar) and needs a bespoke runner that turns
 # per-bin analytic Welch p-values into a Cauchy-combined gene-level p-value.
 
@@ -1060,7 +1297,7 @@ def _run_statistic_with_perm(
     return observed, null
 
 
-def _run_cauchy_welch_analytic(
+def _run_welch_t_cauchy_analytic(
     spectra: np.ndarray,
     groups: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1069,8 +1306,8 @@ def _run_cauchy_welch_analytic(
     Both the per-bin significance and the gene-level combination are
     **analytic**: per-bin p-values come from the Welch t-distribution (not
     a permutation null) and the gene-level p comes from the Cauchy
-    combination (Liu & Xie 2020), which is valid under arbitrary
-    dependence between bins. This is what gives the Cauchy-Welch test
+    combination, which is valid under arbitrary dependence between
+    bins. This is what gives the Cauchy-Welch test
     real power versus the other (permutation-based) statistics in this
     module — permutation p-values are floored at ``1/(n_perm + 1)`` per
     bin, which would cap the combined gene-level p at ~1e-3 for typical
@@ -1100,18 +1337,13 @@ def _run_cauchy_welch_analytic(
 # ---------------------------------------------------------------------------
 
 _NULL_OPTIONS = ("permutation", "wald")
-_NULL_ALIASES = {"liu": "wald"}
 
 
 def _resolve_null(null: str) -> str:
-    """Map ``null`` to the canonical token, handling aliases. Raises on unknown."""
-    canon = _NULL_ALIASES.get(null, null)
-    if canon not in _NULL_OPTIONS:
-        raise ValueError(
-            f"Unknown null='{null}'. Options: {sorted(_NULL_OPTIONS)} "
-            f"(aliases: {sorted(_NULL_ALIASES)})."
-        )
-    return canon
+    """Validate ``null`` against the supported set. Raises on unknown."""
+    if null not in _NULL_OPTIONS:
+        raise ValueError(f"Unknown null='{null}'. Options: {sorted(_NULL_OPTIONS)}.")
+    return null
 
 
 # Minimum residual df below which we issue a calibration warning for the
@@ -1134,7 +1366,7 @@ def _maybe_warn_small_df_wald(df_resid: int) -> None:
             f"log_l2 + null='wald' at residual df={df_resid}: "
             f"σ̂² estimator has ~{rel_noise_pct:.0f}% relative noise, "
             f"so the Wald null may be anti-conservative on a per-test basis. "
-            f"For n_a + n_b ≤ 4, prefer statistic='cauchy_welch' for stricter "
+            f"For n_a + n_b ≤ 4, prefer statistic='welch_t_cauchy' for stricter "
             f"calibration (at the cost of some sensitivity).",
             UserWarning,
             stacklevel=3,
@@ -1472,12 +1704,13 @@ def compare_two_groups(  # noqa: C901
     groups: np.ndarray,
     gene_names: Sequence[str] | None = None,
     statistic: str = "log_l2",
-    null: str = "permutation",
+    null: str = "wald",
     n_perm: int = 1000,
     random_state: int | None = None,
     n_jobs: int = 1,
     freq_weights: np.ndarray | None = None,
     n_perm_max: int = 10000,
+    normalize_shape: bool = False,
 ) -> pd.DataFrame:
     """
     Test, for every gene, whether its spatial-pattern spectrum differs between two groups.
@@ -1491,7 +1724,7 @@ def compare_two_groups(  # noqa: C901
         (mapped internally to 0/1 in sorted order).
     gene_names : sequence of str, optional
         Names for the gene axis. If None, integer indices are used.
-    statistic : {'log_l2', 'cauchy_welch'}, default 'log_l2'
+    statistic : {'log_l2', 'welch_t_cauchy'}, default 'log_l2'
         Test statistic:
 
         - ``'log_l2'`` — (optionally weighted) L2 distance between mean
@@ -1500,23 +1733,24 @@ def compare_two_groups(  # noqa: C901
           the small-n permutation BH-floor; ``null='permutation'`` (default)
           falls back to label permutations with exact enumeration when
           ``C(n, n_a) ≤ n_perm_max``.
-        - ``'cauchy_welch'`` — per-bin Welch two-sided t-test with
-          **analytic** (t-distribution) p-values combined across bins via
-          Cauchy's combination (Liu & Xie 2020). Analytic is the whole
-          point: permutation p-values would floor at ``1/(n_perm + 1)``
-          per bin, which would also floor the gene-level combined
-          p-value and destroy BH-FDR power across thousands of genes.
-          Yields an extra ``P_value_per_bin`` column.
-    null : {'permutation', 'wald', 'liu'}, default 'permutation'
-        Null-distribution method. ``'permutation'`` uses the empirical
-        permutation null (default; back-compat). ``'wald'`` (alias
-        ``'liu'``) uses an analytic Wald-type test for the L2 quadratic
+        - ``'welch_t_cauchy'`` — per-bin Welch two-sided t-test with
+          **analytic** (t-distribution) p-values combined across bins
+          via Cauchy combination. Analytic is the whole point:
+          permutation p-values would floor at ``1/(n_perm + 1)`` per
+          bin, which would also floor the gene-level combined p-value
+          and destroy BH-FDR power across thousands of genes. Yields
+          an extra ``P_value_per_bin`` column.
+    null : {'wald', 'permutation'}, default 'wald'
+        Null-distribution method. ``'wald'`` (the default) uses an analytic Wald-type test for the L2 quadratic
         form: under H₀ the statistic ``T² = D'WD`` is distributed as a
         weighted sum of χ²₁ variables whose tail is integrated via Liu's
-        approximation (see :func:`quadsv.statistics.liu_sf`). Currently
-        ``null='wald'`` is only supported for ``statistic='log_l2'``;
-        raises ``ValueError`` otherwise. ``cauchy_welch`` ignores this
-        argument.
+        approximation (see :func:`quadsv.statistics.liu_sf`).
+        ``'permutation'`` uses the empirical sample-label permutation
+        null and is the only option that respects the
+        ``n_perm`` / ``random_state`` / ``n_perm_max`` arguments.
+        Currently ``null='wald'`` is only supported for
+        ``statistic='log_l2'``; raises ``ValueError`` otherwise.
+        ``welch_t_cauchy`` ignores this argument.
 
         **Sample-size guidance** (residual df = ``n_a + n_b - 2``):
 
@@ -1525,15 +1759,15 @@ def compare_two_groups(  # noqa: C901
         - df ≥ 3 (n_a + n_b ≥ 5): ``'wald'`` acceptable.
         - df < 3 (n_a + n_b ≤ 4): ``'wald'`` emits a ``UserWarning``;
           σ̂² has ≥ 67% relative noise so per-test calibration may be
-          anti-conservative. Prefer ``statistic='cauchy_welch'``
+          anti-conservative. Prefer ``statistic='welch_t_cauchy'``
           (per-bin Welch t with proper df-corrected denominator) or
           stay with ``null='permutation'`` if the cohort allows
           enough exact relabellings.
     n_perm : int, default 1000
         Number of label permutations for the null distribution. **Ignored**
-        when ``statistic='cauchy_welch'`` or ``null='wald'``.
+        when ``statistic='welch_t_cauchy'`` or ``null='wald'``.
     random_state : int, optional
-        Seed for the permutation RNG (ignored for ``'cauchy_welch'``).
+        Seed for the permutation RNG (ignored for ``'welch_t_cauchy'``).
     n_jobs : int, default 1
         Reserved for future parallelism over genes; currently unused (the per-stat
         implementations are already vectorized over genes).
@@ -1552,13 +1786,21 @@ def compare_two_groups(  # noqa: C901
         strictly more accurate than sampling in the small-sample regime
         (e.g. 6-vs-6 → 924 partitions, 5-vs-5 → 252). Above the threshold
         the test falls back to ``n_perm`` random shuffles.
+    normalize_shape : bool, default False
+        If True, divide each per-(sample, gene) spectrum by its sum along
+        the trailing (frequency) axis before the statistic is computed
+        (i.e., apply :func:`normalize_shape` to ``spectra`` first). Use to
+        isolate shape-only / frequency-redistribution signals — the test
+        then only fires when the *relative* distribution of power across
+        radial frequencies varies with the contrast, independent of
+        overall amplitude. Works with every valid ``statistic=`` value.
 
     Returns
     -------
     pd.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value``, ``P_adj``
         (BH-FDR), sorted by descending statistic. When
-        ``statistic='cauchy_welch'``, the frame also carries a
+        ``statistic='welch_t_cauchy'``, the frame also carries a
         ``P_value_per_bin`` object column — each entry is an
         ``(K,)`` numpy array of per-bin permutation p-values for that gene.
 
@@ -1568,11 +1810,14 @@ def compare_two_groups(  # noqa: C901
         If ``statistic`` is unknown, ``groups`` does not contain exactly two values,
         or shapes are inconsistent.
     """
-    _available = set(_STAT_FNS) | {"cauchy_welch"}
+    _available = set(_STAT_FNS) | {"welch_t_cauchy"}
     if statistic not in _available:
         raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_available)}.")
     null_canon = _resolve_null(null)
-    if null_canon == "wald" and statistic != "log_l2":
+    # ``welch_t_cauchy`` carries its own analytic null; the ``null`` argument
+    # is documented as ignored. Don't reject ``null='wald'`` (the package
+    # default) for that statistic — just no-op.
+    if null_canon == "wald" and statistic not in ("log_l2", "welch_t_cauchy"):
         raise ValueError(
             f"null='wald' is only supported with statistic='log_l2', "
             f"got statistic='{statistic}'."
@@ -1588,12 +1833,15 @@ def compare_two_groups(  # noqa: C901
         raise ValueError(f"groups must contain exactly two distinct values, got {uniq}.")
     g_int = (groups == uniq[1]).astype(int)  # 0 = first label sorted, 1 = second
 
+    if normalize_shape:
+        spectra = _normalize_shape_apply(spectra)
+
     rng = np.random.default_rng(random_state)
 
-    if statistic == "cauchy_welch":
+    if statistic == "welch_t_cauchy":
         if freq_weights is not None:
-            logger.debug("freq_weights is ignored by statistic='cauchy_welch'.")
-        observed, combined_p, per_bin_p = _run_cauchy_welch_analytic(spectra, g_int)
+            logger.debug("freq_weights is ignored by statistic='welch_t_cauchy'.")
+        observed, combined_p, per_bin_p = _run_welch_t_cauchy_analytic(spectra, g_int)
         summary_stat = observed.max(axis=-1)  # reportable scalar per gene
         if gene_names is None:
             gene_names = [str(i) for i in range(n_genes)]
@@ -1657,12 +1905,13 @@ def compare_two_groups_masked(  # noqa: C901
     presence: np.ndarray,
     gene_names: Sequence[str] | None = None,
     statistic: str = "log_l2",
-    null: str = "permutation",
+    null: str = "wald",
     n_perm: int = 1000,
     random_state: int | None = None,
     min_samples_per_group: int = 2,
     freq_weights: np.ndarray | None = None,
     n_perm_max: int = 10000,
+    normalize_shape: bool = False,
 ) -> pd.DataFrame:
     """
     Per-gene two-group pattern test with **incomplete data** across samples.
@@ -1683,24 +1932,24 @@ def compare_two_groups_masked(  # noqa: C901
         ``(n_samples, n_genes)`` boolean mask. ``True`` = gene is observed
         in that sample (contributes); ``False`` = gene is absent (ignored).
     gene_names : sequence of str, optional
-    statistic : {'log_l2', 'cauchy_welch'}, default 'log_l2'
-    null : {'permutation', 'wald', 'liu'}, default 'permutation'
-        Null-distribution method. ``'permutation'`` (default) per-gene
-        permutation test, exact-enumerated when ``C(n_g, n_a_g) ≤ n_perm_max``
-        (most genes at small samples).
-
-        ``'wald'`` (alias ``'liu'``) uses an analytic Wald-type test
-        adapted for the masked case via a **mask-aware pooled-Σ**
-        estimator: a single global ``(K, K)`` Σ is accumulated across
-        every gene's present (sample, gene) cells (each gene contributes
-        ``n_g - 2`` residual degrees of freedom), and per-gene
-        noncentrality scaling ``v_{c,g} = 1/n_a_g + 1/n_b_g`` adjusts
-        the eigenvalues for that gene's specific cohort. Cross-bin
-        correlation structure is taken to be homogeneous across genes
-        (the same A3 assumption used in :func:`compare_two_groups` with
-        Wald). Empirical calibration on synthetic missingness up to 50%
+    statistic : {'log_l2', 'welch_t_cauchy'}, default 'log_l2'
+    null : {'wald', 'permutation'}, default 'wald'
+        Null-distribution method. ``'wald'`` (the default) uses an analytic Wald-type test adapted for the masked
+        case via a **mask-aware pooled-Σ** estimator: a single global
+        ``(K, K)`` Σ is accumulated across every gene's present
+        (sample, gene) cells (each gene contributes ``n_g - 2``
+        residual degrees of freedom), and per-gene noncentrality
+        scaling ``v_{c,g} = 1/n_a_g + 1/n_b_g`` adjusts the eigenvalues
+        for that gene's specific cohort. Cross-bin correlation
+        structure is taken to be homogeneous across genes (the same
+        A3 assumption used in :func:`compare_two_groups` with Wald).
+        Empirical calibration on synthetic missingness up to 50%
         matches the unmasked Wald path. Currently supported only with
         ``statistic='log_l2'``.
+
+        ``'permutation'`` runs a per-gene permutation test,
+        exact-enumerated when ``C(n_g, n_a_g) ≤ n_perm_max`` (most
+        genes at small samples).
     n_perm : int, default 1000
     random_state : int, optional
     min_samples_per_group : int, default 2
@@ -1708,20 +1957,29 @@ def compare_two_groups_masked(  # noqa: C901
     freq_weights : np.ndarray, optional
         Only consumed by ``statistic='log_l2'`` (same semantics as
         :func:`compare_two_groups`).
+    normalize_shape : bool, default False
+        If True, divide each per-(sample, gene) spectrum by its sum along
+        the trailing (frequency) axis before the statistic is computed
+        (same semantics as in :func:`compare_two_groups`). Use to isolate
+        shape-only / frequency-redistribution signals. Works with every
+        valid ``statistic=`` value.
 
     Returns
     -------
     pd.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value``, ``P_adj``,
-        ``n_obs_A``, ``n_obs_B``. For ``'cauchy_welch'`` a
+        ``n_obs_A``, ``n_obs_B``. For ``'welch_t_cauchy'`` a
         ``P_value_per_bin`` column is also included (``None`` for skipped
         genes). BH-FDR is computed only over tested genes.
     """
-    _available = set(_STAT_FNS) | {"cauchy_welch"}
+    _available = set(_STAT_FNS) | {"welch_t_cauchy"}
     if statistic not in _available:
         raise ValueError(f"Unknown statistic '{statistic}'. Options: {sorted(_available)}.")
     null_canon = _resolve_null(null)
-    if null_canon == "wald" and statistic != "log_l2":
+    # ``welch_t_cauchy`` carries its own analytic null; the ``null`` argument
+    # is documented as ignored. Don't reject ``null='wald'`` (the package
+    # default) for that statistic — just no-op.
+    if null_canon == "wald" and statistic not in ("log_l2", "welch_t_cauchy"):
         raise ValueError(
             f"null='wald' is only supported with statistic='log_l2', "
             f"got statistic='{statistic}'."
@@ -1739,14 +1997,19 @@ def compare_two_groups_masked(  # noqa: C901
     if uniq.size != 2:
         raise ValueError("groups must contain exactly two distinct values.")
     g_int = (groups == uniq[1]).astype(int)
+
+    if normalize_shape:
+        spectra = _normalize_shape_apply(spectra)
+
     rng = np.random.default_rng(random_state)
 
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]
 
     # Wald masked path: precompute global pooled Σ + eigvalsh; then per-gene
-    # T², v_c-scaled λ, and Liu-tail p-value.
-    if null_canon == "wald":
+    # T², v_c-scaled λ, and Liu-tail p-value. ``welch_t_cauchy`` carries its
+    # own analytic null and falls through to the per-gene branch below.
+    if null_canon == "wald" and statistic == "log_l2":
         Sigma_ell, total_df, _eligible = _pooled_full_within_group_sigma_masked(
             spectra, g_int, presence, min_samples_per_group=min_samples_per_group
         )
@@ -1799,7 +2062,7 @@ def compare_two_groups_masked(  # noqa: C901
             drop=True
         )
 
-    # Permutation / cauchy_welch masked path (per-gene loop).
+    # Permutation / welch_t_cauchy masked path (per-gene loop).
     rows: list[dict[str, Any]] = []
     for g in range(n_genes):
         mask = presence[:, g]
@@ -1813,7 +2076,7 @@ def compare_two_groups_masked(  # noqa: C901
             "Statistic": np.nan,
             "P_value": np.nan,
         }
-        if statistic == "cauchy_welch":
+        if statistic == "welch_t_cauchy":
             row["P_value_per_bin"] = None
 
         if n_a < min_samples_per_group or n_b < min_samples_per_group:
@@ -1823,8 +2086,8 @@ def compare_two_groups_masked(  # noqa: C901
         sub = spectra[mask, g : g + 1, :]  # (n_obs, 1, K)
         sub_groups = g_int[mask]
 
-        if statistic == "cauchy_welch":
-            observed, combined_p, per_bin_p = _run_cauchy_welch_analytic(sub, sub_groups)
+        if statistic == "welch_t_cauchy":
+            observed, combined_p, per_bin_p = _run_welch_t_cauchy_analytic(sub, sub_groups)
             row["Statistic"] = float(observed.max())
             row["P_value"] = float(combined_p[0])
             row["P_value_per_bin"] = per_bin_p[0]
@@ -1858,6 +2121,7 @@ def compare_two_groups_scalar(
     values: np.ndarray,
     groups: np.ndarray,
     gene_names: Sequence[str] | None = None,
+    null: str = "wald",
     n_perm: int = 1000,
     random_state: int | None = None,
     n_perm_max: int = 10000,
@@ -1871,6 +2135,20 @@ def compare_two_groups_scalar(
     DC and AC are orthogonal by construction (the FFT pipeline always mean-
     centres each gene's grid before computing power).
 
+    Two null distributions are supported, chosen via ``null``:
+
+    - ``null='wald'`` (default) — analytic two-sided Welch t-test
+      p-value from the Welch-Satterthwaite t-distribution. No
+      permutation BH-floor; the natural counterpart to
+      :func:`compare_two_groups`'s ``null='wald'`` analytic path on the
+      spectral side. The Welch t is itself a Wald-type statistic
+      (point estimate / estimated SE under H₁), hence the shared
+      kwarg name across the API surface.
+    - ``null='permutation'`` — exact / approximate permutation null on
+      ``abs(Welch t)``. More conservative at small ``n``; produces
+      identical p-values as a Mann-Whitney-style rank test up to ties
+      when the permutation pool is exhausted.
+
     Parameters
     ----------
     values : np.ndarray
@@ -1880,10 +2158,17 @@ def compare_two_groups_scalar(
         Group labels of length ``n_samples`` with exactly two distinct values.
     gene_names : sequence of str, optional
         Gene names. Integer indices if None.
+    null : {'wald', 'permutation'}, default 'wald'
+        Null-distribution method. ``'wald'`` returns analytic
+        Welch-Satterthwaite t-distribution p-values; ``'permutation'``
+        runs a label-shuffle null on ``abs(Welch t)``.
     n_perm : int, default 1000
-        Number of sample-label permutations for the null.
+        Number of sample-label permutations for ``null='permutation'``.
+        Ignored when ``null='wald'``.
     random_state : int, optional
-        Seed for the permutation RNG.
+        Seed for the permutation RNG. Ignored when ``null='wald'``.
+    n_perm_max : int, default 10000
+        Cap on enumerated unique permutations.
 
     Returns
     -------
@@ -1895,11 +2180,13 @@ def compare_two_groups_scalar(
     Raises
     ------
     ValueError
-        If shapes are inconsistent or ``groups`` does not contain exactly two
-        distinct values.
+        If shapes are inconsistent, ``groups`` does not contain exactly two
+        distinct values, or ``null`` is unknown.
     """
     if values.ndim != 2:
         raise ValueError(f"values must be 2D (n_samples, n_genes), got {values.shape}.")
+    if null not in ("wald", "permutation"):
+        raise ValueError(f"null must be 'wald' or 'permutation', got {null!r}.")
     n_samples, n_genes = values.shape
     groups = np.asarray(groups)
     if groups.shape != (n_samples,):
@@ -1909,21 +2196,28 @@ def compare_two_groups_scalar(
         raise ValueError(f"groups must contain exactly two distinct values, got {uniq}.")
     g_int = (groups == uniq[1]).astype(int)
 
-    rng = np.random.default_rng(random_state)
-    perm_labels, is_exact = _exchangeable_group_labels(g_int, n_perm, rng, n_perm_max=n_perm_max)
-    if is_exact:
-        logger.info(
-            "Exact permutation test (DE): enumerated %d distinct relabellings.",
-            perm_labels.shape[0],
-        )
-    observed = np.abs(_welch_t(values[g_int == 0], values[g_int == 1]))
-    mean_diff = values[g_int == 0].mean(axis=0) - values[g_int == 1].mean(axis=0)
+    a_vals = values[g_int == 0]
+    b_vals = values[g_int == 1]
+    mean_diff = a_vals.mean(axis=0) - b_vals.mean(axis=0)
 
-    null = np.empty((perm_labels.shape[0], n_genes))
-    for p in range(perm_labels.shape[0]):
-        a = perm_labels[p] == 0
-        null[p] = np.abs(_welch_t(values[a], values[~a]))
-    pvals = _permutation_pvalue(observed, null)
+    if null == "wald":
+        observed, pvals = _welch_p_two_sided(a_vals, b_vals)
+    else:
+        rng = np.random.default_rng(random_state)
+        perm_labels, is_exact = _exchangeable_group_labels(
+            g_int, n_perm, rng, n_perm_max=n_perm_max
+        )
+        if is_exact:
+            logger.info(
+                "Exact permutation test (DE): enumerated %d distinct relabellings.",
+                perm_labels.shape[0],
+            )
+        observed = np.abs(_welch_t(a_vals, b_vals))
+        null_dist = np.empty((perm_labels.shape[0], n_genes))
+        for p in range(perm_labels.shape[0]):
+            a_mask = perm_labels[p] == 0
+            null_dist[p] = np.abs(_welch_t(values[a_mask], values[~a_mask]))
+        pvals = _permutation_pvalue(observed, null_dist)
 
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]
@@ -1939,7 +2233,7 @@ def compare_two_groups_scalar(
     return df.sort_values("Statistic", ascending=False).reset_index(drop=True)
 
 
-def compare_designs(
+def compare_glm(
     spectra: np.ndarray,
     design: pd.DataFrame | np.ndarray,
     contrast: str | dict[str, float] | np.ndarray,
@@ -1947,6 +2241,7 @@ def compare_designs(
     statistic: str = "log_l2",
     null: str = "wald",
     freq_weights: np.ndarray | None = None,
+    normalize_shape: bool = False,
 ) -> pd.DataFrame:
     """Generalized two-group / continuous-covariate test via a design matrix.
 
@@ -1977,14 +2272,22 @@ def compare_designs(
     gene_names : sequence of str, optional
     statistic : {'log_l2'}, default 'log_l2'
         Currently only ``log_l2`` is supported in the GLM path.
-    null : {'wald', 'liu'}, default 'wald'
+    null : {'wald'}, default 'wald'
         Only the analytic Wald-type null is supported here. Permutation
         nulls for continuous covariates are intentionally deferred (naive
         row permutation breaks the X-y joint distribution under nuisance
         covariates; correct alternatives like Freedman–Lane add complexity
         without a clear payoff over the analytic Wald). Pass
-        ``null="permutation"`` only via :func:`compare_two_groups` with
-        ``groups=`` for the binary case.
+        ``null="permutation"`` only via :func:`compare_two_groups` (binary
+        labels) for permutation-based tests.
+    normalize_shape : bool, default False
+        If True, divide each per-(sample, gene) spectrum by its sum along
+        the trailing (frequency) axis before the GLM is fit (same
+        semantics as in :func:`compare_two_groups`). Use to isolate
+        shape-only / frequency-redistribution signals along the design
+        contrast — the test then only fires when the *relative*
+        distribution of power across radial frequencies varies with the
+        contrast, independent of overall amplitude.
 
     Returns
     -------
@@ -2002,14 +2305,14 @@ def compare_designs(
     null_canon = _resolve_null(null)
     if null_canon != "wald":
         raise NotImplementedError(
-            "compare_designs currently only supports null='wald' (alias 'liu'). "
-            "Permutation null for the GLM path is intentionally deferred — "
-            "use the binary groups= API on compare_two_groups for "
-            "permutation-based tests."
+            "compare_glm currently only supports null='wald'. Permutation "
+            "null for the GLM path is intentionally deferred — use "
+            "compare_two_groups (1-D binary labels) for permutation-based "
+            "tests."
         )
     if statistic != "log_l2":
         raise ValueError(
-            f"compare_designs currently only supports statistic='log_l2', " f"got '{statistic}'."
+            f"compare_glm currently only supports statistic='log_l2', " f"got '{statistic}'."
         )
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, K), got {spectra.shape}.")
@@ -2017,6 +2320,9 @@ def compare_designs(
 
     X, design_columns = _build_design_matrix(design, n_samples)
     contrast_vec = _resolve_contrast(contrast, design_columns)
+
+    if normalize_shape:
+        spectra = _normalize_shape_apply(spectra)
 
     observed, pvals = _run_log_l2_glm_wald(spectra, X, contrast_vec, freq_weights)
 

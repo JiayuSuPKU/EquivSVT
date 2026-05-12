@@ -6,8 +6,11 @@ set of healthy controls and a set of cancer sections) and want to
 ask which genes show the biggest spatial-pattern difference between
 the groups. The :class:`~quadsv.ComparatorIrregular` and
 :class:`~quadsv.ComparatorGrid` classes give you a frequency-domain
-pipeline that does this without spatial registration, with a
-permutation-based p-value per gene.
+pipeline that does this without spatial registration. The default
+null is an analytic Liu-approximation Wald test (``null="wald"``);
+a label-permutation null is available on the binary path with
+``null="permutation"``. The GLM (multi-column / continuous design)
+path is Wald-only.
 
 .. note::
 
@@ -32,16 +35,20 @@ Five-step pipeline
 
 :class:`~quadsv.ComparatorIrregular` chains five stages:
 
-1. Per-sample 2-D power spectra.
+1. Per-sample 2-D power spectra (``compute_spectra``).
 2. Reduction to a low-dimensional feature vector. The default is
    radial 1-D bins.
 3. Background normalisation that cancels per-slide differences in
-   gain and sensitivity (geometric-mean spectrum across all genes
-   per sample).
-4. Optional residualisation against covariate spectra (cell-type
-   maps, tissue-domain indicators, ...).
-5. Per-gene two-group test with a sample-label permutation null and
-   BH-FDR correction.
+   gain and sensitivity (``normalize_background`` — geometric-mean
+   spectrum across all genes per sample).
+4. Optional residualisation against covariate spectra
+   (``normalize_covariates``: cell-type maps, tissue-domain
+   indicators, ...).
+5. Per-gene two-group / GLM-contrast test
+   (``test_diff_freq(design, ...)``) with BH-FDR correction. The
+   ``design`` argument is supplied at test time, not at construction,
+   so a single fitted comparator can serve any number of unrelated
+   comparisons on the same spectra.
 
 .. dropdown:: DC vs AC: separating expression level from pattern shape
 
@@ -51,13 +58,14 @@ Five-step pipeline
 
    The **DC scalar** is the per-sample grid mean, i.e. total
    normalised expression. It is tested across groups with
-   :meth:`~quadsv.ComparatorIrregular.test_expression`, which runs
-   a Welch t-test under a permutation null with BH-FDR. This is a
-   spatially-aware differential-expression test.
+   :meth:`~quadsv.ComparatorIrregular.test_diff_expr`, which runs
+   an analytic Welch-Satterthwaite t-test by default
+   (``null="wald"``; ``null="permutation"`` is also available) with
+   BH-FDR. This is a spatially-aware differential-expression test.
 
    The **AC spectrum** is the pattern shape, with DC exactly zero.
    It is tested with
-   :meth:`~quadsv.ComparatorIrregular.test_pattern` using one of
+   :meth:`~quadsv.ComparatorIrregular.test_diff_freq` using one of
    the two statistics listed below.
 
    The two tests carry complementary information. A gene may be
@@ -77,17 +85,20 @@ common dispatch, so they are directly comparable:
      - What it measures
    * - ``log_l2`` (default)
      - Quadratic form ``T² = D'WD`` on log-spectra differences.
-       Supports both ``null="permutation"`` and analytic
-       ``null="wald"`` (Liu mixture-χ² tail). The Wald null bypasses
-       the BH-FDR floor that the exact permutation test hits at
-       small per-arm n.
-   * - ``cauchy_welch``
+       Supports analytic ``null="wald"`` (Liu mixture-χ² tail; the
+       default on :meth:`~quadsv.ComparatorIrregular.test_diff_freq`)
+       and ``null="permutation"`` on the binary path. The Wald null
+       bypasses the BH-FDR floor that the exact permutation test
+       hits at small per-arm n, and is the only path that works on
+       multi-column / continuous designs.
+   * - ``welch_t_cauchy``
      - Cauchy combination of per-bin Welch t-statistics. Analytic
        null is built in; remains well-calibrated at very small n.
+       Binary path only.
 
 Both run through :func:`quadsv.comparators.multisample.compare_two_groups`
-(or :meth:`quadsv.ComparatorIrregular.test_pattern` for the class API);
-flip ``statistic="log_l2"`` ↔ ``statistic="cauchy_welch"`` to compare on
+(or :meth:`quadsv.ComparatorIrregular.test_diff_freq` for the class API);
+flip ``statistic="log_l2"`` ↔ ``statistic="welch_t_cauchy"`` to compare on
 the same fitted spectra.
 
 
@@ -142,14 +153,17 @@ carries a low-frequency stripe pattern in group 1 only.
        return a
 
    samples = [make_adata(0) for _ in range(4)] + [make_adata(1) for _ in range(4)]
-   groups = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+   design = np.array([0, 0, 0, 0, 1, 1, 1, 1])  # 1-D labels → binary contrast
 
    cmp = (
-       ComparatorIrregular(samples, groups, gene_names)
-       .fit()
+       ComparatorIrregular(samples, gene_names)
+       .compute_spectra()
        .normalize_background()
    )
-   results = cmp.test(statistic="log_l2", n_perm=300, random_state=0)
+   # Default null="wald" → analytic Liu-approximation Wald test.
+   # Add null="permutation", n_perm=300, random_state=0 for the
+   # label-permutation alternative.
+   results = cmp.test_diff_freq(design, statistic="log_l2")
    print(results.head())
 
 The implanted gene ``g0`` ranks first in the resulting table.
@@ -168,17 +182,17 @@ and pass the same bin / table / coord keys you would pass to
    from quadsv import ComparatorGrid
 
    samples_sd = [sd.read_zarr(p) for p in paths_by_group]
+   design = np.array([0] * len(paths_a) + [1] * len(paths_b))
    cmp = ComparatorGrid(
        samples_sd,
-       groups,
        bins="bin_shapes",            # SpatialElement name shared by every sdata
        table_name="counts",          # table inside each sdata
        col_key="array_col",          # obs column with bin-column indices
        row_key="array_row",          # obs column with bin-row indices
        value_key=None,               # None means rasterise expression off .X
        fft_chunk_size=256,           # genes per batched scipy.fft call
-   ).fit().normalize_background()
-   cmp.test(statistic="log_l2", n_perm=300)
+   ).compute_spectra().normalize_background()
+   cmp.test_diff_freq(design, statistic="log_l2")
 
 
 Mixed coordinate units (NUFFT path)
@@ -196,12 +210,12 @@ Mixed coordinate units (NUFFT path)
 
       cmp = ComparatorIrregular(
           samples,
-          groups,
           gene_names=gene_names,
           unit_scales=[1.0, 0.35, 1.0, 0.35],
           spacing=(50.0, 50.0),       # common physical spacing, μm
           n_radial_bins=30,
-      ).fit().normalize_background()
+      ).compute_spectra().normalize_background()
+      cmp.test_diff_freq(design, statistic="log_l2")
 
    If ``grid_shape`` and ``spacing`` are left unset, each sample's
    k-grid is auto-inferred from its coords via
@@ -230,9 +244,29 @@ limit).
 Choosing covariate maps for residualisation
 -------------------------------------------
 
-Pass a list of per-sample covariate arrays of shape
-``(n_covariates, ny_s, nx_s)`` to
-:meth:`~quadsv.ComparatorIrregular.residualize`. Useful candidates:
+:meth:`~quadsv.ComparatorIrregular.normalize_covariates` takes one
+of two shapes — a sequence of column-name strings shared across
+samples, or a sequence of per-sample image arrays:
+
+.. code-block:: python
+
+   # 1. Shared column names — interpreted by the subclass.
+   #    ComparatorIrregular: each key is looked up in adata.obs.columns
+   #    first, then adata.var_names — so the same call accepts
+   #    deconvolved cell-type proportion columns *and* per-gene
+   #    expression columns (housekeeping / marker genes) interchangeably.
+   cmp.normalize_covariates(["celltype_astro", "celltype_neuron", "MALAT1"])
+
+   # ComparatorGrid: forward as `value_key=` to spatialdata.rasterize_bins
+   # (works for .obs columns AND var_names in the comparator's table).
+   cmp_g.normalize_covariates(["region_label", "MALAT1"])
+
+   # 2. Pre-rasterized per-sample arrays of shape (n_covariates, ny_s, nx_s).
+   #    Universal: works on either subclass; use when covariates aren't
+   #    already attached to the sample containers.
+   cmp.normalize_covariates(per_sample_arrays)
+
+Useful covariate candidates:
 
 - Cell-type proportion maps from a deconvolution tool such as
   Cell2location, CARD, or RCTD. One channel per cell type.
@@ -254,7 +288,7 @@ See also
   :class:`quadsv.ComparatorGrid` for the class reference.
 - :func:`quadsv.comparators.multisample.compare_two_groups`,
   :func:`quadsv.comparators.multisample.compare_two_groups_masked`,
-  and :func:`quadsv.comparators.multisample.compare_designs` for the
+  and :func:`quadsv.comparators.multisample.compare_glm` for the
   array-level primitives.
 - :func:`quadsv.kernels.fft.power_spectrum_2d` and
   :func:`quadsv.kernels.nufft.power_spectrum_2d_nufft` for the

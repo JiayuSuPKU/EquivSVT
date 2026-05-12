@@ -24,7 +24,6 @@ import spatialdata as sd
 from quadsv.comparators.base import (
     _ComparatorBase,
     _validate_common,
-    _validate_groups_or_design,
 )
 from quadsv.comparators.multisample import compute_sample_spectrum
 
@@ -52,12 +51,6 @@ class ComparatorGrid(_ComparatorBase):
     Parameters
     ----------
     samples : sequence of :class:`spatialdata.SpatialData`
-    groups : np.ndarray, optional
-        Two-label group vector, length ``len(samples)``. Pass exactly one
-        of ``groups`` or ``design``.
-    design : pd.DataFrame or np.ndarray, optional
-        Sample-level design matrix for the GLM Wald test path. See
-        :class:`ComparatorIrregular` for the contrast resolution rules.
     bins : str
         SpatialElement key for the bin shapes in each ``sdata``.
     table_name : str
@@ -78,14 +71,20 @@ class ComparatorGrid(_ComparatorBase):
 
     Other Parameters
     ----------------
-    feature_mode, n_radial_bins, fft_solver, workers, freq_edges, presence_threshold, min_samples_per_group
+    feature_mode, n_radial_bins, fft_solver, workers, freq_edges, presence_threshold
         See :class:`_ComparatorBase`.
+
+    Notes
+    -----
+    The comparator carries no design / contrast state — supply the
+    cross-sample contrast directly to :meth:`test_diff_freq` /
+    :meth:`test_diff_expr`. A single fitted comparator can therefore
+    serve any number of unrelated comparisons on the same spectra.
     """
 
     def __init__(
         self,
         samples: Sequence[Any],
-        groups: np.ndarray | None = None,
         *,
         bins: str,
         table_name: str,
@@ -93,7 +92,6 @@ class ComparatorGrid(_ComparatorBase):
         row_key: str,
         value_key: str | None = None,
         gene_names: Sequence[str] | None = None,
-        design: Any | None = None,
         feature_mode: str = "radial",
         n_radial_bins: int = 30,
         fft_solver: str = "rfft2",
@@ -101,12 +99,9 @@ class ComparatorGrid(_ComparatorBase):
         spacing: tuple[float, float] | None = None,
         freq_edges: np.ndarray | None = None,
         presence_threshold: float = 0.0,
-        min_samples_per_group: int = 2,
         fft_chunk_size: int = 256,
     ) -> None:
-        fft_solver = _validate_common(
-            feature_mode, fft_solver, presence_threshold, min_samples_per_group
-        )
+        fft_solver = _validate_common(feature_mode, fft_solver, presence_threshold)
         samples_list = list(samples)
         if len(samples_list) == 0:
             raise ValueError("samples must be a non-empty list.")
@@ -116,21 +111,18 @@ class ComparatorGrid(_ComparatorBase):
                     f"sample {i} is {type(s).__name__}, expected spatialdata.SpatialData."
                 )
 
-        groups, design = _validate_groups_or_design(groups, design, len(samples_list))
         resolved = _resolve_spatialdata_gene_names(samples_list, gene_names, table_name)
 
         self.samples = samples_list
-        self.groups = groups
-        self.design = design
         self.gene_names = list(resolved)
         self.feature_mode = feature_mode
-        self.n_radial_bins = int(n_radial_bins)
-        self.fft_solver = fft_solver
-        self.workers = workers
         self.freq_edges = None if freq_edges is None else np.asarray(freq_edges, dtype=float)
-        self.presence_threshold = float(presence_threshold)
-        self.min_samples_per_group = int(min_samples_per_group)
-        self.fft_chunk_size = max(1, int(fft_chunk_size))
+        # Private (internal-config) state.
+        self._n_radial_bins = int(n_radial_bins)
+        self._fft_solver = fft_solver
+        self._workers = workers
+        self._presence_threshold = float(presence_threshold)
+        self._fft_chunk_size = max(1, int(fft_chunk_size))
         self._spectrum_fft_solver = fft_solver
 
         self._bins = bins
@@ -139,7 +131,7 @@ class ComparatorGrid(_ComparatorBase):
         self._row_key = row_key
         self._value_key = value_key
 
-        # Grid shape is determined per-sample at fit time by rasterize_bins
+        # Grid shape is determined per-sample inside compute_spectra by rasterize_bins
         # (the raster's .shape[-2:] carries it). Record the placeholder now
         # and fill in during _compute_spectra; spacing is always (1.0, 1.0)
         # because rasterize_bins outputs one pixel per bin — users can
@@ -147,7 +139,7 @@ class ComparatorGrid(_ComparatorBase):
         # pitch.
         self._spacing_override = None if spacing is None else (float(spacing[0]), float(spacing[1]))
         self._grid_shapes = []  # populated by _compute_spectra
-        self.spacings = None  # populated alongside
+        self._spacings = None  # populated alongside
 
     # ------------------------------------------------------------------
     def _rasterize_one(self, sdata: Any) -> np.ndarray:
@@ -182,7 +174,7 @@ class ComparatorGrid(_ComparatorBase):
     def _compute_spectra(
         self, n_jobs: int, progress: bool
     ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        chunk = self.fft_chunk_size
+        chunk = self._fft_chunk_size
 
         def _one(i: int, pbar: tqdm | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             raster = self._rasterize_one(self.samples[i])
@@ -191,7 +183,7 @@ class ComparatorGrid(_ComparatorBase):
             self._grid_shapes_local_i = (ny, nx)
 
             frac_nonzero = (raster != 0).reshape(n_genes, -1).mean(axis=1)
-            presence_i = frac_nonzero >= self.presence_threshold
+            presence_i = frac_nonzero >= self._presence_threshold
             dc = raster.mean(axis=(1, 2))
 
             expected_kx = nx if self._spectrum_fft_solver == "fft2" else nx // 2 + 1
@@ -203,7 +195,7 @@ class ComparatorGrid(_ComparatorBase):
                 spec_chunk = compute_sample_spectrum(
                     raster[start:stop],
                     fft_solver=self._spectrum_fft_solver,
-                    workers=self.workers,
+                    workers=self._workers,
                     return_dc=False,
                 )
                 spec_stack[start:stop] = spec_chunk
@@ -253,14 +245,52 @@ class ComparatorGrid(_ComparatorBase):
         # Record per-sample grids + spacings for downstream radial binning.
         self._grid_shapes = grids
         if self._spacing_override is not None:
-            self.spacings = [self._spacing_override] * len(grids)
+            self._spacings = [self._spacing_override] * len(grids)
         else:
-            self.spacings = [(1.0, 1.0)] * len(grids)
+            self._spacings = [(1.0, 1.0)] * len(grids)
         del self._grid_shapes_local_i  # tidy attr soup
 
         dc = np.stack([np.asarray(x) for x in dc_list], axis=0)
         presence = np.stack([np.asarray(x) for x in pres_list], axis=0)
         return [np.asarray(x) for x in raw_2d], dc, presence
+
+    # ------------------------------------------------------------------
+    def _covariate_features_from_keys(self, keys: Sequence[str]) -> list[np.ndarray]:
+        """Forward ``keys`` to :func:`spatialdata.rasterize_bins` as
+        ``value_key`` and turn each per-sample raster into covariate features.
+
+        ``keys`` may name any combination of ``.obs`` columns and
+        ``var_names`` in the comparator's ``table_name`` table —
+        ``rasterize_bins`` accepts both. Each sample's resulting
+        ``(n_keys, ny, nx)`` raster is then funneled through the same
+        spectrum + radial-binning pipeline as the gene panel via
+        :meth:`_covariate_features_from_array`.
+        """
+        from quadsv._rasterize import rasterize_table
+
+        keys = list(keys)
+        out: list[np.ndarray] = []
+        for i, sdata in enumerate(self.samples):
+            img = rasterize_table(
+                sdata,
+                bins=self._bins,
+                table_name=self._table_name,
+                col_key=self._col_key,
+                row_key=self._row_key,
+                value_key=keys,
+                return_region_as_labels=False,
+            )
+            arr = np.asarray(img.data if hasattr(img, "data") else img, dtype=np.float64)
+            if arr.ndim == 2:
+                # Single key → rasterize_bins drops the leading axis. Re-insert.
+                arr = arr[None, :, :]
+            if arr.ndim != 3:
+                raise ValueError(
+                    f"sample {i} covariate raster has shape {arr.shape}; "
+                    "expected (n_keys, ny, nx) from rasterize_bins."
+                )
+            out.append(self._covariate_features_from_array(arr, sample_index=i))
+        return out
 
 
 def _resolve_spatialdata_gene_names(

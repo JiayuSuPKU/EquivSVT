@@ -104,7 +104,7 @@ class TestComparatorGrid:
             gene_values = {
                 "g0": np.sin(2 * np.pi * np.arange(ny)[:, None] / ny),
                 "g1": np.cos(2 * np.pi * np.arange(nx)[None, :] / nx),
-                # gene 2 differs across "groups" to make test_pattern meaningful.
+                # gene 2 differs across "groups" to make test_diff_freq meaningful.
                 "g2": (
                     np.sin(2 * np.pi * np.arange(ny)[:, None] / ny + 0.3 * i)
                     if i < n_samples // 2
@@ -124,7 +124,6 @@ class TestComparatorGrid:
         try:
             cmp = ComparatorGrid(
                 samples,
-                groups=groups,
                 bins="bins",
                 table_name="table",
                 col_key="col_idx",
@@ -137,14 +136,14 @@ class TestComparatorGrid:
             # Some spatialdata versions disallow our minimal fixture; that's fine —
             # this test acts as a signal, not a hard requirement.
             pytest.skip("ComparatorGrid smoke test not runnable on this spatialdata version.")
-        cmp.fit(progress=False)
+        cmp.compute_spectra(progress=False)
         assert cmp.spectra_ is not None
         assert cmp.spectra_.shape[0] == len(samples)
         assert cmp.spectra_.shape[1] == 3  # n_genes
         assert cmp.dc_.shape == (len(samples), 3)
         assert cmp.presence_.shape == (len(samples), 3)
         # Pattern test runs without error and returns a frame with a row per gene.
-        df = cmp.test_pattern(n_perm=50, random_state=0)
+        df = cmp.test_diff_freq(groups, n_perm=50, random_state=0)
         assert df.shape[0] == 3
         assert df["P_value"].between(0, 1).all()
 
@@ -156,10 +155,7 @@ class TestComparatorIrregularImport:
 
     def test_rejects_non_anndata(self):
         with pytest.raises(TypeError, match="anndata.AnnData"):
-            ComparatorIrregular(
-                [np.zeros((4, 3))],
-                groups=np.array([0]),
-            )
+            ComparatorIrregular([np.zeros((4, 3))])
 
 
 class TestComparatorCrossConsistency:
@@ -194,7 +190,7 @@ class TestComparatorCrossConsistency:
             groups.append(group)
         return grids, np.array(groups)
 
-    def test_grid_vs_irregular_test_pattern_ranking(self):
+    def test_grid_vs_irregular_test_diff_freq_ranking(self):
         """Both comparators must rank ``g0`` as the top (or near-top)
         group-separating gene. Spearman ≥ 0.6 on per-gene p-values: the two
         pipelines standardize and bin differently, so we only require
@@ -208,9 +204,9 @@ class TestComparatorCrossConsistency:
 
         # --- NUFFT path ---
         adatas = _samples_to_adata_list(grids, gene_names)
-        cmp_n = ComparatorIrregular(adatas, groups, gene_names)
-        cmp_n.fit(progress=False)
-        df_n = cmp_n.test_pattern(n_perm=200, random_state=0)
+        cmp_n = ComparatorIrregular(adatas, gene_names)
+        cmp_n.compute_spectra(progress=False)
+        df_n = cmp_n.test_diff_freq(groups, n_perm=200, random_state=0)
 
         # --- FFT path (via SpatialData raster) ---
         # The minimal _make_bin_sdata fixture doesn't satisfy every spatialdata
@@ -227,7 +223,6 @@ class TestComparatorCrossConsistency:
                 samples_sd.append(sample)
             cmp_g = ComparatorGrid(
                 samples_sd,
-                groups=groups,
                 bins="bins",
                 table_name="table",
                 col_key="col_idx",
@@ -237,8 +232,8 @@ class TestComparatorCrossConsistency:
             )
         except Exception as exc:  # pragma: no cover — depends on spatialdata version
             pytest.skip(f"ComparatorGrid fixture unavailable: {type(exc).__name__}")
-        cmp_g.fit(progress=False)
-        df_g = cmp_g.test_pattern(n_perm=200, random_state=0)
+        cmp_g.compute_spectra(progress=False)
+        df_g = cmp_g.test_diff_freq(groups, n_perm=200, random_state=0)
 
         # Normalize: both frames are indexed by/contain Feature.
         def _by_feature(df):

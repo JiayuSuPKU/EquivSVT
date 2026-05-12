@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import pytest
 from scipy.stats import kstest
 
@@ -11,16 +12,16 @@ from quadsv.comparators import ComparatorIrregular
 from quadsv.comparators.multisample import (
     align_spectra_by_rotation,
     apply_rotations_to_spectra,
-    compare_designs,
+    compare_glm,
     compare_two_groups,
     compare_two_groups_masked,
     compare_two_groups_scalar,
     compute_sample_spectrum,
     estimate_rotations_from_landmarks,
-    normalize_by_background,
+    normalize_background,
+    normalize_covariates,
+    normalize_shape,
     radial_bin_spectrum,
-    residualize_against_covariates,
-    shape_normalize,
 )
 from quadsv.kernels.fft import power_spectrum_2d
 
@@ -415,28 +416,31 @@ class TestBackgroundNormalization:
     def test_identical_genes_become_unit_after_normalization(self):
         # Every gene has the same spectrum -> geo mean = same -> ratio = 1.
         spec = np.tile(np.arange(1.0, 6.0), (10, 1))  # (10 genes, K=5), all rows equal
-        out = normalize_by_background(spec)
+        out = normalize_background(spec)
         np.testing.assert_allclose(out, np.ones_like(out), atol=1e-9)
 
     def test_preserves_shape(self):
         rng = np.random.default_rng(0)
         spec = rng.uniform(0.1, 10.0, size=(7, 12))
-        out = normalize_by_background(spec)
+        out = normalize_background(spec)
         assert out.shape == spec.shape
 
 
 class TestResidualization:
-    def test_perfect_predictor_residual_is_near_zero(self):
+    def test_log_space_perfect_predictor_residual_is_unity(self):
+        """If ``log gene = β_0 + Σ β_c log cov_c`` exactly, the (log-space)
+        residual is zero and the exponentiated output equals 1.0."""
         rng = np.random.default_rng(0)
         cov = rng.uniform(0.1, 5.0, size=(2, 8))  # 2 covariates, K=8
-        gene = 1.5 * cov[0] - 0.7 * cov[1] + 2.0  # exact linear combo + intercept
+        # Log-space linear combo: gene = exp(β_0) · cov_0^{β_1} · cov_1^{β_2}
+        gene = np.exp(2.0 + 1.5 * np.log(cov[0]) - 0.7 * np.log(cov[1]))
         gene = np.tile(gene, (5, 1))
-        out = residualize_against_covariates(gene, cov, fit_intercept=True)
-        np.testing.assert_allclose(out, 0.0, atol=1e-9)
+        out = normalize_covariates(gene, cov, fit_intercept=True)
+        np.testing.assert_allclose(out, 1.0, atol=1e-6)
 
     def test_shape_validation(self):
         with pytest.raises(ValueError, match="Last axis"):
-            residualize_against_covariates(np.zeros((3, 5)), np.zeros((2, 4)))
+            normalize_covariates(np.zeros((3, 5)), np.zeros((2, 4)))
 
 
 # ---------------------------------------------------------------------------
@@ -539,16 +543,15 @@ class TestLogL2WaldNull:
             assert p_wald < p_perm, f"gene {g}: Wald={p_wald:.3g} not < perm={p_perm:.3g}"
             assert p_wald < 1.0 / 71.0, f"gene {g}: Wald={p_wald:.3g} above perm floor"
 
-    def test_liu_alias_matches_wald(self):
+    def test_liu_alias_retired(self):
+        """The retired ``null='liu'`` alias must now raise. Rename guard for
+        the alias-cleanup that left ``null='wald'`` as the single canonical
+        token."""
         rng = np.random.default_rng(1)
         spectra = np.exp(rng.standard_normal((6, 100, 20)))
         groups = np.array([0, 0, 0, 1, 1, 1])
-        df_w = compare_two_groups(spectra, groups, statistic="log_l2", null="wald")
-        df_l = compare_two_groups(spectra, groups, statistic="log_l2", null="liu")
-        # Sort both by Feature for safe comparison.
-        df_w_s = df_w.sort_values("Feature").reset_index(drop=True)
-        df_l_s = df_l.sort_values("Feature").reset_index(drop=True)
-        np.testing.assert_array_equal(df_w_s["P_value"].to_numpy(), df_l_s["P_value"].to_numpy())
+        with pytest.raises(ValueError, match="Unknown null='liu'"):
+            compare_two_groups(spectra, groups, statistic="log_l2", null="liu")
 
     def test_wald_is_deterministic(self):
         rng = np.random.default_rng(2)
@@ -564,12 +567,17 @@ class TestLogL2WaldNull:
             df_b.sort_values("Feature")["P_value"].to_numpy(),
         )
 
-    def test_wald_rejects_non_log_l2_statistic(self):
+    def test_wald_argument_is_ignored_for_welch_t_cauchy(self):
+        """``welch_t_cauchy`` has its own analytic null; the ``null`` argument
+        is documented as ignored. With the package default
+        ``null='wald'``, the call must succeed (no spurious rejection on
+        a moot kwarg) and produce the cauchy-welch output schema."""
         rng = np.random.default_rng(3)
         spectra = np.exp(rng.standard_normal((6, 50, 20)))
         groups = np.array([0, 0, 0, 1, 1, 1])
-        with pytest.raises(ValueError, match="null='wald' is only supported"):
-            compare_two_groups(spectra, groups, statistic="cauchy_welch", null="wald")
+        df = compare_two_groups(spectra, groups, statistic="welch_t_cauchy", null="wald")
+        assert "P_value_per_bin" in df.columns
+        assert df["P_value"].between(0, 1).all()
 
     def test_unknown_null_raises(self):
         rng = np.random.default_rng(4)
@@ -580,7 +588,7 @@ class TestLogL2WaldNull:
 
     def test_small_df_emits_user_warning(self):
         """At residual df < 3 (n_a + n_b ≤ 4), the Wald path should warn the
-        user that σ̂² is noisy and recommend cauchy_welch.
+        user that σ̂² is noisy and recommend welch_t_cauchy.
         """
         rng = np.random.default_rng(0)
         # 1v2 split → df = 1 + 2 - 2 = 1; should warn.
@@ -747,31 +755,36 @@ class TestLogL2WaldNull:
                 min_samples_per_group=2,
             )
 
-    def test_masked_wald_rejects_non_log_l2(self):
+    def test_masked_wald_argument_is_ignored_for_welch_t_cauchy(self):
+        """Same as the unmasked counterpart: ``welch_t_cauchy`` ignores
+        ``null=``, so passing the package default ``null='wald'`` must
+        succeed (no spurious rejection on a moot kwarg)."""
         rng = np.random.default_rng(9)
         n_samples, n_genes, K = 6, 10, 12
         spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
         groups = np.array([0, 0, 0, 1, 1, 1])
         presence = np.ones((n_samples, n_genes), dtype=bool)
-        with pytest.raises(ValueError, match="null='wald' is only supported"):
-            compare_two_groups_masked(
-                spectra,
-                groups,
-                presence,
-                statistic="cauchy_welch",
-                null="wald",
-            )
+        df = compare_two_groups_masked(
+            spectra,
+            groups,
+            presence,
+            statistic="welch_t_cauchy",
+            null="wald",
+        )
+        assert "P_value_per_bin" in df.columns
+        assert df["P_value"].between(0, 1).all()
 
 
 class TestCompareDesignsAndGLMWald:
-    """`compare_designs` GLM Wald path + `ComparatorIrregular(design=)`."""
+    """`compare_glm` GLM Wald path + `Comparator.test_diff_freq(design=DataFrame)`."""
 
     def test_binary_design_matches_groups_path_byte_close(self):
-        """Two-group Wald via groups= and via design= must agree to ~1e-10.
+        """Two-group Wald via 1-D labels and via DataFrame design must agree to ~1e-10.
 
         This is the central calibration anchor: the GLM Wald path with a
         single binary indicator literally recovers the binary Wald math
-        from Commit 1, modulo float64 round-off in the OLS solve.
+        from `compare_two_groups`, modulo float64 round-off in the OLS
+        solve.
         """
         import pandas as pd
 
@@ -787,7 +800,7 @@ class TestCompareDesignsAndGLMWald:
 
         design = pd.DataFrame({"genotype": groups})
         df_d = (
-            compare_designs(spectra, design, contrast="genotype", null="wald")
+            compare_glm(spectra, design, contrast="genotype", null="wald")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
@@ -813,7 +826,7 @@ class TestCompareDesignsAndGLMWald:
         log_y = beta[None, :, :] * x[:, None, None] + 0.3 * rng.standard_normal((n, n_genes, K))
         spectra = np.exp(log_y)
         design = pd.DataFrame({"time": x})
-        df = compare_designs(spectra, design, contrast="time", null="wald")
+        df = compare_glm(spectra, design, contrast="time", null="wald")
         top10 = set(df.head(10)["Feature"].tolist())
         assert {"0", "1", "2", "3", "4"} <= top10, f"missing planted: {top10}"
 
@@ -827,65 +840,47 @@ class TestCompareDesignsAndGLMWald:
         spectra = np.exp(rng.standard_normal((8, 30, 20)))
         design = pd.DataFrame({"a": [0, 1, 0, 1, 0, 1, 0, 1], "b": np.arange(8)})
         df_dict = (
-            compare_designs(spectra, design, contrast={"a": 1.0}, null="wald")
+            compare_glm(spectra, design, contrast={"a": 1.0}, null="wald")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
         df_str = (
-            compare_designs(spectra, design, contrast="a", null="wald")
+            compare_glm(spectra, design, contrast="a", null="wald")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
         np.testing.assert_allclose(df_dict["P_value"].to_numpy(), df_str["P_value"].to_numpy())
 
     def test_ndarray_design_with_intercept_only(self):
-        """Numpy design matrix (caller-built) flows through compare_designs."""
+        """Numpy design matrix (caller-built) flows through compare_glm."""
         rng = np.random.default_rng(3)
         n, n_genes, K = 6, 20, 18
         spectra = np.exp(rng.standard_normal((n, n_genes, K)))
         # Design = [intercept, group_indicator]
         X = np.column_stack([np.ones(n), [0, 0, 0, 1, 1, 1]])
-        df = compare_designs(spectra, X, contrast=np.array([0.0, 1.0]), null="wald")
+        df = compare_glm(spectra, X, contrast=np.array([0.0, 1.0]), null="wald")
         assert df.shape[0] == n_genes
         assert df["P_value"].between(0, 1).all()
 
-    def test_compare_designs_rejects_permutation_null(self):
+    def test_compare_glm_rejects_permutation_null(self):
         import pandas as pd
 
         rng = np.random.default_rng(0)
         spectra = np.exp(rng.standard_normal((6, 10, 12)))
         design = pd.DataFrame({"g": [0, 0, 0, 1, 1, 1]})
         with pytest.raises(NotImplementedError, match="Permutation null"):
-            compare_designs(spectra, design, contrast="g", null="permutation")
+            compare_glm(spectra, design, contrast="g", null="permutation")
 
-    def test_compare_designs_rejects_non_log_l2(self):
+    def test_compare_glm_rejects_non_log_l2(self):
         import pandas as pd
 
         rng = np.random.default_rng(0)
         spectra = np.exp(rng.standard_normal((6, 10, 12)))
         design = pd.DataFrame({"g": [0, 0, 0, 1, 1, 1]})
         with pytest.raises(ValueError, match="only supports statistic='log_l2'"):
-            compare_designs(spectra, design, contrast="g", statistic="cauchy_welch", null="wald")
+            compare_glm(spectra, design, contrast="g", statistic="welch_t_cauchy", null="wald")
 
-    def test_invalid_groups_and_design_both_supplied(self):
-        rng = np.random.default_rng(0)
-        # Build 4 simple AnnData samples for the constructor.
-        samples = []
-        for _ in range(4):
-            samples.append(
-                _grid_to_adata(
-                    rng.uniform(size=(5, 8, 8)),
-                    gene_names=[f"g{i}" for i in range(5)],
-                )
-            )
-        import pandas as pd
-
-        groups = np.array([0, 0, 1, 1])
-        design = pd.DataFrame({"x": [0.1, 0.2, 0.3, 0.4]})
-        with pytest.raises(ValueError, match="not both"):
-            ComparatorIrregular(samples, groups=groups, design=design)
-
-    def test_invalid_neither_groups_nor_design(self):
+    def test_invalid_1d_design_not_binary(self):
         rng = np.random.default_rng(0)
         samples = [
             _grid_to_adata(
@@ -894,8 +889,27 @@ class TestCompareDesignsAndGLMWald:
             )
             for _ in range(4)
         ]
-        with pytest.raises(ValueError, match="Exactly one of"):
-            ComparatorIrregular(samples)
+        # 1-D array with 3 distinct values: rejected since the 1-D path is
+        # binary-only. Wrap in a DataFrame to use the continuous path.
+        # Validation is deferred to the test method (design is no longer a
+        # constructor argument).
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(ValueError, match="exactly two distinct labels"):
+            cmp.test_diff_freq(np.array([0, 1, 2, 2]))
+
+    def test_invalid_design_missing(self):
+        """`design` is a required positional on the test method."""
+        rng = np.random.default_rng(0)
+        samples = [
+            _grid_to_adata(
+                rng.uniform(size=(5, 8, 8)),
+                gene_names=[f"g{i}" for i in range(5)],
+            )
+            for _ in range(4)
+        ]
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(TypeError, match="missing.*required.*positional"):
+            cmp.test_diff_freq()
 
 
 class TestEffectiveRank:
@@ -1016,15 +1030,13 @@ class TestEffectiveRank:
         groups = np.array([0] * n_per + [1] * n_per)
         cmp = ComparatorIrregular(
             adatas,
-            groups=groups,
             gene_names=[f"g{j}" for j in range(200)],
             feature_mode="radial",
             n_radial_bins=15,
             presence_threshold=0.0,
-            min_samples_per_group=2,
         )
-        cmp.fit(n_jobs=1, progress=False)
-        ke = cmp.effective_rank(level="within_group")
+        cmp.compute_spectra(n_jobs=1, progress=False)
+        ke = cmp.effective_rank(level="within_group", design=groups)
         assert isinstance(ke, float)
         assert 1.0 - 1e-9 <= ke <= 15.0 + 1e-9
 
@@ -1041,17 +1053,14 @@ class TestEffectiveRank:
                     rng.uniform(size=(150, 8, 8)), gene_names=[f"g{j}" for j in range(150)]
                 )
             )
-        groups = np.array([0] * n_per + [1] * n_per)
         cmp = ComparatorIrregular(
             adatas,
-            groups=groups,
             gene_names=[f"g{j}" for j in range(150)],
             feature_mode="radial",
             n_radial_bins=12,
             presence_threshold=0.0,
-            min_samples_per_group=2,
         )
-        cmp.fit(n_jobs=1, progress=False)
+        cmp.compute_spectra(n_jobs=1, progress=False)
         ke_arr = cmp.effective_rank(level="per_sample")
         assert ke_arr.shape == (n_total,)
         assert np.all(ke_arr >= 1.0 - 1e-9)
@@ -1079,7 +1088,7 @@ class TestTwoGroupPower:
 
 
 class TestStatisticAliases:
-    @pytest.mark.parametrize("stat", ["log_l2", "cauchy_welch"])
+    @pytest.mark.parametrize("stat", ["log_l2", "welch_t_cauchy"])
     def test_each_statistic_runs(self, stat):
         rng = np.random.default_rng(0)
         spectra = rng.uniform(0.1, 5.0, size=(6, 8, 6))
@@ -1088,7 +1097,7 @@ class TestStatisticAliases:
         assert df.shape[0] == 8
         assert {"Feature", "Statistic", "P_value", "P_adj"} <= set(df.columns)
         assert df["P_value"].between(0, 1).all()
-        if stat == "cauchy_welch":
+        if stat == "welch_t_cauchy":
             assert "P_value_per_bin" in df.columns
             # Each entry is an (K,) array of per-bin p-values in [0, 1].
             per_bin = np.stack(df["P_value_per_bin"].to_numpy())
@@ -1178,11 +1187,11 @@ class TestComparatorIrregularEndToEnd:
         groups = np.array([0] * n_per + [1] * n_per)
 
         cmp = (
-            ComparatorIrregular(_samples_to_adata_list(samples, gene_names), groups, gene_names)
-            .fit()
+            ComparatorIrregular(_samples_to_adata_list(samples, gene_names), gene_names)
+            .compute_spectra()
             .normalize_background()
         )
-        df = cmp.test(statistic="log_l2", n_perm=300, random_state=0)
+        df = cmp.test_diff_freq(groups, statistic="log_l2", n_perm=300, random_state=0)
         assert df["Feature"].iloc[0] == "g0", f"expected g0 first, got {df.head().to_dict()}"
 
     def test_pipeline_residualize_runs(self):
@@ -1193,23 +1202,133 @@ class TestComparatorIrregularEndToEnd:
         samples = [rng.standard_normal((4, ny, nx)) for _ in range(2 * n_per)]
         covariates = [rng.standard_normal((1, ny, nx)) for _ in range(2 * n_per)]
         groups = np.array([0] * n_per + [1] * n_per)
-        cmp = ComparatorIrregular(_samples_to_adata_list(samples, gene_names), groups, gene_names)
-        cmp.fit().residualize(covariates)
-        df = cmp.test(statistic="log_l2", n_perm=50, random_state=0)
+        cmp = ComparatorIrregular(_samples_to_adata_list(samples, gene_names), gene_names)
+        cmp.compute_spectra().normalize_covariates(covariates)
+        df = cmp.test_diff_freq(groups, statistic="log_l2", n_perm=50, random_state=0)
         assert df.shape[0] == 4
 
     def test_invalid_groups_raises(self):
         gene_names = ["a", "b"]
         adatas = _samples_to_adata_list([np.zeros((2, 4, 4))] * 3, gene_names)
+        cmp = ComparatorIrregular(adatas, gene_names).compute_spectra()
         with pytest.raises(ValueError, match="exactly two distinct"):
-            ComparatorIrregular(adatas, np.array([0, 1, 2]), gene_names)
+            cmp.test_diff_freq(np.array([0, 1, 2]))
 
-    def test_must_fit_before_test(self):
+    def test_must_compute_spectra_before_test(self):
         gene_names = ["a", "b"]
         adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
-        cmp = ComparatorIrregular(adatas, np.array([0, 1]), gene_names)
-        with pytest.raises(RuntimeError, match=r"\.fit\(\)"):
-            cmp.test()
+        cmp = ComparatorIrregular(adatas, gene_names)
+        with pytest.raises(RuntimeError, match=r"\.compute_spectra\(\)"):
+            cmp.test_diff_freq(np.array([0, 1]))
+
+
+class TestNormalizeCovariatesObsKeys:
+    """``normalize_covariates`` polymorphic input mode: shared ``obs`` column
+    names per AnnData sample. Mirrors the per-spot covariate workflow users
+    typically have on cell-type proportion maps."""
+
+    @staticmethod
+    def _build_samples(n_samples=4, n_spots=200, n_genes=4, seed=0):
+        rng = np.random.default_rng(seed)
+        out = []
+        for _ in range(n_samples):
+            X = rng.standard_normal((n_spots, n_genes))
+            a = ad.AnnData(X=X)
+            a.var_names = [f"g{i}" for i in range(n_genes)]
+            a.obsm["spatial"] = rng.uniform(0, 50, size=(n_spots, 2))
+            a.obs["cov_a"] = rng.uniform(0.0, 1.0, size=n_spots)
+            a.obs["cov_b"] = rng.uniform(0.0, 1.0, size=n_spots)
+            a.obs["batch"] = pd.Categorical(["A", "B"] * (n_spots // 2))
+            out.append(a)
+        return out
+
+    def test_obs_key_path_runs_and_mutates_spectra(self):
+        """Calling with a ``Sequence[str]`` is interpreted as obs-column
+        names; spectra_ should change in place."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        ret = cmp.normalize_covariates(["cov_a", "cov_b"])
+        assert ret is cmp, "should be chainable"
+        assert not np.array_equal(
+            cmp.spectra_, before
+        ), "spectra_ must change after residualisation"
+        assert cmp.spectra_.shape == before.shape
+
+    def test_key_missing_from_obs_and_var_raises_keyerror(self):
+        """Resolution checks both obs.columns and var_names; if neither
+        contains the key, raise with both lists in the message."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(KeyError, match="in neither obs.columns nor"):
+            cmp.normalize_covariates(["does_not_exist"])
+
+    def test_var_names_key_path(self):
+        """A key that matches a gene in ``var_names`` is treated as a
+        per-spot expression covariate (housekeeping-gene workflow)."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        # g0 exists in var_names; use it as a covariate.
+        cmp.normalize_covariates(["g0"])
+        assert not np.array_equal(cmp.spectra_, before)
+        assert cmp.spectra_.shape == before.shape
+
+    def test_obs_takes_precedence_over_var_on_collision(self):
+        """When the same name appears in both obs and var_names, the obs
+        column wins (matches the user's mental model that they're naming
+        a metadata column)."""
+        samples = self._build_samples()
+        # Inject a synthetic obs column whose name collides with a gene.
+        for a in samples:
+            a.obs["g0"] = np.linspace(0.0, 1.0, a.n_obs)
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        cmp.normalize_covariates(["g0"])
+        # Sanity: spectra moved, and the obs path runs (no float-cast error
+        # on the linspace column).
+        assert not np.array_equal(cmp.spectra_, before)
+
+    def test_mixed_obs_and_var_keys_in_one_call(self):
+        """obs and var_names keys can be mixed in a single call — they're
+        resolved per-key, then the per-spot vectors are stacked into one
+        block before NUFFT."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        cmp.normalize_covariates(["cov_a", "g0"])  # obs + var_names
+        assert not np.array_equal(cmp.spectra_, before)
+
+    def test_obs_key_categorical_raises_value_error(self):
+        """Categorical obs columns can't be cast to float — surface a clear
+        error pointing at encoding."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(ValueError, match="cannot be cast to float"):
+            cmp.normalize_covariates(["batch"])
+
+    def test_array_path_still_works(self):
+        """The legacy per-sample (n_cov, ny, nx) array input must keep
+        working alongside the new key-list mode."""
+        rng = np.random.default_rng(1)
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        arrays = [rng.standard_normal((1, 8, 8)) for _ in samples]
+        cmp.normalize_covariates(arrays)
+        assert not np.array_equal(cmp.spectra_, before)
+
+    def test_empty_sequence_rejected(self):
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(ValueError, match="non-empty"):
+            cmp.normalize_covariates([])
+
+    def test_mixed_str_and_array_rejected(self):
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(TypeError, match="Mixed str and non-str"):
+            cmp.normalize_covariates(["cov_a", np.zeros((1, 8, 8))])
 
 
 # ---------------------------------------------------------------------------
@@ -1245,9 +1364,77 @@ class TestScalarTestCalibration:
         n_samples, n_genes = 10, 300
         values = rng.standard_normal((n_samples, n_genes))
         groups = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
-        df = compare_two_groups_scalar(values, groups, n_perm=300, random_state=0)
+        df = compare_two_groups_scalar(
+            values, groups, null="permutation", n_perm=300, random_state=0
+        )
         ks_stat, ks_p = kstest(df.P_value.to_numpy(), "uniform")
         assert ks_p > 0.01, f"DE-test p-values not uniform under H0, KS p={ks_p:.4f}"
+
+    def test_welch_analytic_is_uniform_under_h0(self):
+        """null='wald' (analytic) p-values should be uniform under iid Gaussian H0."""
+        rng = np.random.default_rng(0)
+        n_samples, n_genes = 10, 1000
+        values = rng.standard_normal((n_samples, n_genes))
+        groups = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+        df = compare_two_groups_scalar(values, groups, null="wald")
+        ks_stat, ks_p = kstest(df.P_value.to_numpy(), "uniform")
+        assert ks_p > 0.01, f"analytic-Welch p-values not uniform under H0, KS p={ks_p:.4f}"
+
+    def test_welch_analytic_matches_scipy(self):
+        """null='wald' p-values should agree with scipy.stats.ttest_ind(equal_var=False)."""
+        from scipy.stats import ttest_ind
+
+        rng = np.random.default_rng(2)
+        n_per, n_genes = 5, 50
+        a = rng.normal(0.0, 1.0, size=(n_per, n_genes))
+        b = rng.normal(0.3, 1.5, size=(n_per, n_genes))
+        values = np.concatenate([a, b], axis=0)
+        groups = np.array([0] * n_per + [1] * n_per)
+        df = compare_two_groups_scalar(values, groups, null="wald")
+        df = df.set_index("Feature").loc[[str(i) for i in range(n_genes)]]
+        scipy_p = ttest_ind(a, b, equal_var=False, axis=0).pvalue
+        np.testing.assert_allclose(df["P_value"].to_numpy(), scipy_p, rtol=1e-9, atol=1e-300)
+
+    def test_welch_analytic_breaks_perm_raw_p_floor(self):
+        """At small n the permutation raw-p has a floor at 1/(perms+1); analytic does not.
+
+        4 vs 4 has C(8, 4) = 70 unique permutations, so the permutation null
+        cannot give a raw p-value smaller than ~1/70 ≈ 0.014 even for an
+        arbitrarily strong signal. The analytic Welch path can give raw p
+        many orders of magnitude smaller. This is the floor that translates
+        downstream into the BH-FDR power problem on small cohorts.
+        """
+        rng = np.random.default_rng(3)
+        n_per, n_genes = 4, 50
+        a = rng.normal(0.0, 1.0, size=(n_per, n_genes))
+        b = rng.normal(0.0, 1.0, size=(n_per, n_genes))
+        # Implant a very strong shift so the analytic test gives a tiny p.
+        b[:, 0] += 8.0
+        values = np.concatenate([a, b], axis=0)
+        groups = np.array([0] * n_per + [1] * n_per)
+
+        df_perm = compare_two_groups_scalar(
+            values, groups, null="permutation", n_perm=1000, random_state=0
+        )
+        df_welch = compare_two_groups_scalar(values, groups, null="wald")
+        # Most-significant gene should be the same in both rankings (gene 0).
+        assert df_perm.iloc[0]["Feature"] == "0"
+        assert df_welch.iloc[0]["Feature"] == "0"
+        top_perm_raw = float(df_perm.iloc[0]["P_value"])
+        top_welch_raw = float(df_welch.iloc[0]["P_value"])
+        # Permutation raw-p floor at n=4v4: ~1 / C(8, 4) ≈ 0.014.
+        assert top_perm_raw >= 0.01, f"perm raw-p unexpectedly tight: {top_perm_raw}"
+        # Analytic should be < 1e-3 for a 8σ implant on a non-degenerate Welch t.
+        assert top_welch_raw < 1e-3, f"analytic raw p too large: {top_welch_raw}"
+        # The analytic-vs-perm raw-p ratio at the top gene should be at least 10×.
+        assert top_perm_raw / max(top_welch_raw, 1e-300) > 10.0
+
+    def test_invalid_null_raises(self):
+        rng = np.random.default_rng(0)
+        values = rng.standard_normal((6, 3))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        with pytest.raises(ValueError, match="null must be"):
+            compare_two_groups_scalar(values, groups, null="bogus")
 
     def test_implanted_mean_shift_recovered(self):
         rng = np.random.default_rng(7)
@@ -1257,7 +1444,7 @@ class TestScalarTestCalibration:
         b[:, :5] += 2.0  # large mean shift on genes 0..4
         values = np.concatenate([a, b], axis=0)
         groups = np.array([0] * n_per + [1] * n_per)
-        df = compare_two_groups_scalar(values, groups, n_perm=400, random_state=0)
+        df = compare_two_groups_scalar(values, groups, null="wald")
         top5 = set(df.head(5).Feature.astype(str).tolist())
         assert top5 == {"0", "1", "2", "3", "4"}
 
@@ -1284,13 +1471,12 @@ class TestDeAndPatternOrthogonality:
         gene_names = [f"g{i}" for i in range(n_genes)]
         cmp = ComparatorIrregular(
             _samples_to_adata_list(samples, gene_names),
-            groups,
             gene_names=gene_names,
             n_radial_bins=8,
-        ).fit()
+        ).compute_spectra()
 
-        de = cmp.test_expression(n_perm=400, random_state=0)
-        pattern_df = cmp.test_pattern(n_perm=400, random_state=0)
+        de = cmp.test_diff_expr(groups, n_perm=400, random_state=0)
+        pattern_df = cmp.test_diff_freq(groups, n_perm=400, random_state=0)
 
         de_g0 = de.set_index("Feature").loc["g0"]
         pat_g0 = pattern_df.set_index("Feature").loc["g0"]
@@ -1316,27 +1502,26 @@ class TestComparatorIrregularDcAccess:
     def test_fit_populates_dc(self):
         rng = np.random.default_rng(0)
         samples = [rng.standard_normal((3, 8, 10)) + s for s in range(4)]
-        groups = np.array([0, 0, 1, 1])
         gene_names = ["a", "b", "c"]
         cmp = ComparatorIrregular(
-            _samples_to_adata_list(samples, gene_names), groups, gene_names
-        ).fit()
+            _samples_to_adata_list(samples, gene_names), gene_names
+        ).compute_spectra()
         assert cmp.dc_ is not None
         assert cmp.dc_.shape == (4, 3)
         # DC equals per-sample grid mean of the raw signal.
         expected = np.array([samples[i].mean(axis=(1, 2)) for i in range(4)])
         np.testing.assert_allclose(cmp.dc_, expected, rtol=1e-12)
 
-    def test_test_expression_requires_fit(self):
+    def test_test_diff_expr_requires_compute_spectra(self):
         gene_names = ["a", "b"]
         adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
-        cmp = ComparatorIrregular(adatas, np.array([0, 1]), gene_names)
-        with pytest.raises(RuntimeError, match="fit"):
-            cmp.test_expression()
+        cmp = ComparatorIrregular(adatas, gene_names)
+        with pytest.raises(RuntimeError, match=r"\.compute_spectra\(\)"):
+            cmp.test_diff_expr(np.array([0, 1]))
 
 
 # ---------------------------------------------------------------------------
-# shape_normalize: magnitude-invariant spectrum shapes
+# normalize_shape: magnitude-invariant spectrum shapes
 # ---------------------------------------------------------------------------
 
 
@@ -1344,7 +1529,7 @@ class TestShapeNormalize:
     def test_sum_to_one_along_axis(self):
         rng = np.random.default_rng(0)
         x = rng.uniform(0.1, 10.0, size=(4, 7, 12))
-        out = shape_normalize(x, axis=-1)
+        out = normalize_shape(x, axis=-1)
         np.testing.assert_allclose(out.sum(axis=-1), 1.0, rtol=1e-12)
 
     def test_cancels_scalar_rescale(self):
@@ -1353,7 +1538,7 @@ class TestShapeNormalize:
         row = rng.uniform(0.5, 3.0, size=10)
         scales = np.array([[0.3], [1.0], [50.0]])
         stack = scales * row[None, :]
-        out = shape_normalize(stack, axis=-1)
+        out = normalize_shape(stack, axis=-1)
         # All three rows become identical probability vectors after L1
         # normalization (the shared shape of the row).
         np.testing.assert_allclose(out[0], out[1], rtol=1e-10, atol=1e-12)
@@ -1361,35 +1546,58 @@ class TestShapeNormalize:
 
     def test_preserves_shape(self):
         x = np.random.default_rng(0).uniform(0.1, 5.0, size=(3, 8, 6))
-        assert shape_normalize(x).shape == x.shape
+        assert normalize_shape(x).shape == x.shape
 
-    def test_spectral_comparator_shape_normalize_chainable(self):
+    def test_diff_freq_normalize_shape_kwarg_matches_standalone(self):
+        """``cmp.test_diff_freq(..., normalize_shape=True)`` produces the same
+        result as calling the standalone ``compare_two_groups`` with
+        ``normalize_shape=True`` on ``cmp.spectra_``."""
         rng = np.random.default_rng(0)
         samples = [rng.standard_normal((4, 12, 14)) for _ in range(4)]
         groups = np.array([0, 0, 1, 1])
         gene_names = ["g0", "g1", "g2", "g3"]
         cmp = (
             ComparatorIrregular(
-                _samples_to_adata_list(samples, gene_names), groups, gene_names, n_radial_bins=8
+                _samples_to_adata_list(samples, gene_names), gene_names, n_radial_bins=8
             )
-            .fit()
+            .compute_spectra()
             .normalize_background()
         )
-        before_dc = cmp.dc_.copy()
-        ret = cmp.shape_normalize()
-        # Chainable: returns self
-        assert ret is cmp
-        # spectra_ now sums to 1 along the last axis (probability-vector shape)
-        np.testing.assert_allclose(cmp.spectra_.sum(axis=-1), 1.0, rtol=1e-10)
-        # dc_ is untouched
-        np.testing.assert_array_equal(cmp.dc_, before_dc)
+        df_kw = cmp.test_diff_freq(groups, statistic="log_l2", null="wald", normalize_shape=True)
+        df_manual = compare_two_groups(
+            cmp.spectra_,
+            groups,
+            gene_names=cmp.gene_names,
+            statistic="log_l2",
+            null="wald",
+            normalize_shape=True,
+        )
+        df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
+        df_manual = df_manual.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(
+            df_kw["P_value"].to_numpy(),
+            df_manual["P_value"].to_numpy(),
+            rtol=1e-12,
+            atol=1e-15,
+        )
 
-    def test_shape_normalize_requires_fit(self):
-        gene_names = ["a", "b"]
-        adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
-        cmp = ComparatorIrregular(adatas, np.array([0, 1]), gene_names)
-        with pytest.raises(RuntimeError, match="fit"):
-            cmp.shape_normalize()
+    def test_diff_freq_normalize_shape_kwarg_is_non_destructive(self):
+        """``cmp.spectra_`` must be byte-identical before vs after a
+        ``test_diff_freq(..., normalize_shape=True)`` call."""
+        rng = np.random.default_rng(0)
+        samples = [rng.standard_normal((4, 12, 14)) for _ in range(4)]
+        groups = np.array([0, 0, 1, 1])
+        gene_names = ["g0", "g1", "g2", "g3"]
+        cmp = (
+            ComparatorIrregular(
+                _samples_to_adata_list(samples, gene_names), gene_names, n_radial_bins=8
+            )
+            .compute_spectra()
+            .normalize_background()
+        )
+        before = cmp.spectra_.copy()
+        cmp.test_diff_freq(groups, statistic="log_l2", null="wald", normalize_shape=True)
+        np.testing.assert_array_equal(cmp.spectra_, before)
 
 
 # ---------------------------------------------------------------------------
@@ -1446,14 +1654,12 @@ class TestComparatorIrregularWithSpacings:
         rng = np.random.default_rng(0)
         shapes = [(32, 40), (30, 42), (34, 38), (33, 41)]
         samples = [rng.standard_normal((3, ny, nx)) for (ny, nx) in shapes]
-        groups = np.array([0, 0, 1, 1])
         gene_names = ["g0", "g1", "g2"]
         cmp = ComparatorIrregular(
             _samples_to_adata_list(samples, gene_names),
-            groups,
             gene_names=gene_names,
             n_radial_bins=8,
-        ).fit()
+        ).compute_spectra()
         # 8 edges -> 7 bins after DC-drop.
         assert cmp.spectra_.shape == (4, 3, 7)
         assert cmp.freq_edges is not None
@@ -1539,16 +1745,273 @@ class TestIncompleteData:
         groups = np.array([0, 0, 1, 1])
         cmp = ComparatorIrregular(
             samples,
-            groups,
             gene_names,
             presence_threshold=0.5,
-        ).fit()
+        ).compute_spectra()
         assert cmp.presence_.shape == (4, 3)
         # Gene 0 should be absent in the two samples we zeroed, present elsewhere.
         assert not cmp.presence_[0, 0]
         assert not cmp.presence_[1, 0]
         assert cmp.presence_[2, 0]
-        # Running test_pattern should dispatch to the masked path and return
+        # Running test_diff_freq should dispatch to the masked path and return
         # n_obs_A / n_obs_B columns.
-        df = cmp.test_pattern(statistic="log_l2", n_perm=20, random_state=0)
+        df = cmp.test_diff_freq(groups, statistic="log_l2", n_perm=20, random_state=0)
         assert {"n_obs_A", "n_obs_B"}.issubset(df.columns)
+
+
+# ---------------------------------------------------------------------------
+# normalize_shape kwarg on the comparison functions
+# ---------------------------------------------------------------------------
+
+
+def _stub_spectra_groups(seed: int = 0, n_a: int = 4, n_b: int = 4, n_genes: int = 30, K: int = 12):
+    rng = np.random.default_rng(seed)
+    spec = rng.uniform(0.5, 2.0, size=(n_a + n_b, n_genes, K))
+    groups = np.array([0] * n_a + [1] * n_b)
+    return spec, groups
+
+
+class TestNormalizeShapeKwargCompareTwoGroups:
+    """``normalize_shape`` kwarg on ``compare_two_groups``."""
+
+    @pytest.mark.parametrize(
+        "statistic,null",
+        [
+            ("log_l2", "wald"),
+            ("log_l2", "permutation"),
+            ("welch_t_cauchy", "permutation"),
+        ],
+    )
+    def test_default_false_unchanged(self, statistic, null):
+        spec, groups = _stub_spectra_groups()
+        kw = {"statistic": statistic, "null": null, "n_perm": 200, "random_state": 0}
+        df_a = compare_two_groups(spec, groups, **kw)
+        df_b = compare_two_groups(spec, groups, **kw, normalize_shape=False)
+        # Drop the per-bin object column for welch_t_cauchy (object dtype
+        # confuses pandas equality assertions).
+        for c in ("P_value_per_bin",):
+            df_a = df_a.drop(columns=c, errors="ignore")
+            df_b = df_b.drop(columns=c, errors="ignore")
+        pd.testing.assert_frame_equal(df_a, df_b)
+
+    @pytest.mark.parametrize(
+        "statistic,null",
+        [
+            ("log_l2", "wald"),
+            ("log_l2", "permutation"),
+            ("welch_t_cauchy", "permutation"),
+        ],
+    )
+    def test_kwarg_true_matches_manual(self, statistic, null):
+        spec, groups = _stub_spectra_groups()
+        kw = {"statistic": statistic, "null": null, "n_perm": 200, "random_state": 0}
+        df_kw = compare_two_groups(spec, groups, **kw, normalize_shape=True)
+        df_manual = compare_two_groups(normalize_shape(spec), groups, **kw)
+        # Sort by Feature so row ordering is consistent between calls.
+        df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
+        df_manual = df_manual.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(
+            df_kw["P_value"].to_numpy(),
+            df_manual["P_value"].to_numpy(),
+            rtol=1e-12,
+            atol=1e-15,
+        )
+        np.testing.assert_allclose(
+            df_kw["Statistic"].to_numpy(),
+            df_manual["Statistic"].to_numpy(),
+            rtol=1e-12,
+            atol=1e-15,
+        )
+
+    def test_calibrated_under_h0_log_l2_wald(self):
+        # Random spectra + random labels → P-values from the shape path
+        # should be approximately uniform on [0, 1] under H0.
+        rng = np.random.default_rng(123)
+        spec = rng.uniform(0.5, 2.0, size=(8, 200, 12))
+        groups = np.array([0, 1] * 4)
+        df = compare_two_groups(
+            spec,
+            groups,
+            statistic="log_l2",
+            null="wald",
+            normalize_shape=True,
+        )
+        ks_stat = kstest(df["P_value"].to_numpy(), "uniform").pvalue
+        assert ks_stat > 1e-3, f"shape-path H0 p-value ks-uniform p={ks_stat:.3g}"
+
+
+class TestNormalizeShapeKwargCompareTwoGroupsMasked:
+    """``normalize_shape`` kwarg on ``compare_two_groups_masked``."""
+
+    @pytest.mark.parametrize(
+        "statistic,null",
+        [
+            ("log_l2", "wald"),
+            ("log_l2", "permutation"),
+            ("welch_t_cauchy", "permutation"),
+        ],
+    )
+    def test_default_false_unchanged(self, statistic, null):
+        spec, groups = _stub_spectra_groups()
+        presence = np.ones((spec.shape[0], spec.shape[1]), dtype=bool)
+        kw = {"statistic": statistic, "null": null, "n_perm": 200, "random_state": 0}
+        df_a = compare_two_groups_masked(spec, groups, presence, **kw)
+        df_b = compare_two_groups_masked(spec, groups, presence, **kw, normalize_shape=False)
+        for c in ("P_value_per_bin",):
+            df_a = df_a.drop(columns=c, errors="ignore")
+            df_b = df_b.drop(columns=c, errors="ignore")
+        pd.testing.assert_frame_equal(df_a, df_b)
+
+    @pytest.mark.parametrize(
+        "statistic,null",
+        [
+            ("log_l2", "wald"),
+            ("log_l2", "permutation"),
+            ("welch_t_cauchy", "permutation"),
+        ],
+    )
+    def test_kwarg_true_matches_manual(self, statistic, null):
+        spec, groups = _stub_spectra_groups()
+        presence = np.ones((spec.shape[0], spec.shape[1]), dtype=bool)
+        kw = {"statistic": statistic, "null": null, "n_perm": 200, "random_state": 0}
+        df_kw = compare_two_groups_masked(spec, groups, presence, **kw, normalize_shape=True)
+        df_manual = compare_two_groups_masked(normalize_shape(spec), groups, presence, **kw)
+        df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
+        df_manual = df_manual.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(
+            df_kw["P_value"].to_numpy(),
+            df_manual["P_value"].to_numpy(),
+            rtol=1e-12,
+            atol=1e-15,
+        )
+
+
+class TestNormalizeShapeKwargCompareDesigns:
+    """``normalize_shape`` kwarg on ``compare_glm``."""
+
+    def test_default_false_unchanged(self):
+        spec, _ = _stub_spectra_groups()
+        design = pd.DataFrame({"x": np.arange(spec.shape[0], dtype=float)})
+        df_a = compare_glm(spec, design, "x", statistic="log_l2", null="wald")
+        df_b = compare_glm(
+            spec, design, "x", statistic="log_l2", null="wald", normalize_shape=False
+        )
+        pd.testing.assert_frame_equal(df_a, df_b)
+
+    def test_kwarg_true_matches_manual(self):
+        spec, _ = _stub_spectra_groups()
+        design = pd.DataFrame({"x": np.arange(spec.shape[0], dtype=float)})
+        df_kw = compare_glm(
+            spec, design, "x", statistic="log_l2", null="wald", normalize_shape=True
+        )
+        df_manual = compare_glm(normalize_shape(spec), design, "x", statistic="log_l2", null="wald")
+        df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
+        df_manual = df_manual.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(
+            df_kw["P_value"].to_numpy(),
+            df_manual["P_value"].to_numpy(),
+            rtol=1e-12,
+            atol=1e-15,
+        )
+
+    def test_calibrated_under_h0(self):
+        rng = np.random.default_rng(7)
+        spec = rng.uniform(0.5, 2.0, size=(10, 200, 12))
+        design = pd.DataFrame({"x": rng.standard_normal(10)})
+        df = compare_glm(spec, design, "x", statistic="log_l2", null="wald", normalize_shape=True)
+        ks_p = kstest(df["P_value"].to_numpy(), "uniform").pvalue
+        assert ks_p > 1e-3, f"compare_glm shape-path H0 ks-uniform p={ks_p:.3g}"
+
+
+# ---------------------------------------------------------------------------
+# Unified normalize_* surface API: signatures + ImportError on old names
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizationApiUnification:
+    def test_old_names_removed(self):
+        """The hard rename should make the old names unimportable."""
+        import importlib
+
+        mod = importlib.import_module("quadsv.comparators.multisample")
+        for old in ("normalize_by_background", "residualize_against_covariates", "shape_normalize"):
+            assert not hasattr(
+                mod, old
+            ), f"{old} should have been removed from multisample after the rename"
+            assert (
+                old not in mod.__all__
+            ), f"{old} still listed in multisample.__all__ after the rename"
+
+    def test_three_normalizers_share_eps_default(self):
+        """All three normalize_* helpers expose ``eps=1e-12`` (used inside the
+        per-function log/divide guard)."""
+        import inspect
+
+        for fn in (normalize_background, normalize_covariates, normalize_shape):
+            sig = inspect.signature(fn)
+            assert "eps" in sig.parameters, f"{fn.__name__} missing eps kwarg"
+            assert (
+                sig.parameters["eps"].default == 1e-12
+            ), f"{fn.__name__} eps default differs from 1e-12"
+
+    def test_normalize_covariates_output_strictly_positive(self):
+        """Log-space formulation: output is exp(log P - X β̂), always > 0."""
+        rng = np.random.default_rng(0)
+        gene = rng.lognormal(size=(50, 10))
+        cov = rng.lognormal(size=(3, 10))
+        out = normalize_covariates(gene, cov)
+        assert (out > 0).all(), "log-space normalize_covariates must return > 0"
+
+    def test_normalize_covariates_commutes_with_background_in_log_space(self):
+        """``bg`` is left-mult by a projection on the genes axis; ``cov`` is
+        right-mult by a projection on the bins axis. They commute exactly
+        on log-spectra. Verify via the public (exponentiated) outputs."""
+        rng = np.random.default_rng(0)
+        spec = rng.lognormal(size=(40, 12))  # (G, K)
+        cov = rng.lognormal(size=(2, 12))  # (n_cov, K)
+        order_a = normalize_covariates(normalize_background(spec, axis=-2), cov)
+        order_b = normalize_background(normalize_covariates(spec, cov), axis=-2)
+        np.testing.assert_allclose(order_a, order_b, rtol=1e-10, atol=1e-12)
+
+    def test_normalize_covariates_no_covariates_reduces_to_geo_mean_centering(
+        self,
+    ):
+        """With fit_intercept=True and no covariates, the output equals each
+        gene's spectrum divided by its cross-bin geometric mean."""
+        rng = np.random.default_rng(0)
+        spec = rng.lognormal(size=(15, 9))
+        out = normalize_covariates(spec, np.zeros((0, spec.shape[-1])))
+        geo_mean_per_gene = np.exp(np.mean(np.log(spec + 1e-12), axis=-1, keepdims=True))
+        np.testing.assert_allclose(out, spec / geo_mean_per_gene, rtol=1e-10)
+
+    def test_normalize_background_axis_default_unchanged(self):
+        """Passing axis=-2 explicitly matches omitting it (default)."""
+        rng = np.random.default_rng(0)
+        spec = rng.uniform(0.5, 2.0, size=(2, 5, 8))
+        np.testing.assert_array_equal(
+            normalize_background(spec),
+            normalize_background(spec, axis=-2),
+        )
+
+    def test_comparator_old_method_names_removed(self):
+        """The four retired Comparator method names must not be reachable
+        as instance attributes (rename-guard for breaking API changes)."""
+        gene_names = ["a", "b"]
+        adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
+        cmp = ComparatorIrregular(adatas, gene_names)
+        for old in ("test_pattern", "test_expression", "test", "normalize_shape"):
+            assert not hasattr(cmp, old), f"Comparator.{old} should have been retired in the rename"
+
+    def test_normalize_covariates_first_arg_named_spectra(self):
+        """First-arg rename gene_spectra → spectra. Old keyword should fail."""
+        rng = np.random.default_rng(0)
+        gene = rng.uniform(size=(20, 8))
+        cov = rng.uniform(size=(2, 8))
+        # Named-keyword call with the new name works:
+        out_kw = normalize_covariates(spectra=gene, covariate_spectra=cov)
+        # Positional call still works:
+        out_pos = normalize_covariates(gene, cov)
+        np.testing.assert_array_equal(out_kw, out_pos)
+        # Old keyword name is gone:
+        with pytest.raises(TypeError):
+            normalize_covariates(gene_spectra=gene, covariate_spectra=cov)
