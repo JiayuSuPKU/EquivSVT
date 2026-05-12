@@ -82,7 +82,7 @@ class ComparatorIrregular(_ComparatorBase):
         Number of genes per batched NUFFT call. 32–128 balances finufft's
         per-call overhead against the `(n_spots, chunk)` transient RAM.
     workers : int, optional
-        Forwarded to per-sample FFTs used by :meth:`residualize`.
+        Forwarded to per-sample FFTs used by :meth:`normalize_covariates`.
     """
 
     def __init__(

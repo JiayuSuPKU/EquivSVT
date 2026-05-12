@@ -4,14 +4,14 @@ Shared mixin and input-validation helpers for the comparator layer.
 This module hosts the private :class:`_ComparatorBase` mixin that
 :class:`~quadsv.ComparatorIrregular` and :class:`~quadsv.ComparatorGrid`
 inherit from for their post-fit surface (``normalize_background``,
-``shape_normalize``, ``residualize``, ``test_pattern``,
-``test_expression``, ``benchmark``), plus the two ``_validate_*``
-helpers used by both classes' constructors.
+``normalize_covariates``, ``normalize_shape``, ``test_pattern``,
+``test_expression``), plus the two ``_validate_*`` helpers used by both
+classes' constructors.
 
-The instance-method names are kept (``.shape_normalize``, ``.residualize``)
-for backward compatibility, but they delegate to the unified ``normalize_*``
-standalone functions in :mod:`quadsv.comparators.multisample`
-(``normalize_background``, ``normalize_covariates``, ``normalize_shape``).
+Each chainable instance method (``.normalize_background``,
+``.normalize_covariates``, ``.normalize_shape``) is a thin wrapper
+around the same-named standalone function in
+:mod:`quadsv.comparators.multisample`.
 
 Concrete classes live in sibling modules:
 :mod:`quadsv.comparators.irregular` and
@@ -241,26 +241,28 @@ class _ComparatorBase:
             self.spectra_[i] = _normalize_background(self.spectra_[i])
         return self
 
-    def shape_normalize(self) -> _ComparatorBase:
+    def normalize_shape(self) -> _ComparatorBase:
         """Rescale each ``(sample, gene)`` spectrum to sum-1 along frequency.
 
         Thin chainable wrapper around the standalone
-        :func:`~quadsv.comparators.multisample.normalize_shape` (renamed
-        from the prior ``shape_normalize`` standalone helper).
+        :func:`~quadsv.comparators.multisample.normalize_shape`.
         """
         if self.spectra_ is None:
-            raise RuntimeError("Call .fit() before .shape_normalize().")
+            raise RuntimeError("Call .fit() before .normalize_shape().")
         self.spectra_ = _normalize_shape(self.spectra_, axis=-1)
         return self
 
-    def residualize(self, covariates: Sequence[np.ndarray]) -> _ComparatorBase:
+    def normalize_covariates(self, covariates: Sequence[np.ndarray]) -> _ComparatorBase:
         """Regress out per-sample covariate spectra from :attr:`spectra_`.
+
+        Thin chainable wrapper around the standalone
+        :func:`~quadsv.comparators.multisample.normalize_covariates`.
 
         ``covariates[i]`` should be a ``(n_covariates, ny_i, nx_i)`` array
         matching :attr:`_grid_shapes[i]`.
         """
         if self.spectra_ is None:
-            raise RuntimeError("Call .fit() before .residualize().")
+            raise RuntimeError("Call .fit() before .normalize_covariates().")
         if len(covariates) != len(self.samples):
             raise ValueError(
                 f"covariates length {len(covariates)} != n_samples {len(self.samples)}."

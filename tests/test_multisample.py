@@ -1195,7 +1195,7 @@ class TestComparatorIrregularEndToEnd:
         covariates = [rng.standard_normal((1, ny, nx)) for _ in range(2 * n_per)]
         groups = np.array([0] * n_per + [1] * n_per)
         cmp = ComparatorIrregular(_samples_to_adata_list(samples, gene_names), groups, gene_names)
-        cmp.fit().residualize(covariates)
+        cmp.fit().normalize_covariates(covariates)
         df = cmp.test(statistic="log_l2", n_perm=50, random_state=0)
         assert df.shape[0] == 4
 
@@ -1432,7 +1432,7 @@ class TestShapeNormalize:
         x = np.random.default_rng(0).uniform(0.1, 5.0, size=(3, 8, 6))
         assert normalize_shape(x).shape == x.shape
 
-    def test_spectral_comparator_shape_normalize_chainable(self):
+    def test_spectral_comparator_normalize_shape_chainable(self):
         rng = np.random.default_rng(0)
         samples = [rng.standard_normal((4, 12, 14)) for _ in range(4)]
         groups = np.array([0, 0, 1, 1])
@@ -1445,7 +1445,7 @@ class TestShapeNormalize:
             .normalize_background()
         )
         before_dc = cmp.dc_.copy()
-        ret = cmp.shape_normalize()
+        ret = cmp.normalize_shape()
         # Chainable: returns self
         assert ret is cmp
         # spectra_ now sums to 1 along the last axis (probability-vector shape)
@@ -1453,12 +1453,12 @@ class TestShapeNormalize:
         # dc_ is untouched
         np.testing.assert_array_equal(cmp.dc_, before_dc)
 
-    def test_shape_normalize_requires_fit(self):
+    def test_normalize_shape_requires_fit(self):
         gene_names = ["a", "b"]
         adatas = _samples_to_adata_list([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
         cmp = ComparatorIrregular(adatas, np.array([0, 1]), gene_names)
         with pytest.raises(RuntimeError, match="fit"):
-            cmp.shape_normalize()
+            cmp.normalize_shape()
 
 
 # ---------------------------------------------------------------------------

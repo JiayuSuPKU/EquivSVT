@@ -10,9 +10,9 @@ Subpackage grouping the layer-4 public classes:
   backend).
 
 Both classes share the same post-fit surface
-(``normalize_background``, ``shape_normalize``, ``residualize``,
-``test_pattern``, ``test_expression``, ``benchmark``) through the
-private :class:`~quadsv.comparators.base._ComparatorBase` mixin.
+(``normalize_background``, ``normalize_covariates``, ``normalize_shape``,
+``test_pattern``, ``test_expression``) through the private
+:class:`~quadsv.comparators.base._ComparatorBase` mixin.
 
 The array-level primitives (spectrum compute, radial binning,
 rotation alignment, statistical tests) live in

@@ -8,235 +8,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Analytic Welch t null for `compare_two_groups_scalar`**: new
-  `null="welch"` parameter (now the default) computes the per-gene
-  two-sided p-value from the Welch-Satterthwaite t-distribution
-  instead of a permutation null. Mirrors the analytic-default
-  posture of `compare_two_groups`'s `null="wald"` path on the
-  spectral side, and lets the DE companion produce raw p-values that
-  aren't floored at `1/(n_perm+1)` on small cohorts (which
-  permutation cannot escape and which collapses BH-FDR power on
-  small-n binary panels). The previous permutation null is preserved
-  as `null="permutation"`. New tests cover analytic-vs-scipy parity,
-  null-uniformity under H₀, and the raw-p floor that permutation
-  hits at small n while the analytic path bypasses.
+- **GLM design API for cross-sample pattern comparison.** New public
+  `compare_designs(spectra, design, contrast, …)` generalises the
+  two-group test to arbitrary OLS designs (binary, continuous,
+  multi-factor) with an analytic Wald null. The two-group case is
+  recovered exactly. `ComparatorIrregular` / `ComparatorGrid`
+  constructors accept a `design=` keyword (mutually exclusive with
+  `groups=`); DataFrames are patsy-encoded, ndarrays are used as-is.
+  `Comparator.test_pattern(...)` gains a `contrast=` argument
+  (column name, dict, or contrast vector).
+- **Analytic Wald null for `log_l2`** (`null="wald"`, alias
+  `"liu"`) on `compare_two_groups`, `compare_two_groups_masked`, and
+  `compare_designs`. Per-gene statistic is integrated via Liu's
+  approximation against a pooled-across-genes **full** within-group
+  Σ (a single 30×30 eigendecomposition before each Liu integration);
+  bypasses the small-n permutation BH-floor while keeping mean
+  within-group null FPR at ~0.012 across the three benchmark panels.
+  Emits a `UserWarning` at residual df < 3. The masked variant uses
+  a mask-aware pooled estimator with per-gene noncentrality scaling
+  so genes with different observed cohorts get correctly-scaled
+  eigenvalues.
+- **Analytic Welch t null for `compare_two_groups_scalar`**
+  (`null="welch"`, now the default). Computes per-gene two-sided
+  p-values from the Welch-Satterthwaite t-distribution; lets the DE
+  companion bypass the permutation `1/(n_perm+1)` raw-p floor on
+  small cohorts. The previous permutation null is preserved as
+  `null="permutation"`.
+- **`normalize_shape: bool = False` keyword** on every spectrum-input
+  comparison test (`compare_two_groups`, `compare_two_groups_masked`,
+  `compare_designs`). When True, divides each per-(sample, gene)
+  spectrum by its sum along the frequency axis before the statistic
+  is computed, so the test fires only on shape-only redistribution
+  of power across radial frequencies. Statistic-agnostic; default
+  False preserves prior behaviour.
+- **Effective-rank diagnostics** for the within-group covariance
+  used by the Wald null: `quadsv.effective_rank(cov, weights=None)`
+  primitive (`K_eff = (Σλ)² / Σλ²`),
+  `quadsv.gene_pattern_diversity(spectra)` for per-sample
+  heterogeneity,
+  `quadsv.within_group_pattern_diversity(spectra, groups)` for
+  cohort-level, and a chainable
+  `Comparator.effective_rank(level=…)` accessor.
+- **Top-level convenience exports**:
+  `quadsv.Detector(data, …)` and `quadsv.Comparator(data_list, …)`
+  factories that dispatch on `AnnData` vs `SpatialData`;
+  `quadsv.compute_null_params`, `quadsv.auto_chunk_size`,
+  `quadsv.liu_sf` promoted to top level (canonical
+  `quadsv.statistics` paths still work).
+- **Public-API freeze test** (`tests/test_public_api.py`) snapshots
+  `__all__`, docstring presence, canonical-path identity, and
+  asserts removed legacy paths raise `ModuleNotFoundError`.
+
+### Changed
+- **Breaking: package layout migrated to `src/quadsv/`** with the
+  four conceptual layers as physical subpackages —
+  `quadsv.kernels.{fft,nufft}`,
+  `quadsv.detectors.{base,irregular,grid}`,
+  `quadsv.comparators.{__init__,multisample}`. `import quadsv` and
+  `from quadsv import …` keep working; editable installs must be
+  reissued (`pip install -e ".[dev]"`). Lint / format commands now
+  target `src/ tests/`.
+- **Breaking: unified `normalize_*` surface API in
+  `quadsv.comparators.multisample`** (no aliases):
+    * `normalize_by_background` → `normalize_background`
+    * `residualize_against_covariates` → `normalize_covariates`
+    * `shape_normalize` → `normalize_shape`
+  Consistent first-arg `spectra`, keyword-only after, NumPy-style
+  docstrings with LaTeX math.
+  `normalize_covariates`'s first positional arg is renamed
+  `gene_spectra` → `spectra` and the `eps` kwarg is dropped (the
+  closed-form pseudoinverse is numerically robust on the typical
+  low-`n_cov` designs used here). The chainable comparator
+  instance methods follow suit:
+    * `.shape_normalize()` → `.normalize_shape()`
+    * `.residualize()` → `.normalize_covariates()`
 
 ### Removed
-- **Breaking: `center` argument retired across the comparator API.**
-  `ComparatorIrregular`, `ComparatorGrid`, and `compute_sample_spectrum`
-  no longer accept `center`. Per-gene mean centering (`center='mean'`,
-  the previous default) is now the only spectrum normalization path —
-  it removes DC from the spectrum and orthogonalizes the AC pattern test
-  against the DC `compare_two_groups_scalar` DE test, which the
-  benchmark sweep showed dominated `center='zscore'` and `center=None`
-  on every panel. `_ZSCORE_CLIP` constant, the `zscore_clip` parameter
-  on `compute_sample_spectrum`, and the per-bin `_ZSCORE_CLIP` clamp
-  in the NUFFT comparator loop are also deleted (~50 LOC). Callers
-  passing `center=` will hit `TypeError: unexpected keyword argument`.
-  `_ComparatorBase.center` attribute removed; `_validate_common`
-  signature shrinks by one argument.
-- **Breaking: `benchmark_statistics` function retired.** The thin
-  `compare_two_groups`-with-shared-permutations wrapper was unused;
-  callers should invoke `compare_two_groups` directly with both
-  `statistic="log_l2"` and `statistic="cauchy_welch"` to A/B compare
-  on the same fitted spectra. The matching `Comparator.benchmark()`
-  method is also removed. ~95 LOC.
-
-### Changed
-- Benchmark sweep grid shrank from 2 × 2 × 3 = 12 configs to 2 × 2 = 4
-  configs (statistic × feature_mode). Sweep wall-clock dropped from
-  ~5.5 min to ~2 min on the same 3-panel × 19-sample-set workload.
-  Recommended pipeline is now **`feature_mode="2d"` + `statistic="log_l2"`
-  + `null="wald"`** (composite −0.051; `radial / log_l2` tied within
-  0.003). Outdated benchmark output files (`bench_F1_perm_*`,
-  `bench_sci_smoke_*`) and exploratory diagnostic figures
-  (`diag_hierarchical_sigma`, `diag_linear_shrinkage_alpha_sweep`,
-  `diag_masked_wald_proposal`, `diag_per_panel_sigma_structure`,
-  `sci_slide_layouts`) were cleaned up; the legacy
-  `run_comparator_panel.py` per-panel runner and the
-  `HIERARCHICAL_SIGMA_AND_MASKED_WALD.md` design memo (subsumed by
-  the comparator_benchmark/README.md §4 narrative) were also deleted.
-
-### Added
-- **sci benchmark switched to section-level samples.** Each Lu et al.
-  (GSE256397) Visium array carries four disjoint cryosections of the
-  same (timepoint, distance) on one capture area. New helper
-  `scripts/comparator_benchmark/split_sci_sections.py` clusters spots
-  via DBSCAN (`eps=110`, `min_samples=10`; cleanly separates 4/4
-  sections on every non-empty slide with 0 noise spots) and writes
-  per-section `.h5ad` to `data/sci/adata_sections/` with a matching
-  `metadata_sections.csv`. The benchmark `sci` panel now defaults to
-  section-level (16 sham vs 12 t72 sub-AnnData, residual df 26 vs 5
-  previously); the legacy slide-level view is preserved as
-  `--panels sci_slides`. Within-condition split nulls are
-  slide-preserving (all 4 sections from a slide go to the same arm)
-  to avoid pseudo-replication contamination of the H₀ baseline.
-  Empirical comparison: `cauchy_welch` sci-panel sensitivity halves
-  on `2d/mean` (rank-pct 0.28 → 0.14) and quarters on `2d/zscore`
-  (0.49 → 0.11) — Welch-Satterthwaite df becomes well-behaved at
-  section sample size. The recommended `log_l2 + wald` configs are
-  panel-stable across the slide/section change. See
-  `scripts/comparator_benchmark/README.md` §3, §4.5 for the full
-  comparison.
-- **Effective rank / spatial-pattern diversity primitives.** Three new
-  public functions and a comparator method for diagnosing how
-  concentrated a sample's or cohort's spatial-frequency content is:
-  - `quadsv.effective_rank(cov, weights=None)` — primitive computing
-    `K_eff = (Σλ)² / Σλ²` for a covariance matrix, bounded by 1
-    (rank-1, all power on one direction → Wald reduces to a 1-DoF
-    test, very sensitive to estimation noise) and K (uniformly spread
-    → CLT smoothing applies). Optional per-bin weights for analysing
-    weighted-L2 statistics.
-  - `quadsv.gene_pattern_diversity(spectra)` — single-sample heterogeneity:
-    K_eff of the cross-gene spectrum covariance. Low K_eff means the
-    sample's genes share a single dominant spatial-frequency profile;
-    high K_eff means a rich mix of spatial scales.
-  - `quadsv.within_group_pattern_diversity(spectra, groups)` —
-    cohort-level heterogeneity: K_eff of the pooled within-group
-    residual covariance (the same Σ used by `log_l2 + null='wald'`).
-    Low K_eff is a warning that the Wald analytic null may be
-    miscalibrated due to estimation noise concentrated in a single
-    direction.
-  - `Comparator.effective_rank(level='within_group' | 'per_sample')` —
-    convenience accessor on a fitted comparator. Useful for diagnosing
-    why two cohorts have different post-Wald p-value distributions.
-  Empirical reference values on the benchmark panels (within-group):
-  ad_pig 4.05, brain_dev 1.15, sci 1.29 — directly explains the
-  ranking of post-F1 QQ-deviation across panels (sci worst, ad_pig
-  best). 10 new tests in `TestEffectiveRank`.
-- **`compare_two_groups_masked` now supports `null="wald"`** for
-  `statistic="log_l2"`. Implementation uses a mask-aware pooled
-  covariance estimator (new `_pooled_full_within_group_sigma_masked`)
-  that accumulates per-gene `R_g.T @ R_g` over each gene's present
-  (sample, gene) cells, and per-gene noncentrality scaling
-  `v_{c,g} = 1/n_a_g + 1/n_b_g` adjusts the eigenvalues for that
-  gene's specific cohort. Cross-bin correlation structure is shared
-  across genes (same A3 assumption already in use). Empirical
-  calibration on synthetic missingness 0–50% on the ad_pig cohort
-  yields raw FPR 0.025–0.13 (matching the unmasked Wald baseline) and
-  BH-adjusted FPR 0.004–0.07; tests 3–12× more genes than the
-  pre-filter workaround. Five new regression tests in
-  `TestLogL2WaldNull`. The previous `NotImplementedError` for
-  `null="wald"` on the masked path is removed.
-
-### Changed
-- **`null="wald"` (`log_l2`) now emits a `UserWarning` when residual df
-  is below 3** (i.e., `n_a + n_b ≤ 4`). The warning explains that the
-  σ̂² estimator has ≥ 67% relative noise in that regime so per-test
-  calibration may be anti-conservative, and recommends switching to
-  `statistic="cauchy_welch"` for stricter calibration. Suppress with
-  the standard `warnings.filterwarnings("ignore", ...)` recipe if you
-  accept the calibration risk. Added `TestLogL2WaldNull::test_small_df_emits_user_warning`.
-- **`null="wald"` for `log_l2` now uses a pooled-across-genes FULL Σ
-  estimator** (was: pooled-diagonal Σ). The diagonal proxy was empirically
-  anti-conservative on real spatial data because radial-bin spectra are
-  strongly correlated within each gene (mean off-diag |r| 0.5-0.95 across
-  benchmark panels), so the true Σ has effective rank 1-4 not 30. The
-  diagonal proxy spread that single dominant eigenvalue across all 30
-  bins, dramatically under-modelling the tail of the resulting weighted-χ²
-  mixture and producing within-group null FPR up to 0.71 instead of the
-  nominal 0.05. Switching to pooled-FULL Σ + a single 30×30
-  eigendecomposition before Liu integration drops mean within-group null
-  FPR from 0.175 → 0.012 across the three benchmark panels (14×) without
-  changing sensitivity. The recommended pipeline is now
-  `radial / mean / log_l2 + null="wald"` again (was `cauchy_welch` in the
-  previous benchmark run because of the FPR penalty in the composite
-  score). See `TestLogL2WaldNull::test_full_sigma_calibrates_under_correlated_bins`
-  for a synthetic regression test. Residual anti-conservativeness at
-  df=1 (1-vs-2 splits) is a known limitation tied to noise in the σ²
-  estimator itself; eBayes-style σ²-shrinkage would close it.
-
-### Added
-- New `compare_designs(spectra, design, contrast, ...)` public function
-  generalises the two-group comparator to arbitrary OLS designs (binary,
-  continuous, or multi-factor). Supports analytic Wald null only
-  (`null="wald"`, alias `"liu"`); permutation is intentionally not
-  implemented for the GLM path (use the binary `groups=` API for
-  permutation tests). The two-group case is recovered exactly: passing
-  `design=pd.DataFrame({"g": groups})` with `contrast="g"` produces
-  p-values matching `compare_two_groups(..., null="wald")` to ~1e-10.
-- `ComparatorIrregular` and `ComparatorGrid` constructors accept a new
-  `design=` keyword (mutually exclusive with `groups=`). DataFrames are
-  encoded via patsy (`~ <every column>` formula, treatment-coded
-  categoricals + intercept); ndarrays are used as-is. The
-  back-compat `groups=` keyword is preserved.
-- `Comparator.test_pattern(...)` accepts a new `contrast=` argument: a
-  column name (auto-resolves treatment-coded factor levels), a dict
-  `{column: coefficient}`, or a length-`p` numpy contrast vector.
-  Defaults to `None`, in which case the binary `groups=` path is used.
-- Analytic Wald-type null for `log_l2`: pass `null="wald"` (alias
-  `null="liu"`) to `compare_two_groups`, `compare_two_groups_masked`,
-  `benchmark_statistics`, or `Comparator.test_pattern`/`.benchmark`.
-  Under H₀ the per-gene statistic `T² = D'WD` is a quadratic form in a
-  Gaussian difference-of-means; the tail of the resulting weighted-χ²
-  mixture is integrated via Liu's approximation
-  (`quadsv.statistics.liu_sf`). The within-group variance is estimated
-  diagonally per frequency bin and pooled across genes. Default null
-  remains `"permutation"` for back-compat. Currently only valid with
-  `statistic="log_l2"`; `compare_two_groups_masked` will raise
-  `NotImplementedError` (the per-gene presence subsetting breaks the
-  pooled-σ² estimator). The Wald path bypasses the small-n
-  exact-permutation BH-floor at the cost of mild anti-conservatism on
-  contrasts with very small residual df (e.g. 1-vs-2 splits) — see
-  the new `TestLogL2WaldNull` calibration tests.
-- Package layout migrated to `src/quadsv/` (no behavioural change for
-  consumers; existing `import quadsv` and `from quadsv import ...`
-  keep working). Editable installs must be reissued
-  (`pip install -e ".[dev]"`).
-- Three power-user helpers promoted to top-level:
-  `quadsv.compute_null_params`, `quadsv.auto_chunk_size`,
-  `quadsv.liu_sf`. The canonical `quadsv.statistics` paths still
-  work.
-- New type-dispatch factory entry points:
-  `quadsv.Detector(data, **kw)` and
-  `quadsv.Comparator(data_list, **kw)`. They dispatch on
-  `isinstance(data, AnnData)` to `DetectorIrregular` /
-  `ComparatorIrregular` vs `isinstance(data, SpatialData)` to
-  `DetectorGrid` / `ComparatorGrid`. Mixed-type lists raise
-  `TypeError`.
-- New `tests/test_public_api.py` freezes the public surface:
-  `__all__` snapshot, docstring presence, canonical-path identity,
-  the negative assertion that the removed legacy module paths
-  raise `ModuleNotFoundError`, and a check that backend ABCs do
-  not leak into the top-level namespace.
+- **Breaking: `center` argument retired** across the comparator API.
+  `ComparatorIrregular`, `ComparatorGrid`, and
+  `compute_sample_spectrum` no longer accept `center`. Per-gene
+  mean centring (the previous default) is now the only spectrum
+  normalisation path. The `_ZSCORE_CLIP` constant, the
+  `zscore_clip` parameter, and the per-bin clamp in the NUFFT loop
+  are deleted (~50 LOC).
+- **Breaking: `benchmark_statistics` function and the matching
+  `Comparator.benchmark()` method retired.** Invoke
+  `compare_two_groups` directly with each `statistic=` value to A/B
+  compare on the same fitted spectra (~95 LOC).
+- **Breaking: `statistic="hotelling_lw"` and `statistic="mmd_rbf"`
+  paths retired** from every comparison function. Both were
+  impractically slow and consistently dominated on sensitivity by
+  `log_l2 + null='wald'` or `cauchy_welch`. `_AVAILABLE_STATISTICS`
+  now reads `("log_l2", "cauchy_welch")`.
+- **Breaking: six legacy-path shim modules removed** —
+  `quadsv.fft`, `quadsv.nufft`, `quadsv.detector`,
+  `quadsv.detector_grid`, `quadsv._detector_base`,
+  `quadsv.multisample`. Use the canonical subpackage paths.
+- **Breaking: backend ABCs `Kernel` and `MatrixKernelBase` no
+  longer re-exported from top-level `quadsv`**. They live at
+  `quadsv.kernels` and are intended for backend authors.
 
 ### Fixed
-- CI workflow's install step referenced non-existent extras
+- CI workflow install step referenced non-existent extras
   (`[dev,test,spatial]` and `[docs,spatial]`); narrowed to the
-  actual `[dev]` / `[docs]` extras defined in `pyproject.toml`.
-
-### Changed
-- The four conceptual layers are now physical subpackages:
-  - `quadsv.kernels.{fft,nufft}` (was `quadsv.fft`, `quadsv.nufft`)
-  - `quadsv.detectors.{base,irregular,grid}` (was
-    `quadsv._detector_base`, `quadsv.detector`,
-    `quadsv.detector_grid`)
-  - `quadsv.comparators.{__init__,multisample}` (was
-    `quadsv.comparators` flat module + `quadsv.multisample`)
-  Lint / format commands now target `src/ tests/` (was
-  `quadsv/ tests/`).
-
-### Removed
-- **Breaking**: `statistic="hotelling_lw"` and `statistic="mmd_rbf"` paths
-  retired from `compare_two_groups`, `compare_two_groups_masked`,
-  `benchmark_statistics`, and the comparator API. The benchmark sweep
-  showed both were impractically slow (per-gene matrix inversions /
-  pairwise kernels at >30 min/cell on a 3 000-gene panel) and were
-  consistently dominated on sensitivity by `log_l2 + null='wald'` or
-  `cauchy_welch`. `_AVAILABLE_STATISTICS` now reads `("log_l2",
-  "cauchy_welch")`. Callers passing the removed names will hit the
-  existing `ValueError("Unknown statistic ...")` validator. The internal
-  `_stat_hotelling_lw`, `_stat_mmd_rbf`, and `_ledoit_wolf_shrinkage`
-  helpers were also deleted (~57 LOC).
-- The six legacy-path shim modules `quadsv.fft`, `quadsv.nufft`,
-  `quadsv.detector`, `quadsv.detector_grid`,
-  `quadsv._detector_base`, and `quadsv.multisample`. Use the
-  canonical subpackage paths above.
-- The backend ABCs `Kernel` and `MatrixKernelBase` are no longer
-  re-exported from the top-level `quadsv` namespace. They live at
-  `quadsv.kernels` and are intended for backend authors. Subclass
-  `quadsv.kernels.Kernel` for a custom kernel and
-  `quadsv.kernels.MatrixKernelBase` for a custom matrix backend.
+  actual `[dev]` / `[docs]` extras in `pyproject.toml`.
 
 ## Release Process
 
