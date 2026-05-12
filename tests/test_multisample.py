@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import pytest
 from scipy.stats import kstest
 
@@ -17,10 +18,10 @@ from quadsv.comparators.multisample import (
     compare_two_groups_scalar,
     compute_sample_spectrum,
     estimate_rotations_from_landmarks,
-    normalize_by_background,
+    normalize_background,
+    normalize_covariates,
+    normalize_shape,
     radial_bin_spectrum,
-    residualize_against_covariates,
-    shape_normalize,
 )
 from quadsv.kernels.fft import power_spectrum_2d
 
@@ -415,13 +416,13 @@ class TestBackgroundNormalization:
     def test_identical_genes_become_unit_after_normalization(self):
         # Every gene has the same spectrum -> geo mean = same -> ratio = 1.
         spec = np.tile(np.arange(1.0, 6.0), (10, 1))  # (10 genes, K=5), all rows equal
-        out = normalize_by_background(spec)
+        out = normalize_background(spec)
         np.testing.assert_allclose(out, np.ones_like(out), atol=1e-9)
 
     def test_preserves_shape(self):
         rng = np.random.default_rng(0)
         spec = rng.uniform(0.1, 10.0, size=(7, 12))
-        out = normalize_by_background(spec)
+        out = normalize_background(spec)
         assert out.shape == spec.shape
 
 
@@ -431,12 +432,12 @@ class TestResidualization:
         cov = rng.uniform(0.1, 5.0, size=(2, 8))  # 2 covariates, K=8
         gene = 1.5 * cov[0] - 0.7 * cov[1] + 2.0  # exact linear combo + intercept
         gene = np.tile(gene, (5, 1))
-        out = residualize_against_covariates(gene, cov, fit_intercept=True)
+        out = normalize_covariates(gene, cov, fit_intercept=True)
         np.testing.assert_allclose(out, 0.0, atol=1e-9)
 
     def test_shape_validation(self):
         with pytest.raises(ValueError, match="Last axis"):
-            residualize_against_covariates(np.zeros((3, 5)), np.zeros((2, 4)))
+            normalize_covariates(np.zeros((3, 5)), np.zeros((2, 4)))
 
 
 # ---------------------------------------------------------------------------
@@ -1404,7 +1405,7 @@ class TestComparatorIrregularDcAccess:
 
 
 # ---------------------------------------------------------------------------
-# shape_normalize: magnitude-invariant spectrum shapes
+# normalize_shape: magnitude-invariant spectrum shapes
 # ---------------------------------------------------------------------------
 
 
@@ -1412,7 +1413,7 @@ class TestShapeNormalize:
     def test_sum_to_one_along_axis(self):
         rng = np.random.default_rng(0)
         x = rng.uniform(0.1, 10.0, size=(4, 7, 12))
-        out = shape_normalize(x, axis=-1)
+        out = normalize_shape(x, axis=-1)
         np.testing.assert_allclose(out.sum(axis=-1), 1.0, rtol=1e-12)
 
     def test_cancels_scalar_rescale(self):
@@ -1421,7 +1422,7 @@ class TestShapeNormalize:
         row = rng.uniform(0.5, 3.0, size=10)
         scales = np.array([[0.3], [1.0], [50.0]])
         stack = scales * row[None, :]
-        out = shape_normalize(stack, axis=-1)
+        out = normalize_shape(stack, axis=-1)
         # All three rows become identical probability vectors after L1
         # normalization (the shared shape of the row).
         np.testing.assert_allclose(out[0], out[1], rtol=1e-10, atol=1e-12)
@@ -1429,7 +1430,7 @@ class TestShapeNormalize:
 
     def test_preserves_shape(self):
         x = np.random.default_rng(0).uniform(0.1, 5.0, size=(3, 8, 6))
-        assert shape_normalize(x).shape == x.shape
+        assert normalize_shape(x).shape == x.shape
 
     def test_spectral_comparator_shape_normalize_chainable(self):
         rng = np.random.default_rng(0)
@@ -1620,3 +1621,239 @@ class TestIncompleteData:
         # n_obs_A / n_obs_B columns.
         df = cmp.test_pattern(statistic="log_l2", n_perm=20, random_state=0)
         assert {"n_obs_A", "n_obs_B"}.issubset(df.columns)
+
+
+# ---------------------------------------------------------------------------
+# normalize_shape kwarg on the comparison functions
+# ---------------------------------------------------------------------------
+
+
+def _stub_spectra_groups(seed: int = 0, n_a: int = 4, n_b: int = 4, n_genes: int = 30, K: int = 12):
+    rng = np.random.default_rng(seed)
+    spec = rng.uniform(0.5, 2.0, size=(n_a + n_b, n_genes, K))
+    groups = np.array([0] * n_a + [1] * n_b)
+    return spec, groups
+
+
+class TestNormalizeShapeKwargCompareTwoGroups:
+    """``normalize_shape`` kwarg on ``compare_two_groups``."""
+
+    @pytest.mark.parametrize(
+        "statistic,null",
+        [
+            ("log_l2", "wald"),
+            ("log_l2", "permutation"),
+            ("cauchy_welch", "permutation"),
+        ],
+    )
+    def test_default_false_unchanged(self, statistic, null):
+        spec, groups = _stub_spectra_groups()
+        kw = {"statistic": statistic, "null": null, "n_perm": 200, "random_state": 0}
+        df_a = compare_two_groups(spec, groups, **kw)
+        df_b = compare_two_groups(spec, groups, **kw, normalize_shape=False)
+        # Drop the per-bin object column for cauchy_welch (object dtype
+        # confuses pandas equality assertions).
+        for c in ("P_value_per_bin",):
+            df_a = df_a.drop(columns=c, errors="ignore")
+            df_b = df_b.drop(columns=c, errors="ignore")
+        pd.testing.assert_frame_equal(df_a, df_b)
+
+    @pytest.mark.parametrize(
+        "statistic,null",
+        [
+            ("log_l2", "wald"),
+            ("log_l2", "permutation"),
+            ("cauchy_welch", "permutation"),
+        ],
+    )
+    def test_kwarg_true_matches_manual(self, statistic, null):
+        spec, groups = _stub_spectra_groups()
+        kw = {"statistic": statistic, "null": null, "n_perm": 200, "random_state": 0}
+        df_kw = compare_two_groups(spec, groups, **kw, normalize_shape=True)
+        df_manual = compare_two_groups(normalize_shape(spec), groups, **kw)
+        # Sort by Feature so row ordering is consistent between calls.
+        df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
+        df_manual = df_manual.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(
+            df_kw["P_value"].to_numpy(),
+            df_manual["P_value"].to_numpy(),
+            rtol=1e-12,
+            atol=1e-15,
+        )
+        np.testing.assert_allclose(
+            df_kw["Statistic"].to_numpy(),
+            df_manual["Statistic"].to_numpy(),
+            rtol=1e-12,
+            atol=1e-15,
+        )
+
+    def test_calibrated_under_h0_log_l2_wald(self):
+        # Random spectra + random labels → P-values from the shape path
+        # should be approximately uniform on [0, 1] under H0.
+        rng = np.random.default_rng(123)
+        spec = rng.uniform(0.5, 2.0, size=(8, 200, 12))
+        groups = np.array([0, 1] * 4)
+        df = compare_two_groups(
+            spec,
+            groups,
+            statistic="log_l2",
+            null="wald",
+            normalize_shape=True,
+        )
+        ks_stat = kstest(df["P_value"].to_numpy(), "uniform").pvalue
+        assert ks_stat > 1e-3, f"shape-path H0 p-value ks-uniform p={ks_stat:.3g}"
+
+
+class TestNormalizeShapeKwargCompareTwoGroupsMasked:
+    """``normalize_shape`` kwarg on ``compare_two_groups_masked``."""
+
+    @pytest.mark.parametrize(
+        "statistic,null",
+        [
+            ("log_l2", "wald"),
+            ("log_l2", "permutation"),
+            ("cauchy_welch", "permutation"),
+        ],
+    )
+    def test_default_false_unchanged(self, statistic, null):
+        spec, groups = _stub_spectra_groups()
+        presence = np.ones((spec.shape[0], spec.shape[1]), dtype=bool)
+        kw = {"statistic": statistic, "null": null, "n_perm": 200, "random_state": 0}
+        df_a = compare_two_groups_masked(spec, groups, presence, **kw)
+        df_b = compare_two_groups_masked(spec, groups, presence, **kw, normalize_shape=False)
+        for c in ("P_value_per_bin",):
+            df_a = df_a.drop(columns=c, errors="ignore")
+            df_b = df_b.drop(columns=c, errors="ignore")
+        pd.testing.assert_frame_equal(df_a, df_b)
+
+    @pytest.mark.parametrize(
+        "statistic,null",
+        [
+            ("log_l2", "wald"),
+            ("log_l2", "permutation"),
+            ("cauchy_welch", "permutation"),
+        ],
+    )
+    def test_kwarg_true_matches_manual(self, statistic, null):
+        spec, groups = _stub_spectra_groups()
+        presence = np.ones((spec.shape[0], spec.shape[1]), dtype=bool)
+        kw = {"statistic": statistic, "null": null, "n_perm": 200, "random_state": 0}
+        df_kw = compare_two_groups_masked(spec, groups, presence, **kw, normalize_shape=True)
+        df_manual = compare_two_groups_masked(normalize_shape(spec), groups, presence, **kw)
+        df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
+        df_manual = df_manual.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(
+            df_kw["P_value"].to_numpy(),
+            df_manual["P_value"].to_numpy(),
+            rtol=1e-12,
+            atol=1e-15,
+        )
+
+
+class TestNormalizeShapeKwargCompareDesigns:
+    """``normalize_shape`` kwarg on ``compare_designs``."""
+
+    def test_default_false_unchanged(self):
+        spec, _ = _stub_spectra_groups()
+        design = pd.DataFrame({"x": np.arange(spec.shape[0], dtype=float)})
+        df_a = compare_designs(spec, design, "x", statistic="log_l2", null="wald")
+        df_b = compare_designs(
+            spec, design, "x", statistic="log_l2", null="wald", normalize_shape=False
+        )
+        pd.testing.assert_frame_equal(df_a, df_b)
+
+    def test_kwarg_true_matches_manual(self):
+        spec, _ = _stub_spectra_groups()
+        design = pd.DataFrame({"x": np.arange(spec.shape[0], dtype=float)})
+        df_kw = compare_designs(
+            spec, design, "x", statistic="log_l2", null="wald", normalize_shape=True
+        )
+        df_manual = compare_designs(
+            normalize_shape(spec), design, "x", statistic="log_l2", null="wald"
+        )
+        df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
+        df_manual = df_manual.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(
+            df_kw["P_value"].to_numpy(),
+            df_manual["P_value"].to_numpy(),
+            rtol=1e-12,
+            atol=1e-15,
+        )
+
+    def test_calibrated_under_h0(self):
+        rng = np.random.default_rng(7)
+        spec = rng.uniform(0.5, 2.0, size=(10, 200, 12))
+        design = pd.DataFrame({"x": rng.standard_normal(10)})
+        df = compare_designs(
+            spec, design, "x", statistic="log_l2", null="wald", normalize_shape=True
+        )
+        ks_p = kstest(df["P_value"].to_numpy(), "uniform").pvalue
+        assert ks_p > 1e-3, f"compare_designs shape-path H0 ks-uniform p={ks_p:.3g}"
+
+
+# ---------------------------------------------------------------------------
+# Unified normalize_* surface API: signatures + ImportError on old names
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizationApiUnification:
+    def test_old_names_removed(self):
+        """The hard rename should make the old names unimportable."""
+        import importlib
+
+        mod = importlib.import_module("quadsv.comparators.multisample")
+        for old in ("normalize_by_background", "residualize_against_covariates", "shape_normalize"):
+            assert not hasattr(
+                mod, old
+            ), f"{old} should have been removed from multisample after the rename"
+            assert (
+                old not in mod.__all__
+            ), f"{old} still listed in multisample.__all__ after the rename"
+
+    def test_eps_default_consistent_where_used(self):
+        """``normalize_background`` and ``normalize_shape`` both expose
+        ``eps=1e-12`` (used inside log/divide). ``normalize_covariates`` does
+        not have an ``eps`` parameter — the closed-form pseudoinverse path is
+        numerically stable on the low-``n_cov`` designs used here, so adding a
+        no-op kwarg purely for API symmetry would be misleading."""
+        import inspect
+
+        for fn in (normalize_background, normalize_shape):
+            sig = inspect.signature(fn)
+            assert "eps" in sig.parameters, f"{fn.__name__} missing eps kwarg"
+            assert (
+                sig.parameters["eps"].default == 1e-12
+            ), f"{fn.__name__} eps default differs from 1e-12"
+        # normalize_covariates intentionally omits eps.
+        assert "eps" not in inspect.signature(normalize_covariates).parameters
+
+    def test_normalize_covariates_rejects_eps_kwarg(self):
+        """``eps`` was dropped — passing it must now raise TypeError."""
+        rng = np.random.default_rng(0)
+        gene = rng.uniform(size=(5, 6))
+        cov = rng.uniform(size=(1, 6))
+        with pytest.raises(TypeError):
+            normalize_covariates(gene, cov, eps=1e-12)
+
+    def test_normalize_background_axis_default_unchanged(self):
+        """Passing axis=-2 explicitly matches omitting it (default)."""
+        rng = np.random.default_rng(0)
+        spec = rng.uniform(0.5, 2.0, size=(2, 5, 8))
+        np.testing.assert_array_equal(
+            normalize_background(spec),
+            normalize_background(spec, axis=-2),
+        )
+
+    def test_normalize_covariates_first_arg_named_spectra(self):
+        """First-arg rename gene_spectra → spectra. Old keyword should fail."""
+        rng = np.random.default_rng(0)
+        gene = rng.uniform(size=(20, 8))
+        cov = rng.uniform(size=(2, 8))
+        # Named-keyword call with the new name works:
+        out_kw = normalize_covariates(spectra=gene, covariate_spectra=cov)
+        # Positional call still works:
+        out_pos = normalize_covariates(gene, cov)
+        np.testing.assert_array_equal(out_kw, out_pos)
+        # Old keyword name is gone:
+        with pytest.raises(TypeError):
+            normalize_covariates(gene_spectra=gene, covariate_spectra=cov)

@@ -19,9 +19,12 @@ Pipeline
    :func:`align_spectra_by_rotation` rotates each sample's full 2D spectrum to
    maximize similarity to a reference, restoring comparability when directional
    anisotropy matters.
-4. **Batch correction** — :func:`normalize_by_background` cancels per-slide
-   gain/sensitivity differences; :func:`residualize_against_covariates` regresses out
-   user-supplied covariate spectra (cell-type proportions, tissue domains, etc.).
+4. **Batch correction** — :func:`normalize_background` cancels per-slide
+   gain/sensitivity differences; :func:`normalize_covariates` regresses out
+   user-supplied covariate spectra (cell-type proportions, tissue domains, etc.);
+   :func:`normalize_shape` projects per-(sample, gene) spectra onto the
+   probability simplex along the frequency axis, isolating shape-only
+   redistribution from amplitude differences.
 5. **Two-group test per gene** — :func:`compare_two_groups` produces a
    per-gene table with a permutation (or analytic Wald) p-value and BH-FDR.
 
@@ -65,9 +68,9 @@ __all__ = [
     "align_spectra_by_rotation",
     "estimate_rotations_from_landmarks",
     "apply_rotations_to_spectra",
-    "normalize_by_background",
-    "residualize_against_covariates",
-    "shape_normalize",
+    "normalize_background",
+    "normalize_covariates",
+    "normalize_shape",
     "compare_two_groups",
     "compare_two_groups_masked",
     "compare_two_groups_scalar",
@@ -640,94 +643,221 @@ def align_spectra_by_rotation(
 # ---------------------------------------------------------------------------
 
 
-def normalize_by_background(
+def normalize_background(
     spectra: np.ndarray,
+    *,
+    axis: int = -2,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """
-    Cancel per-sample multiplicative effects via the geometric-mean spectrum.
+    """Cancel per-sample multiplicative gain via cross-gene geometric-mean centring.
 
-    For a single sample with spectra ``(n_genes, K)``, computes the geometric-mean
-    spectrum across genes :math:`\\bar P(k) = \\exp(\\overline{\\log P(\\cdot, k)})`
-    and returns ``spectra / bar_P``. In log-space this equals subtracting the per-bin
-    mean of ``log P`` across genes — the standard recipe for cancelling sample-level
-    sensitivity / depth differences.
+    For each (sample, frequency-bin) pair, every gene's power is divided
+    by the geometric mean of the spectrum across the genes axis. Use
+    this to correct per-sample multiplicative gain (sequencing depth,
+    antibody titre, dewaxing efficiency) that scales every gene's
+    spectrum at every frequency by a sample-level factor.
 
     Parameters
     ----------
     spectra : np.ndarray
-        Per-sample spectra of shape ``(..., n_genes, K)``. The geometric mean is
-        computed along the ``n_genes`` axis (second-to-last).
+        Non-negative spectra :math:`P` with shape ``(..., G, K)``
+        (:math:`G` along ``axis``, :math:`K` frequency bins on the
+        trailing axis). Any leading dimensions (e.g., ``n_samples``)
+        are broadcast over.
+    axis : int, default -2
+        Axis along which the cross-gene geometric mean is taken
+        (the genes axis).
     eps : float, default 1e-12
-        Floor added before the log to avoid ``log(0)``.
+        Floor :math:`\\varepsilon` added before the logarithm to keep
+        zeros finite.
 
     Returns
     -------
     np.ndarray
-        Background-normalized spectra, same shape as the input.
+        Background-normalized spectra :math:`\\tilde P`, same shape as
+        ``spectra``. Never mutates the input.
 
     Notes
     -----
-    **Equivalence with a per-sample one-hot covariate.** When stacking all
-    ``(sample, gene)`` log-spectra as rows and regressing each frequency bin
-    against a one-hot *sample-ID* indicator (i.e., a fixed sample effect
-    per bin), the residuals are, by construction, the per-sample demeaned
-    log-spectra — which is exactly what this function computes in log-space.
-    That is: running this function sample-by-sample is mathematically
-    identical to fitting a one-hot-sample covariate in log-space and
-    residualizing. This is why a separate "residualize against
-    per-sample one-hot" step is unnecessary — it is already covered here.
+    Let :math:`P` denote the input spectrum, :math:`G` the number of
+    genes (length of ``axis``), :math:`K` the number of frequency
+    bins, and :math:`\\varepsilon` the ``eps`` floor. The per-bin
+    geometric-mean background is
 
-    :func:`residualize_against_covariates` is the complementary step for
-    non-trivial covariates whose shape across frequency bins is not
-    constant (cell-type proportion spectra, tissue-domain maps, etc.).
+    .. math::
+
+        b_{k} = \\exp\\!\\Bigl(
+            \\tfrac{1}{G} \\sum_{g'=1}^{G}
+            \\log\\bigl(P_{g',k} + \\varepsilon\\bigr)
+        \\Bigr),
+
+    and the output is the per-bin gene-wise quotient
+
+    .. math::
+
+        \\tilde P_{g,k} = \\frac{P_{g,k}}{b_{k}}.
+
+    Equivalently, in log-space this is per-bin mean centring across
+    the genes axis,
+
+    .. math::
+
+        \\log \\tilde P_{g,k}
+        = \\log\\bigl(P_{g,k} + \\varepsilon\\bigr)
+          - \\tfrac{1}{G} \\sum_{g'=1}^{G}
+            \\log\\bigl(P_{g',k} + \\varepsilon\\bigr),
+
+    so after the transform :math:`\\prod_{g} \\tilde P_{g,k} = 1` at
+    every bin :math:`k` — the cross-gene geometric mean at every
+    frequency is unity.
+
+    The operation is equivalent to a per-bin OLS regression of
+    :math:`\\log P_{\\cdot,k}` against a constant (the cross-gene
+    mean) followed by exponentiation. With a per-sample one-hot
+    covariate stacked across all (sample, gene) rows, the residuals
+    match :math:`\\log \\tilde P` row-for-row, so running this
+    function sample-by-sample is identical to fitting a one-hot
+    sample-ID covariate in log-space and residualising.
+
+    Companion functions:
+
+    - :func:`normalize_covariates` removes per-bin bias linear in
+      user-supplied covariate spectra (cell-type proportion maps,
+      tissue domains, housekeeping templates).
+    - :func:`normalize_shape` removes per-(sample, gene) amplitude
+      by L1-normalising along the frequency axis.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> rng = np.random.default_rng(0)
+    >>> spec = rng.lognormal(size=(2, 5, 8))      # (n_samples, G, K)
+    >>> P_tilde = normalize_background(spec)
+    >>> P_tilde.shape
+    (2, 5, 8)
+    >>> # Cross-gene geometric mean at each (sample, bin) is unity:
+    >>> bool(np.allclose(np.prod(P_tilde, axis=-2), 1.0))
+    True
     """
     log_spec = np.log(spectra + eps)
-    bg = log_spec.mean(axis=-2, keepdims=True)
+    bg = log_spec.mean(axis=axis, keepdims=True)
     return np.exp(log_spec - bg)
 
 
-def residualize_against_covariates(
-    gene_spectra: np.ndarray,
+def normalize_covariates(
+    spectra: np.ndarray,
     covariate_spectra: np.ndarray,
+    *,
     fit_intercept: bool = True,
 ) -> np.ndarray:
-    """
-    Regress each gene's spectrum on a set of covariate spectra; return the residuals.
+    """Project gene spectra onto the orthogonal complement of covariate spectra.
 
-    For one sample, fits :math:`P_g \\approx \\beta_0 + \\sum_c \\beta_c\\,C_c` per
-    frequency bin (i.e., each bin treated as an observation; covariates as features),
-    and subtracts the fit. Equivalent to projecting out the column space of the
-    covariate matrix from the gene-spectrum matrix.
+    Each gene's :math:`K`-dim spectrum is regressed (per gene, OLS in
+    linear scale) on the supplied covariate spectra plus an optional
+    intercept; the function returns the residual. Use to remove the
+    contribution of structured per-bin templates (cell-type proportion
+    maps, tissue-domain indicators, housekeeping composite expression)
+    from every gene's per-frequency power.
 
     Parameters
     ----------
-    gene_spectra : np.ndarray
-        Gene spectra of shape ``(n_genes, K)``.
+    spectra : np.ndarray
+        Gene spectra :math:`P` of shape ``(G, K)`` to residualise.
     covariate_spectra : np.ndarray
-        Covariate spectra of shape ``(n_covariates, K)``. Typical covariates: spectra
-        of cell-type proportion maps, tissue-domain indicator maps, or housekeeping
-        composite expression.
+        Covariate spectra :math:`C` of shape ``(n_cov, K)``.
     fit_intercept : bool, default True
-        If True, prepend a constant column to the covariate design.
+        If True, prepend a column of ones to the design matrix
+        :math:`X` so per-gene additive offsets along the frequency
+        axis are absorbed.
 
     Returns
     -------
     np.ndarray
-        Residual spectra of shape ``(n_genes, K)``.
+        Residual spectra :math:`\\tilde P` of shape ``(G, K)``. Never
+        mutates the input.
 
     Raises
     ------
     ValueError
         If ``covariate_spectra`` has a different last-axis length than
-        ``gene_spectra``.
+        ``spectra``.
+
+    Notes
+    -----
+    Let :math:`P \\in \\mathbb{R}^{G \\times K}` denote the input
+    spectra (:math:`G` genes, :math:`K` frequency bins) and
+    :math:`C \\in \\mathbb{R}^{n_{\\mathrm{cov}} \\times K}` the
+    covariate spectra. Build the design matrix
+
+    .. math::
+
+        X = \\bigl[\\, \\mathbf{1}_{K} \\;\\big|\\; C^{\\top} \\,\\bigr]
+            \\;\\in\\; \\mathbb{R}^{K \\times (n_{\\mathrm{cov}} + 1)},
+
+    dropping the leading column :math:`\\mathbf{1}_{K}` when
+    ``fit_intercept=False``. Fit per-gene OLS coefficients via the
+    Moore-Penrose pseudoinverse :math:`X^{+}`,
+
+    .. math::
+
+        \\hat\\beta_{g} = X^{+}\\, P_{g,\\cdot}^{\\top}
+            \\;\\in\\; \\mathbb{R}^{n_{\\mathrm{cov}} + 1},
+
+    and return the residual
+
+    .. math::
+
+        \\tilde P_{g,k} = P_{g,k} - X_{k,\\cdot}\\,\\hat\\beta_{g}.
+
+    Equivalently,
+
+    .. math::
+
+        \\tilde P_{g,\\cdot}^{\\top}
+        = \\bigl( I_{K} - X X^{+} \\bigr)\\, P_{g,\\cdot}^{\\top},
+
+    i.e., the orthogonal projection of each gene's spectrum onto the
+    orthogonal complement of the column space of :math:`X`. After the
+    transform, every gene's residual spectrum is uncorrelated (in the
+    :math:`K`-bin inner product) with each covariate column of
+    :math:`X`.
+
+    With ``fit_intercept=True`` and **no** covariates (empty
+    ``covariate_spectra``), this reduces to per-gene mean centring
+    along the frequency axis,
+
+    .. math::
+
+        \\tilde P_{g,k} = P_{g,k}
+            - \\tfrac{1}{K} \\sum_{k'=1}^{K} P_{g,k'}.
+
+    This is **not** equivalent to :func:`normalize_background`, which
+    operates on a different axis (genes vs frequencies) in a different
+    scale (log vs linear).
+
+    Companion functions:
+
+    - :func:`normalize_background` removes per-sample multiplicative
+      gain via cross-gene geometric-mean centring in log-space.
+    - :func:`normalize_shape` removes per-(sample, gene) amplitude
+      by L1-normalising along the frequency axis.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> rng  = np.random.default_rng(0)
+    >>> spec = rng.lognormal(size=(20, 8))      # (G, K)
+    >>> cov  = rng.lognormal(size=(2, 8))       # (n_cov, K)
+    >>> resid = normalize_covariates(spec, cov)
+    >>> resid.shape
+    (20, 8)
     """
-    if gene_spectra.shape[-1] != covariate_spectra.shape[-1]:
+    if spectra.shape[-1] != covariate_spectra.shape[-1]:
         raise ValueError(
-            f"Last axis must match: gene_spectra has K={gene_spectra.shape[-1]}, "
+            f"Last axis must match: spectra has K={spectra.shape[-1]}, "
             f"covariate_spectra has K={covariate_spectra.shape[-1]}."
         )
-    K = gene_spectra.shape[-1]
+    K = spectra.shape[-1]
     # Design matrix shape (K, n_covariates [+1]).
     X = covariate_spectra.T
     if fit_intercept:
@@ -735,62 +865,107 @@ def residualize_against_covariates(
     # Solve least-squares: P_g.T = X @ beta_g -> beta_g = pinv(X) @ P_g.T per gene.
     # Closed form via pseudo-inverse (covariates K is small).
     pinv = np.linalg.pinv(X)
-    fitted = (X @ pinv @ gene_spectra.T).T  # (n_genes, K)
-    return gene_spectra - fitted
+    fitted = (X @ pinv @ spectra.T).T  # (n_genes, K)
+    return spectra - fitted
 
 
-def shape_normalize(
+def normalize_shape(
     spectra: np.ndarray,
+    *,
     axis: int = -1,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """
-    Normalize spectra to sum-1 along ``axis`` (probability-vector shape).
+    """Project each spectrum onto the probability simplex along ``axis``.
 
-    Divides each slice along ``axis`` by its own L1 norm so the resulting
-    slice is a proper probability distribution over frequency bins:
-    ``out = spectra / spectra.sum(axis)``. Rows that differ only by a
-    positive scalar (the fingerprint of a gene expressed in one group and
-    absent in another) become identical — only the **shape** of the
-    power-vs-frequency curve survives.
-
-    This is the natural companion to :func:`normalize_by_background`:
-    background normalization cancels per-sample gain across genes;
-    :func:`shape_normalize` cancels per-(sample, gene) magnitude across
-    frequencies. Composed, they leave a pure, unit-sum radial pattern
-    signature that is directly comparable as a distribution (so e.g.
-    Jensen-Shannon / total-variation distances are well-defined).
+    Each fibre along ``axis`` is divided by its L1 norm, so the result
+    is a proper probability distribution over the entries along that
+    axis. Two fibres that differ only by a positive scalar produce
+    identical outputs — only the **shape** of the power-vs-frequency
+    curve survives, the overall scale is removed.
 
     Parameters
     ----------
     spectra : np.ndarray
-        Non-negative radial spectra. Any leading dimensions are preserved;
-        normalization acts along ``axis`` only.
+        Non-negative spectra :math:`P`. Any leading dimensions are
+        preserved; normalisation acts along ``axis`` only.
     axis : int, default -1
-        Axis along which to enforce the sum-1 constraint (typically the K /
+        Axis to L1-normalise along (typically the trailing
         frequency-bin axis).
     eps : float, default 1e-12
-        Floor added to the denominator to avoid division-by-zero when an
-        entire slice is numerically zero.
+        Floor :math:`\\varepsilon` on the per-fibre sum to avoid
+        division by zero.
 
     Returns
     -------
     np.ndarray
-        Shape-normalized spectra, same shape as the input, summing to 1 along
-        ``axis``.
+        Shape-normalized spectra :math:`\\tilde P`, same shape as
+        ``spectra``, summing to 1 along ``axis``. Never mutates the
+        input.
+
+    Notes
+    -----
+    Let :math:`P` denote the input spectrum with :math:`K` entries
+    along ``axis`` and :math:`\\varepsilon` the ``eps`` floor. The
+    output is the per-fibre L1 quotient
+
+    .. math::
+
+        \\tilde P_{\\ldots,k}
+        = \\frac{P_{\\ldots,k}}
+                {\\sum_{k'=1}^{K} P_{\\ldots,k'} + \\varepsilon},
+
+    so :math:`\\sum_{k} \\tilde P_{\\ldots,k} = 1` for every
+    leading-index combination (modulo the :math:`\\varepsilon` floor;
+    fibres whose total sum is below :math:`\\varepsilon` are
+    effectively returned unchanged because the numerator dominates
+    the floor).
+
+    Equivalently, in log-space this is per-fibre log-sum centring,
+
+    .. math::
+
+        \\log \\tilde P_{\\ldots,k}
+        = \\log P_{\\ldots,k}
+          - \\log\\!\\Bigl( \\textstyle\\sum_{k'=1}^{K}
+            P_{\\ldots,k'} + \\varepsilon \\Bigr).
+
+    After this transform every fibre is a probability vector over
+    frequency bins, so distances such as Jensen-Shannon and
+    total-variation are well-defined between fibres.
+
+    Used internally by the spectrum comparison functions
+    (:func:`compare_two_groups`, :func:`compare_two_groups_masked`,
+    :func:`compare_designs`) when their ``normalize_shape=True``
+    keyword argument is set — the differential-frequency test then
+    fires only on shape redistribution across radial bins, not on
+    overall amplitude changes.
+
+    Companion functions:
+
+    - :func:`normalize_background` removes per-sample multiplicative
+      gain via cross-gene geometric-mean centring in log-space.
+    - :func:`normalize_covariates` removes per-bin bias linear in
+      user-supplied covariate spectra.
 
     Examples
     --------
     >>> import numpy as np
     >>> x = np.array([[1.0, 2.0, 4.0], [10.0, 20.0, 40.0]])
-    >>> out = shape_normalize(x, axis=-1)
-    >>> np.allclose(out.sum(axis=-1), 1.0)
+    >>> P_tilde = normalize_shape(x, axis=-1)
+    >>> bool(np.allclose(P_tilde.sum(axis=-1), 1.0))
     True
-    >>> np.allclose(out[0], out[1])  # only the shape survives
+    >>> bool(np.allclose(P_tilde[0], P_tilde[1]))  # only the shape survives
     True
     """
     total = spectra.sum(axis=axis, keepdims=True)
     return spectra / (total + eps)
+
+
+# Internal helper: applied inside the comparison functions when their
+# ``normalize_shape: bool`` kwarg is True. Exists only to bridge the
+# kwarg-vs-function name overlap inside the function body.
+def _normalize_shape_apply(spectra: np.ndarray) -> np.ndarray:
+    return normalize_shape(spectra, axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -1478,6 +1653,7 @@ def compare_two_groups(  # noqa: C901
     n_jobs: int = 1,
     freq_weights: np.ndarray | None = None,
     n_perm_max: int = 10000,
+    normalize_shape: bool = False,
 ) -> pd.DataFrame:
     """
     Test, for every gene, whether its spatial-pattern spectrum differs between two groups.
@@ -1552,6 +1728,14 @@ def compare_two_groups(  # noqa: C901
         strictly more accurate than sampling in the small-sample regime
         (e.g. 6-vs-6 → 924 partitions, 5-vs-5 → 252). Above the threshold
         the test falls back to ``n_perm`` random shuffles.
+    normalize_shape : bool, default False
+        If True, divide each per-(sample, gene) spectrum by its sum along
+        the trailing (frequency) axis before the statistic is computed
+        (i.e., apply :func:`normalize_shape` to ``spectra`` first). Use to
+        isolate shape-only / frequency-redistribution signals — the test
+        then only fires when the *relative* distribution of power across
+        radial frequencies varies with the contrast, independent of
+        overall amplitude. Works with every valid ``statistic=`` value.
 
     Returns
     -------
@@ -1587,6 +1771,9 @@ def compare_two_groups(  # noqa: C901
     if uniq.size != 2:
         raise ValueError(f"groups must contain exactly two distinct values, got {uniq}.")
     g_int = (groups == uniq[1]).astype(int)  # 0 = first label sorted, 1 = second
+
+    if normalize_shape:
+        spectra = _normalize_shape_apply(spectra)
 
     rng = np.random.default_rng(random_state)
 
@@ -1663,6 +1850,7 @@ def compare_two_groups_masked(  # noqa: C901
     min_samples_per_group: int = 2,
     freq_weights: np.ndarray | None = None,
     n_perm_max: int = 10000,
+    normalize_shape: bool = False,
 ) -> pd.DataFrame:
     """
     Per-gene two-group pattern test with **incomplete data** across samples.
@@ -1708,6 +1896,12 @@ def compare_two_groups_masked(  # noqa: C901
     freq_weights : np.ndarray, optional
         Only consumed by ``statistic='log_l2'`` (same semantics as
         :func:`compare_two_groups`).
+    normalize_shape : bool, default False
+        If True, divide each per-(sample, gene) spectrum by its sum along
+        the trailing (frequency) axis before the statistic is computed
+        (same semantics as in :func:`compare_two_groups`). Use to isolate
+        shape-only / frequency-redistribution signals. Works with every
+        valid ``statistic=`` value.
 
     Returns
     -------
@@ -1739,6 +1933,10 @@ def compare_two_groups_masked(  # noqa: C901
     if uniq.size != 2:
         raise ValueError("groups must contain exactly two distinct values.")
     g_int = (groups == uniq[1]).astype(int)
+
+    if normalize_shape:
+        spectra = _normalize_shape_apply(spectra)
+
     rng = np.random.default_rng(random_state)
 
     if gene_names is None:
@@ -1974,6 +2172,7 @@ def compare_designs(
     statistic: str = "log_l2",
     null: str = "wald",
     freq_weights: np.ndarray | None = None,
+    normalize_shape: bool = False,
 ) -> pd.DataFrame:
     """Generalized two-group / continuous-covariate test via a design matrix.
 
@@ -2012,6 +2211,14 @@ def compare_designs(
         without a clear payoff over the analytic Wald). Pass
         ``null="permutation"`` only via :func:`compare_two_groups` with
         ``groups=`` for the binary case.
+    normalize_shape : bool, default False
+        If True, divide each per-(sample, gene) spectrum by its sum along
+        the trailing (frequency) axis before the GLM is fit (same
+        semantics as in :func:`compare_two_groups`). Use to isolate
+        shape-only / frequency-redistribution signals along the design
+        contrast — the test then only fires when the *relative*
+        distribution of power across radial frequencies varies with the
+        contrast, independent of overall amplitude.
 
     Returns
     -------
@@ -2044,6 +2251,9 @@ def compare_designs(
 
     X, design_columns = _build_design_matrix(design, n_samples)
     contrast_vec = _resolve_contrast(contrast, design_columns)
+
+    if normalize_shape:
+        spectra = _normalize_shape_apply(spectra)
 
     observed, pvals = _run_log_l2_glm_wald(spectra, X, contrast_vec, freq_weights)
 

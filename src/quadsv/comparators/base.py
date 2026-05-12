@@ -8,6 +8,11 @@ inherit from for their post-fit surface (``normalize_background``,
 ``test_expression``, ``benchmark``), plus the two ``_validate_*``
 helpers used by both classes' constructors.
 
+The instance-method names are kept (``.shape_normalize``, ``.residualize``)
+for backward compatibility, but they delegate to the unified ``normalize_*``
+standalone functions in :mod:`quadsv.comparators.multisample`
+(``normalize_background``, ``normalize_covariates``, ``normalize_shape``).
+
 Concrete classes live in sibling modules:
 :mod:`quadsv.comparators.irregular` and
 :mod:`quadsv.comparators.grid`.
@@ -38,10 +43,18 @@ from quadsv.comparators.multisample import (
     compare_two_groups_masked,
     compare_two_groups_scalar,
     compute_sample_spectrum,
-    normalize_by_background,
     radial_bin_spectrum,
-    residualize_against_covariates,
-    shape_normalize,
+)
+from quadsv.comparators.multisample import (
+    # Aliased to leading-underscore names to avoid shadowing the
+    # like-named instance methods on the comparator class below.
+    normalize_background as _normalize_background,
+)
+from quadsv.comparators.multisample import (
+    normalize_covariates as _normalize_covariates,
+)
+from quadsv.comparators.multisample import (
+    normalize_shape as _normalize_shape,
 )
 from quadsv.statistics import (
     gene_pattern_diversity as _gene_pattern_diversity,
@@ -225,14 +238,19 @@ class _ComparatorBase:
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .normalize_background().")
         for i in range(self.spectra_.shape[0]):
-            self.spectra_[i] = normalize_by_background(self.spectra_[i])
+            self.spectra_[i] = _normalize_background(self.spectra_[i])
         return self
 
     def shape_normalize(self) -> _ComparatorBase:
-        """Rescale each ``(sample, gene)`` spectrum to sum-1 along frequency."""
+        """Rescale each ``(sample, gene)`` spectrum to sum-1 along frequency.
+
+        Thin chainable wrapper around the standalone
+        :func:`~quadsv.comparators.multisample.normalize_shape` (renamed
+        from the prior ``shape_normalize`` standalone helper).
+        """
         if self.spectra_ is None:
             raise RuntimeError("Call .fit() before .shape_normalize().")
-        self.spectra_ = shape_normalize(self.spectra_, axis=-1)
+        self.spectra_ = _normalize_shape(self.spectra_, axis=-1)
         return self
 
     def residualize(self, covariates: Sequence[np.ndarray]) -> _ComparatorBase:
@@ -275,7 +293,7 @@ class _ComparatorBase:
                 low = cov_2d[:, :k, :k] if cov_2d.shape[-1] > k else cov_2d[:, :k, :]
                 cov_feat = low.reshape(low.shape[0], -1)
             cov_feat = cov_feat[..., : self.spectra_.shape[-1]]
-            self.spectra_[i] = residualize_against_covariates(self.spectra_[i], cov_feat)
+            self.spectra_[i] = _normalize_covariates(self.spectra_[i], cov_feat)
         return self
 
     # ------------------------------------------------------------------
