@@ -244,10 +244,29 @@ limit).
 Choosing covariate maps for residualisation
 -------------------------------------------
 
-Pass a list of per-sample covariate arrays of shape
-``(n_covariates, ny_s, nx_s)`` to
-:meth:`~quadsv.ComparatorIrregular.normalize_covariates`. Useful
-candidates:
+:meth:`~quadsv.ComparatorIrregular.normalize_covariates` takes one
+of two shapes — a sequence of column-name strings shared across
+samples, or a sequence of per-sample image arrays:
+
+.. code-block:: python
+
+   # 1. Shared column names — interpreted by the subclass.
+   #    ComparatorIrregular: each key is looked up in adata.obs.columns
+   #    first, then adata.var_names — so the same call accepts
+   #    deconvolved cell-type proportion columns *and* per-gene
+   #    expression columns (housekeeping / marker genes) interchangeably.
+   cmp.normalize_covariates(["celltype_astro", "celltype_neuron", "MALAT1"])
+
+   # ComparatorGrid: forward as `value_key=` to spatialdata.rasterize_bins
+   # (works for .obs columns AND var_names in the comparator's table).
+   cmp_g.normalize_covariates(["region_label", "MALAT1"])
+
+   # 2. Pre-rasterized per-sample arrays of shape (n_covariates, ny_s, nx_s).
+   #    Universal: works on either subclass; use when covariates aren't
+   #    already attached to the sample containers.
+   cmp.normalize_covariates(per_sample_arrays)
+
+Useful covariate candidates:
 
 - Cell-type proportion maps from a deconvolution tool such as
   Cell2location, CARD, or RCTD. One channel per cell type.

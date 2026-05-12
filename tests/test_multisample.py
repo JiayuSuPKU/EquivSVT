@@ -1222,6 +1222,115 @@ class TestComparatorIrregularEndToEnd:
             cmp.test_diff_freq(np.array([0, 1]))
 
 
+class TestNormalizeCovariatesObsKeys:
+    """``normalize_covariates`` polymorphic input mode: shared ``obs`` column
+    names per AnnData sample. Mirrors the per-spot covariate workflow users
+    typically have on cell-type proportion maps."""
+
+    @staticmethod
+    def _build_samples(n_samples=4, n_spots=200, n_genes=4, seed=0):
+        rng = np.random.default_rng(seed)
+        out = []
+        for _ in range(n_samples):
+            X = rng.standard_normal((n_spots, n_genes))
+            a = ad.AnnData(X=X)
+            a.var_names = [f"g{i}" for i in range(n_genes)]
+            a.obsm["spatial"] = rng.uniform(0, 50, size=(n_spots, 2))
+            a.obs["cov_a"] = rng.uniform(0.0, 1.0, size=n_spots)
+            a.obs["cov_b"] = rng.uniform(0.0, 1.0, size=n_spots)
+            a.obs["batch"] = pd.Categorical(["A", "B"] * (n_spots // 2))
+            out.append(a)
+        return out
+
+    def test_obs_key_path_runs_and_mutates_spectra(self):
+        """Calling with a ``Sequence[str]`` is interpreted as obs-column
+        names; spectra_ should change in place."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        ret = cmp.normalize_covariates(["cov_a", "cov_b"])
+        assert ret is cmp, "should be chainable"
+        assert not np.array_equal(
+            cmp.spectra_, before
+        ), "spectra_ must change after residualisation"
+        assert cmp.spectra_.shape == before.shape
+
+    def test_key_missing_from_obs_and_var_raises_keyerror(self):
+        """Resolution checks both obs.columns and var_names; if neither
+        contains the key, raise with both lists in the message."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(KeyError, match="in neither obs.columns nor"):
+            cmp.normalize_covariates(["does_not_exist"])
+
+    def test_var_names_key_path(self):
+        """A key that matches a gene in ``var_names`` is treated as a
+        per-spot expression covariate (housekeeping-gene workflow)."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        # g0 exists in var_names; use it as a covariate.
+        cmp.normalize_covariates(["g0"])
+        assert not np.array_equal(cmp.spectra_, before)
+        assert cmp.spectra_.shape == before.shape
+
+    def test_obs_takes_precedence_over_var_on_collision(self):
+        """When the same name appears in both obs and var_names, the obs
+        column wins (matches the user's mental model that they're naming
+        a metadata column)."""
+        samples = self._build_samples()
+        # Inject a synthetic obs column whose name collides with a gene.
+        for a in samples:
+            a.obs["g0"] = np.linspace(0.0, 1.0, a.n_obs)
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        cmp.normalize_covariates(["g0"])
+        # Sanity: spectra moved, and the obs path runs (no float-cast error
+        # on the linspace column).
+        assert not np.array_equal(cmp.spectra_, before)
+
+    def test_mixed_obs_and_var_keys_in_one_call(self):
+        """obs and var_names keys can be mixed in a single call — they're
+        resolved per-key, then the per-spot vectors are stacked into one
+        block before NUFFT."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        cmp.normalize_covariates(["cov_a", "g0"])  # obs + var_names
+        assert not np.array_equal(cmp.spectra_, before)
+
+    def test_obs_key_categorical_raises_value_error(self):
+        """Categorical obs columns can't be cast to float — surface a clear
+        error pointing at encoding."""
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(ValueError, match="cannot be cast to float"):
+            cmp.normalize_covariates(["batch"])
+
+    def test_array_path_still_works(self):
+        """The legacy per-sample (n_cov, ny, nx) array input must keep
+        working alongside the new key-list mode."""
+        rng = np.random.default_rng(1)
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra().normalize_background()
+        before = cmp.spectra_.copy()
+        arrays = [rng.standard_normal((1, 8, 8)) for _ in samples]
+        cmp.normalize_covariates(arrays)
+        assert not np.array_equal(cmp.spectra_, before)
+
+    def test_empty_sequence_rejected(self):
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(ValueError, match="non-empty"):
+            cmp.normalize_covariates([])
+
+    def test_mixed_str_and_array_rejected(self):
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra()
+        with pytest.raises(TypeError, match="Mixed str and non-str"):
+            cmp.normalize_covariates(["cov_a", np.zeros((1, 8, 8))])
+
+
 # ---------------------------------------------------------------------------
 # DC/AC decomposition & DE-vs-pattern orthogonality
 # ---------------------------------------------------------------------------

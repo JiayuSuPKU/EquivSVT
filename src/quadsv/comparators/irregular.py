@@ -19,6 +19,7 @@ from quadsv.comparators.base import (
     _ComparatorBase,
     _validate_common,
 )
+from quadsv.comparators.multisample import radial_bin_spectrum
 
 __all__ = ["ComparatorIrregular"]
 
@@ -234,10 +235,123 @@ class ComparatorIrregular(_ComparatorBase):
             progress=progress,
         )
 
+    # ------------------------------------------------------------------
+    def _covariate_features_from_keys(  # noqa: C901 — per-key obs/var dispatch + per-sample loop
+        self, keys: Sequence[str]
+    ) -> list[np.ndarray]:
+        """Per-spot column lookup → per-sample covariate features.
 
-# ---------------------------------------------------------------------------
-# ComparatorGrid — SpatialData / regular bins via rasterize_bins
-# ---------------------------------------------------------------------------
+        Each ``key`` is resolved against the first sample as either:
+
+        - an ``adata.obs`` column (per-spot scalar — typical for
+          deconvolution outputs, region labels, depth proxies); or
+        - an entry in ``adata.var_names`` (treats that gene's
+          per-spot expression as the covariate — useful for
+          regressing out a housekeeping gene's spatial pattern).
+
+        Resolution prefers ``obs`` when a name appears in both. Every
+        subsequent sample must resolve each key to the same source as
+        the first sample (i.e., a key is "obs everywhere" or "var
+        everywhere") — anything else is treated as a schema mismatch.
+
+        For each sample the resolved per-spot vectors are stacked into
+        an ``(n_obs, n_covariates)`` block, mean-centred per column,
+        and NUFFTed directly onto the sample's k-grid. The 2-D spectra
+        are then radial-binned with the same edges as the gene panel.
+
+        Raises
+        ------
+        KeyError
+            If a key is missing from both ``adata.obs.columns`` and
+            ``adata.var_names`` in any sample, or if a key resolves to
+            different sources across samples.
+        ValueError
+            If an obs column cannot be cast to float (e.g., string
+            categoricals — encode them first).
+        """
+        from quadsv.kernels.nufft import power_spectrum_2d_nufft
+
+        keys = list(keys)
+        # Classify each key once against the first sample; require all
+        # later samples to agree on the source.
+        first = self.samples[0]
+        sources: dict[str, str] = {}
+        for k in keys:
+            in_obs = k in first.obs.columns
+            in_var = k in first.var_names
+            if not (in_obs or in_var):
+                raise KeyError(
+                    f"covariate key {k!r} is in neither obs.columns nor "
+                    f"var_names of sample 0. Available obs (first 10): "
+                    f"{list(first.obs.columns)[:10]}; available var_names "
+                    f"(first 10): {list(first.var_names)[:10]}."
+                )
+            sources[k] = "obs" if in_obs else "var"
+
+        out: list[np.ndarray] = []
+        for i, adata in enumerate(self.samples):
+            cols: list[np.ndarray] = []
+            for k in keys:
+                src = sources[k]
+                if src == "obs":
+                    if k not in adata.obs.columns:
+                        raise KeyError(
+                            f"sample {i} resolves covariate {k!r} differently from "
+                            f"sample 0 (sample 0 → obs, sample {i} → not in obs)."
+                        )
+                    try:
+                        cols.append(np.asarray(adata.obs[k], dtype=np.float64))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"sample {i} obs[{k!r}] cannot be cast to float "
+                            f"({type(exc).__name__}); encode categoricals before passing."
+                        ) from exc
+                else:  # var_names path
+                    if k not in adata.var_names:
+                        raise KeyError(
+                            f"sample {i} resolves covariate {k!r} differently from "
+                            f"sample 0 (sample 0 → var_names, sample {i} → not in "
+                            "var_names)."
+                        )
+                    idx = adata.var_names.get_loc(k)
+                    X_src = adata.X if self._layer is None else adata.layers[self._layer]
+                    col = X_src[:, idx]
+                    if sp.issparse(col):
+                        col = col.toarray()
+                    cols.append(np.asarray(col, dtype=np.float64).ravel())
+            block = np.column_stack(cols)  # (n_obs, n_cov)
+            # Mean-centre each column, matching the gene panel's per-column DC removal.
+            block = block - block.mean(axis=0, keepdims=True)
+
+            p = power_spectrum_2d_nufft(
+                self._coords[i],
+                block,
+                grid_shape=self._grid_shapes[i],
+                spacing=self._spacings[i],
+                unit_scale=self._unit_scales[i],
+                eps=self._nufft_eps,
+                center_coords=True,
+            )
+            # power_spectrum_2d_nufft returns (ny, nx, M) for multi-column values.
+            cov_2d = np.moveaxis(p, -1, 0)  # (n_cov, ny, nx)
+            ny, nx = self._grid_shapes[i]
+            if self.feature_mode == "radial":
+                cov_feat = radial_bin_spectrum(
+                    cov_2d,
+                    grid_shape=(ny, nx),
+                    n_bins=self._n_radial_bins,
+                    fft_solver=self._spectrum_fft_solver,
+                    spacing=self._spacings[i],
+                    edges=self.freq_edges,
+                )
+            else:
+                k_max = min(self._n_radial_bins, ny // 2, nx // 2)
+                low = (
+                    cov_2d[:, :k_max, :k_max] if cov_2d.shape[-1] > k_max else cov_2d[:, :k_max, :]
+                )
+                cov_feat = low.reshape(low.shape[0], -1)
+            out.append(cov_feat)
+        return out
 
 
 # ---------------------------------------------------------------------------

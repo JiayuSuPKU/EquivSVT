@@ -55,6 +55,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Public-API freeze test** (`tests/test_public_api.py`) snapshots
   `__all__`, docstring presence, canonical-path identity, and
   asserts removed legacy paths raise `ModuleNotFoundError`.
+- **Convenience input modes for `Comparator.normalize_covariates`.**
+  In addition to the existing per-sample
+  `Sequence[np.ndarray]` of pre-rasterized
+  `(n_covariates, ny, nx)` images, the method now accepts a shared
+  `Sequence[str]` of column names; the subclass interprets it
+  natively:
+
+    * `ComparatorIrregular` looks each key up in `adata.obs.columns`
+      first, then `adata.var_names` (preferring obs on collision);
+      the resolved per-spot vector is NUFFTed directly onto the
+      sample's k-grid — so the same call accepts deconvolved
+      cell-type proportion columns *and* per-gene expression columns
+      (e.g., a housekeeping or marker gene) interchangeably.
+    * `ComparatorGrid` forwards the keys as `value_key=` to
+      `spatialdata.rasterize_bins`, so any combination of `.obs`
+      columns and `var_names` in the comparator's table works.
+
+  Mode is detected from the first element's type. Both paths reduce
+  to the same `(n_covariates, K)` per-sample features fed into the
+  log-space residualization, so the math is identical — only the
+  input boilerplate is different.
 
 ### Changed
 - **Breaking: package layout migrated to `src/quadsv/`** with the

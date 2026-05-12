@@ -254,6 +254,44 @@ class ComparatorGrid(_ComparatorBase):
         presence = np.stack([np.asarray(x) for x in pres_list], axis=0)
         return [np.asarray(x) for x in raw_2d], dc, presence
 
+    # ------------------------------------------------------------------
+    def _covariate_features_from_keys(self, keys: Sequence[str]) -> list[np.ndarray]:
+        """Forward ``keys`` to :func:`spatialdata.rasterize_bins` as
+        ``value_key`` and turn each per-sample raster into covariate features.
+
+        ``keys`` may name any combination of ``.obs`` columns and
+        ``var_names`` in the comparator's ``table_name`` table —
+        ``rasterize_bins`` accepts both. Each sample's resulting
+        ``(n_keys, ny, nx)`` raster is then funneled through the same
+        spectrum + radial-binning pipeline as the gene panel via
+        :meth:`_covariate_features_from_array`.
+        """
+        from quadsv._rasterize import rasterize_table
+
+        keys = list(keys)
+        out: list[np.ndarray] = []
+        for i, sdata in enumerate(self.samples):
+            img = rasterize_table(
+                sdata,
+                bins=self._bins,
+                table_name=self._table_name,
+                col_key=self._col_key,
+                row_key=self._row_key,
+                value_key=keys,
+                return_region_as_labels=False,
+            )
+            arr = np.asarray(img.data if hasattr(img, "data") else img, dtype=np.float64)
+            if arr.ndim == 2:
+                # Single key → rasterize_bins drops the leading axis. Re-insert.
+                arr = arr[None, :, :]
+            if arr.ndim != 3:
+                raise ValueError(
+                    f"sample {i} covariate raster has shape {arr.shape}; "
+                    "expected (n_keys, ny, nx) from rasterize_bins."
+                )
+            out.append(self._covariate_features_from_array(arr, sample_index=i))
+        return out
+
 
 def _resolve_spatialdata_gene_names(
     samples: list[Any],

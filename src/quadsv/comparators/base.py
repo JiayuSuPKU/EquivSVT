@@ -280,51 +280,138 @@ class _ComparatorBase:
             self.spectra_[i] = _normalize_background(self.spectra_[i])
         return self
 
-    def normalize_covariates(self, covariates: Sequence[np.ndarray]) -> _ComparatorBase:
+    def normalize_covariates(self, covariates: Sequence[Any]) -> _ComparatorBase:
         """Regress out per-sample covariate spectra from :attr:`spectra_`.
 
-        Thin chainable wrapper around the standalone
-        :func:`~quadsv.comparators.multisample.normalize_covariates`.
+        Two input modes, detected from the first element's type:
 
-        ``covariates[i]`` should be a ``(n_covariates, ny_i, nx_i)`` array
-        matching :attr:`_grid_shapes[i]`.
+        - **Sequence of str** — column-key list shared across samples.
+          Each string key is considered as one covariate applied to every
+          sample. Implementation depends on the subclass:
+
+            * :class:`~quadsv.ComparatorIrregular` looks each key up in
+              ``adata.obs.columns`` first, then ``adata.var_names``
+              (preferring obs on collision); the resolved per-spot
+              vector is NUFFTed directly onto the sample's k-grid.
+            * :class:`~quadsv.ComparatorGrid` rasterizes via
+              :func:`spatialdata.rasterize_bins` with the keys forwarded
+              as ``value_key`` (any combination of ``.obs`` columns and
+              ``var_names``).
+
+        - **Sequence of np.ndarray** — per-sample pre-rasterized images,
+          one ``(n_covariates, ny_i, nx_i)`` array per sample. Universal
+          path; works on either subclass. Use when you want full control
+          over rasterization, or when the covariates aren't already
+          attached to the sample containers.
+
+        Both modes produce the same downstream behaviour: per-sample
+        covariate features are reduced to ``(n_covariates, K)`` (same
+        ``K`` as :attr:`spectra_`) and passed through
+        :func:`~quadsv.comparators.multisample.normalize_covariates` to
+        log-space-residualise each gene's spectrum against them.
+
+        Parameters
+        ----------
+        covariates : sequence of str or sequence of np.ndarray
+            See modes above. Strings are interpreted by the subclass;
+            ndarrays are used verbatim (one per sample).
+
+        Returns
+        -------
+        self : _ComparatorBase
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .normalize_covariates().")
-        if len(covariates) != len(self.samples):
-            raise ValueError(
-                f"covariates length {len(covariates)} != n_samples {len(self.samples)}."
-            )
-        for i, cov in enumerate(covariates):
-            if cov.ndim != 3:
-                raise ValueError(f"covariate sample {i} must be 3D, got {cov.shape}.")
-            cov_2d = compute_sample_spectrum(
-                cov, fft_solver=self._spectrum_fft_solver, workers=self._workers
-            )
-            # Use the covariate's own raster shape — for the NUFFT path the
-            # sample's internal k-grid (self._grid_shapes[i]) is auto-inferred
-            # and may differ from the covariate raster. ``freq_edges`` (shared
-            # across samples when ``feature_mode='radial'``) is what aligns the
-            # bins, not grid_shape.
-            cov_shape = cov.shape[-2:]
-            spacing = self._spacings[i] if self._spacings is not None else None
-            if self.feature_mode == "radial":
-                cov_feat = radial_bin_spectrum(
-                    cov_2d,
-                    grid_shape=cov_shape,
-                    n_bins=self._n_radial_bins,
-                    fft_solver=self._spectrum_fft_solver,
-                    spacing=spacing,
-                    edges=self.freq_edges,
+        items = list(covariates)
+        if len(items) == 0:
+            raise ValueError("covariates must be a non-empty sequence.")
+
+        first = items[0]
+        if isinstance(first, str):
+            # Shared key-list mode.
+            if not all(isinstance(k, str) for k in items):
+                raise TypeError(
+                    "Mixed str and non-str entries in `covariates=` — pass either a "
+                    "list of column-name strings (shared across samples) or a list "
+                    "of per-sample (n_cov, ny, nx) arrays."
                 )
-            else:
-                ny, nx = cov_shape
-                k = min(self._n_radial_bins, ny // 2, nx // 2)
-                low = cov_2d[:, :k, :k] if cov_2d.shape[-1] > k else cov_2d[:, :k, :]
-                cov_feat = low.reshape(low.shape[0], -1)
+            cov_features_per_sample = self._covariate_features_from_keys(items)
+        elif isinstance(first, np.ndarray):
+            if len(items) != len(self.samples):
+                raise ValueError(
+                    f"covariates length {len(items)} != n_samples {len(self.samples)}."
+                )
+            cov_features_per_sample = [
+                self._covariate_features_from_array(arr, sample_index=i)
+                for i, arr in enumerate(items)
+            ]
+        else:
+            raise TypeError(
+                f"covariates[0] is {type(first).__name__}; expected str (column-name "
+                "mode) or np.ndarray (per-sample image-array mode)."
+            )
+
+        if len(cov_features_per_sample) != len(self.samples):
+            raise ValueError(
+                f"Subclass returned {len(cov_features_per_sample)} covariate-feature "
+                f"sets but the comparator has {len(self.samples)} samples."
+            )
+        for i, cov_feat in enumerate(cov_features_per_sample):
             cov_feat = cov_feat[..., : self.spectra_.shape[-1]]
             self.spectra_[i] = _normalize_covariates(self.spectra_[i], cov_feat)
         return self
+
+    # ------------------------------------------------------------------
+    def _covariate_features_from_array(self, cov: np.ndarray, sample_index: int) -> np.ndarray:
+        """Image-array → ``(n_covariates, K)`` covariate features for one sample.
+
+        Shared by both subclasses for the pre-rasterized
+        ``(n_covariates, ny, nx)`` input mode. Mirrors the spectrum +
+        radial-binning pipeline used on the gene panel itself. The
+        sample index is needed only to look up that sample's physical
+        ``spacing`` for radial binning.
+        """
+        if cov.ndim != 3:
+            raise ValueError(f"covariate array must be 3D (n_cov, ny, nx), got {cov.shape}.")
+        cov_2d = compute_sample_spectrum(
+            cov, fft_solver=self._spectrum_fft_solver, workers=self._workers
+        )
+        # Use the covariate's own raster shape — for the NUFFT path the
+        # sample's internal k-grid (self._grid_shapes[i]) is auto-inferred
+        # and may differ from the covariate raster. ``freq_edges`` (shared
+        # across samples when ``feature_mode='radial'``) is what aligns the
+        # bins, not grid_shape.
+        cov_shape = cov.shape[-2:]
+        spacing = self._spacings[sample_index] if self._spacings is not None else None
+        if self.feature_mode == "radial":
+            return radial_bin_spectrum(
+                cov_2d,
+                grid_shape=cov_shape,
+                n_bins=self._n_radial_bins,
+                fft_solver=self._spectrum_fft_solver,
+                spacing=spacing,
+                edges=self.freq_edges,
+            )
+        ny, nx = cov_shape
+        k = min(self._n_radial_bins, ny // 2, nx // 2)
+        low = cov_2d[:, :k, :k] if cov_2d.shape[-1] > k else cov_2d[:, :k, :]
+        return low.reshape(low.shape[0], -1)
+
+    def _covariate_features_from_keys(self, keys: Sequence[str]) -> list[np.ndarray]:
+        """Column-key list → per-sample ``(n_covariates, K)`` covariate features.
+
+        Subclass hook. ``ComparatorIrregular`` reads ``adata.obs[key]``
+        per sample (NUFFT directly on per-spot values), and
+        ``ComparatorGrid`` forwards the keys as ``value_key`` to
+        :func:`spatialdata.rasterize_bins`.
+
+        The base class raises so the user gets a clear error if the
+        subclass doesn't implement it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support column-name covariate input; "
+            "pass per-sample (n_cov, ny, nx) arrays instead."
+        )
 
     # ------------------------------------------------------------------
     # Tests
