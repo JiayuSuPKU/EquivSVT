@@ -12,11 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compare_designs(spectra, design, contrast, …)` generalises the
   two-group test to arbitrary OLS designs (binary, continuous,
   multi-factor) with an analytic Wald null. The two-group case is
-  recovered exactly. `ComparatorIrregular` / `ComparatorGrid`
-  constructors accept a `design=` keyword (mutually exclusive with
-  `groups=`); DataFrames are patsy-encoded, ndarrays are used as-is.
-  `Comparator.test_pattern(...)` gains a `contrast=` argument
-  (column name, dict, or contrast vector).
+  recovered exactly. `Comparator.test_diff_freq(...)` gains a
+  `contrast=` argument (column name, dict, or contrast vector).
 - **Analytic Wald null for `log_l2`** (`null="wald"`, alias
   `"liu"`) on `compare_two_groups`, `compare_two_groups_masked`, and
   `compare_designs`. Per-gene statistic is integrated via Liu's
@@ -83,12 +80,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Log-space `normalize_covariates` also **commutes exactly** with
   `normalize_background` (left- vs right-multiplication of the
   log-spectrum matrix by orthogonal-projection matrices on disjoint
-  axes), so the two can be applied in either order. The chainable
-  comparator instance methods follow suit:
-    * `.shape_normalize()` → `.normalize_shape()`
+  axes), so the two can be applied in either order. The remaining
+  chainable comparator instance method follows the rename:
     * `.residualize()` → `.normalize_covariates()`
+- **Breaking: `Comparator.fit()` renamed to `Comparator.compute_spectra()`**.
+  The method computes per-sample radial-binned power spectra rather than
+  fitting model parameters; the new name describes the operation
+  directly and matches the codebase's verb-first method convention. All
+  three keyword arguments (`n_jobs`, `landmark_genes`, `progress`) and
+  the chainable `return self` behaviour are unchanged.
+- **Breaking: `design` moved from Comparator constructor to test
+  time.** The cross-sample contrast is no longer a construction
+  argument — it is supplied directly to `.test_diff_freq(design, ...)`
+  / `.test_diff_expr(design, ...)` (positional first arg), and to
+  `.effective_rank(level="within_group", design=...)` for the
+  group-conditioned diagnostic. A single fitted comparator can now
+  serve any number of unrelated contrasts on the same `spectra_`
+  without recomputing per-sample spectra. `min_samples_per_group`
+  follows `design` to `test_diff_freq` (kwarg) since it's a property
+  of the design's group sizes, not of the spectra. `design` accepts
+  the same three forms as before:
+    * 1-D array / Series of binary labels → two-sample dispatch
+      (`compare_two_groups` / `compare_two_groups_masked`);
+    * 2-D `np.ndarray` of shape `(n_samples, p)` → GLM design matrix,
+      used verbatim by `compare_designs`;
+    * `pandas.DataFrame` → GLM design, patsy-encoded by
+      `compare_designs`.
+- **Breaking: default `null` switched from `"permutation"` to
+  `"wald"` across the entire comparison surface** —
+  `Comparator.test_diff_freq`,
+  `quadsv.comparators.multisample.compare_two_groups`, and
+  `quadsv.comparators.multisample.compare_two_groups_masked`. The
+  Wald (Liu mixture-χ²) null bypasses the small-n permutation
+  BH-floor and is the only path that works on every dispatch target
+  (binary perm/Wald + GLM Wald), so it makes a single sensible
+  package-wide default. Callers who want the permutation null must
+  now pass `null="permutation"` explicitly. As a related
+  ergonomic fix, `compare_two_groups{,_masked}(statistic="cauchy_welch",
+  null="wald")` no longer raises — `cauchy_welch` carries its own
+  analytic null (documented as ignoring the `null` kwarg) so the
+  package default `null="wald"` is treated as a no-op for that
+  statistic.
+- **Breaking: Comparator attribute surface narrowed** (sklearn-style
+  moderate-privacy convention). The public surface is now `samples`,
+  `gene_names`, `feature_mode`, `freq_edges`, plus the
+  trailing-underscore fitted attributes (`spectra_`, `dc_`,
+  `presence_`, `rotation_angles_`). `design`/`groups_` are no longer
+  carried as instance state — the comparator is design-agnostic.
+  Internal config knobs that were inadvertently public are now
+  single-underscore-prefixed: `_n_radial_bins`, `_fft_solver`,
+  `_workers`, `_presence_threshold`, `_spacings`, `_grid_shapes`,
+  `_spectrum_fft_solver`, `_fft_chunk_size`, `_spacing_override`,
+  `_bins`, `_table_name`, `_col_key`, `_row_key`, `_value_key`.
+- **Breaking: Comparator test methods renamed and aligned with the
+  standalone `compare_*` API** in `quadsv.comparators.multisample`:
+    * `.test_pattern()`    → `.test_diff_freq()` — gains a new
+      `normalize_shape: bool = False` keyword, forwarded to its
+      dispatch target (`compare_two_groups`,
+      `compare_two_groups_masked`, or `compare_designs`) so users get
+      the shape-only DF path without mutating `cmp.spectra_`.
+    * `.test_expression()` → `.test_diff_expr()` — gains an explicit
+      `null: str = "welch"` keyword (default matches the analytic
+      Welch t default on `compare_two_groups_scalar`); the previous
+      always-permutation behaviour is now reachable via
+      `null="permutation"`.
 
 ### Removed
+- **Breaking: `groups=` / `design=` constructor kwargs on
+  `ComparatorIrregular` and `ComparatorGrid` are gone.** Supply the
+  1-D labels or design matrix to the test method instead
+  (`cmp.test_diff_freq(design, ...)`, `cmp.test_diff_expr(design,
+  ...)`). The comparator no longer carries design state; one fitted
+  comparator can serve any number of contrasts on the same spectra.
+- **Breaking: `Comparator.shape_normalize()` chainable method
+  retired.** Use the equivalent
+  `cmp.test_diff_freq(..., normalize_shape=True)` keyword path for the
+  one-shot non-destructive test, or call
+  `quadsv.comparators.multisample.normalize_shape(cmp.spectra_)`
+  directly to obtain the standalone transform. The previous in-place
+  method silently mutated `cmp.spectra_` and surprised subsequent
+  `.test_diff_freq()`/`.test_diff_expr()` calls on the same comparator.
+- **Breaking: the `test = test_pattern` alias retired.** Use the
+  explicit `cmp.test_diff_freq(...)` (or `cmp.test_diff_expr(...)` for
+  the DE companion); the unqualified `cmp.test()` was ambiguous once
+  the API exposed two complementary tests.
 - **Breaking: `center` argument retired** across the comparator API.
   `ComparatorIrregular`, `ComparatorGrid`, and
   `compute_sample_spectrum` no longer accept `center`. Per-gene

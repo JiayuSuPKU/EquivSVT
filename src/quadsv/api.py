@@ -12,11 +12,18 @@ the runtime type of the input data so users don't have to know the
 >>> cmp = Comparator([adata, ...])    # → ComparatorIrregular
 >>> cmp = Comparator([sdata, ...])    # → ComparatorGrid
 
-The factories never inspect or copy the data — they only check
-``isinstance`` to pick the right class, then forward all remaining
-kwargs verbatim. The data argument is **not** passed to the
-constructor; the caller is expected to chain ``.setup_data(...)``
-afterwards just as they would with the explicit classes.
+The factories only check ``isinstance`` to pick the right class, then
+forward kwargs verbatim. Asymmetry between the two:
+
+- :func:`Detector` does **not** pass the data argument to the
+  constructor — the caller chains ``.setup_data(data)`` afterwards
+  (matching the explicit-class flow).
+- :func:`Comparator` **does** pass the sample list as the first
+  positional argument, since both comparator constructors take
+  ``samples`` there. Cross-sample contrasts (``design``) are
+  supplied later, at test time, on
+  :meth:`~quadsv.ComparatorIrregular.test_diff_freq` /
+  :meth:`~quadsv.ComparatorIrregular.test_diff_expr`.
 
 For advanced use (custom kernel selection, sample-list inputs that
 mix two backends intentionally) prefer the explicit class names —
@@ -137,7 +144,9 @@ def Comparator(  # noqa: N802 - factory mimics class names
         Per-sample inputs. Must all be of the same type.
     **kwargs
         Forwarded to the chosen class's ``__init__`` verbatim
-        (typically ``groups=...``, ``feature_mode=...``, etc.).
+        (e.g. ``gene_names=...``, ``feature_mode=...``, etc.). The
+        cross-sample contrast (``design``) is supplied later on
+        :meth:`test_diff_freq` / :meth:`test_diff_expr`, not here.
 
     Returns
     -------
@@ -153,8 +162,8 @@ def Comparator(  # noqa: N802 - factory mimics class names
     Examples
     --------
     >>> from quadsv import Comparator
-    >>> cmp = Comparator([a1, a2, a3], groups=group_labels)
-    >>> result = cmp.run()
+    >>> cmp = Comparator([a1, a2, a3]).compute_spectra()
+    >>> df = cmp.test_diff_freq(group_labels)
     """
     items = list(data_list)
     if len(items) == 0:

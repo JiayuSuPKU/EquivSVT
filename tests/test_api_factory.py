@@ -64,10 +64,9 @@ class TestComparatorFactory(unittest.TestCase):
             a = ad.AnnData(rng.standard_normal((20, 3)))
             a.obsm["spatial"] = rng.standard_normal((20, 2))
             self.adatas.append(a)
-        self.groups = np.array([0, 0, 1])
 
     def test_anndata_list_dispatches_to_irregular(self):
-        cmp = Comparator(self.adatas, groups=self.groups)
+        cmp = Comparator(self.adatas)
         self.assertIsInstance(cmp, ComparatorIrregular)
 
     def test_spatialdata_list_dispatches_to_grid(self):
@@ -78,7 +77,7 @@ class TestComparatorFactory(unittest.TestCase):
         # the type and forwards. Use pytest.raises to allow downstream
         # validation errors but still assert the *class* picked first.
         try:
-            cmp = Comparator(sdatas, groups=self.groups)
+            cmp = Comparator(sdatas)
         except (TypeError, ValueError, AttributeError):
             # Construction may legitimately fail because the
             # SpatialData objects are empty; we only care that the
@@ -89,18 +88,18 @@ class TestComparatorFactory(unittest.TestCase):
 
     def test_empty_list_raises_typeerror(self):
         with pytest.raises(TypeError, match="non-empty"):
-            Comparator([], groups=np.array([]))
+            Comparator([])
 
     def test_mixed_list_raises_typeerror(self):
         from spatialdata import SpatialData
 
         mixed = [self.adatas[0], SpatialData()]
         with pytest.raises(TypeError, match="mixed"):
-            Comparator(mixed, groups=np.array([0, 1]))
+            Comparator(mixed)
 
     def test_unsupported_element_type_raises(self):
         with pytest.raises(TypeError, match="mixed"):
-            Comparator([np.zeros((10, 10))], groups=np.array([0]))
+            Comparator([np.zeros((10, 10))])
 
 
 if __name__ == "__main__":
